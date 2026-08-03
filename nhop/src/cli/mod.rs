@@ -1,4 +1,5 @@
 mod client;
+pub mod doctor;
 pub mod explain;
 pub mod status;
 pub mod system_proxy;
@@ -444,9 +445,7 @@ async fn dispatch(
             json,
         }) => logs(paths, Follow::of(follow), since, Output::of(json), out, err).await,
         Subcommand::Tail(Tail { json: _ }) => unserved("tail", err),
-        Subcommand::Doctor(Doctor { json }) => {
-            ask(paths, Command::Doctor, Output::of(json), out, err).await
-        }
+        Subcommand::Doctor(Doctor { json }) => diagnose(paths, Output::of(json), out, err).await,
         Subcommand::Proxy(Proxy {
             action: _,
             service: _,
@@ -589,6 +588,23 @@ fn render_log(line: &str, out: &mut dyn Write) -> io::Result<()> {
 fn unreadable_log(file: &Path, err: &mut dyn Write) -> Exit {
     let _ = writeln!(err, "nhop: cannot read {}", file.display());
     Exit::Failed
+}
+
+async fn diagnose(paths: &Paths, output: Output, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
+    let answered = client::ask(&paths.socket_file(), &Command::Doctor).await;
+    let checks = match answered {
+        Ok(Response::Doctor(checks)) => checks,
+        Ok(response) => return render(&response, output, out, err),
+        Err(failure) => {
+            let _ = writeln!(err, "nhop: {failure}");
+            doctor::report(&[doctor::unreachable(&failure.to_string())])
+        }
+    };
+    match output {
+        Output::Json => write_json(&checks, out),
+        Output::Human => render_checks(&checks, out),
+    }
+    doctor::exit_of(&checks)
 }
 
 async fn ask(
@@ -1219,18 +1235,77 @@ mod tests {
         daemon.shutdown().await;
     }
 
+    #[test]
+    fn a_daemon_error_keeps_stdout_empty_even_with_json() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let response = Response::Err {
+            kind: ErrKind::Internal,
+            message: "the daemon does not serve this command yet".to_owned(),
+        };
+
+        let exit = render(&response, Output::Json, &mut out, &mut err);
+
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(exit.code(), 1);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(String::from_utf8(err).unwrap().contains("yet"));
+    }
+
     #[tokio::test]
-    async fn a_daemon_error_keeps_stdout_empty_even_with_json() {
+    async fn doctor_reports_the_seven_checks_a_running_daemon_can_make() {
         let (_home, paths, daemon) = running_daemon().await;
 
         let (exit, out, err) = invoke(&paths, &["doctor", "--json"]).await;
 
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        let checks: Vec<CheckView> = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            names(&checks),
+            vec![
+                "daemon_reachable".to_owned(),
+                "ports_bound".to_owned(),
+                "system_proxy".to_owned(),
+                "upstream_reachable".to_owned(),
+                "init_file".to_owned(),
+                "last_load".to_owned(),
+                "log_writable".to_owned(),
+            ]
+        );
+        assert!(checks[0].ok, "{out}");
+        assert!(checks[1].ok, "{out}");
         assert_eq!(exit, Exit::Failed);
-        assert_eq!(exit.code(), 1);
-        assert!(out.is_empty(), "{out}");
-        assert!(err.contains("yet"), "{err}");
 
         daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn doctor_without_a_daemon_still_prints_seven_checks_and_exits_one() {
+        let (_home, paths) = temp_paths();
+
+        let (exit, out, err) = invoke(&paths, &["doctor"]).await;
+
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(exit.code(), 1);
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.contains("nhop start"), "{err}");
+        assert_eq!(out.lines().count(), 7, "{out}");
+        assert!(out.contains("daemon_reachable"), "{out}");
+        assert!(out.contains("log_writable"), "{out}");
+    }
+
+    fn names(checks: &[CheckView]) -> Vec<String> {
+        let mut names = Vec::new();
+        for CheckView {
+            name,
+            ok: _,
+            detail: _,
+        } in checks
+        {
+            names.push(name.clone());
+        }
+        names
     }
 
     #[tokio::test]

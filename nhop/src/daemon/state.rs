@@ -11,6 +11,7 @@ use nhop_ipc::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cli::doctor;
 use crate::cli::explain;
 use crate::cli::status::{DaemonStatus, status_view};
 use crate::cli::system_proxy::{NetworkService, NoSystemProxy, SystemProxyReader};
@@ -371,7 +372,8 @@ impl DaemonState {
             Command::Test { host, port } => {
                 answer(reply, Response::Decision(self.decision(&host, port)));
             }
-            Command::Doctor | Command::Subscribe => answer(reply, unserved()),
+            Command::Doctor => self.doctor(reply),
+            Command::Subscribe => answer(reply, unserved()),
         }
     }
 
@@ -689,16 +691,38 @@ impl DaemonState {
         }
     }
 
+    fn listen(&self) -> Listen {
+        Listen {
+            http: self.http_listen,
+            socks: self.socks_listen,
+        }
+    }
+
+    fn doctor(&self, reply: oneshot::Sender<Response>) {
+        let mut findings = vec![
+            doctor::daemon_reachable(&self.paths.socket_file()),
+            doctor::ports_bound(self.listen(), self.bind_state()),
+            doctor::system_proxy(self.proxy.read(&self.service), self.listen(), &self.service),
+            doctor::init_file(&self.paths.init_file()),
+            doctor::last_load(self.last_load.as_ref()),
+            doctor::log_writable(&self.paths.log_file()),
+        ];
+        let written = self.upstream.clone();
+        let upstream = self.live.upstream().snapshot();
+        let health = self.live.health().verdict();
+        tokio::spawn(async move {
+            findings.push(doctor::upstream_reachable(&written, upstream, health).await);
+            answer(reply, Response::Doctor(doctor::report(&findings)));
+        });
+    }
+
     fn status(&self) -> StatusView {
         let rules = self.live.rules().snapshot();
         let proxy = self.proxy.read(&self.service).unwrap_or_default();
         status_view(
             &DaemonStatus {
                 uptime_secs: self.started.elapsed().as_secs(),
-                listen: Listen {
-                    http: self.http_listen,
-                    socks: self.socks_listen,
-                },
+                listen: self.listen(),
                 bound: self.bind_state(),
                 upstream: self.upstream.clone(),
                 health: self.live.health().verdict(),
@@ -1594,7 +1618,7 @@ mod tests {
     async fn a_command_of_a_later_task_reports_an_internal_error() {
         let (_home, state) = spawn_here();
 
-        let Response::Err { kind, message } = state.call(Command::Doctor).await else {
+        let Response::Err { kind, message } = state.call(Command::Subscribe).await else {
             panic!("an unserved command must answer with an error");
         };
         assert_eq!(kind, ErrKind::Internal);

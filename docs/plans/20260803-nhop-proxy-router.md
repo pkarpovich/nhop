@@ -724,17 +724,44 @@ uses `doctor`, which Task 11 will take over in turn.
 **Files:**
 - Create: `nhop/src/cli/doctor.rs`
 
-- [ ] emit exactly seven `CheckView` objects, in this order, with these `name` values:
+- [x] emit exactly seven `CheckView` objects, in this order, with these `name` values:
       `daemon_reachable`, `ports_bound`, `system_proxy`, `upstream_reachable`, `init_file`,
       `last_load`, `log_writable`
-- [ ] the Local Network check is the subtle one: on `EHOSTUNREACH` when connecting to the upstream,
+- [x] the Local Network check is the subtle one: on `EHOSTUNREACH` when connecting to the upstream,
       report a probable Local Network permission denial with the remedy, because macOS reports that
       denial as a routing error
-- [ ] exit codes: 0 when all pass; 3 when the only failures are upstream-reachability checks;
+- [x] exit codes: 0 when all pass; 3 when the only failures are upstream-reachability checks;
       otherwise 1
-- [ ] write tests over the aggregation function with injected results: all pass, only upstream
+- [x] write tests over the aggregation function with injected results: all pass, only upstream
       fails, several fail - asserting exit code, output order and the seven names
-- [ ] run `mise run check` - must pass before task 12
+- [x] run `mise run check` - must pass before task 12
+
+➕ `Check` owns the seven names and `CHECKS` their order, so `report(&[Finding])` renders the fixed
+seven whatever order they were observed in. A check nothing observed renders failed with "not
+checked" - which is exactly what `doctor` prints when the daemon never answered and only
+`daemon_reachable` could be made. `exit_of` is the aggregation the plan asks for: it counts failures
+and failures beyond `upstream_reachable`, so 0/3/1 fall out of the two counters.
+
+➕ The daemon runs six checks synchronously in the state task and spawns the seventh: dialling the
+upstream must not block the actor, and it is the only check that waits on the network. `Command::Doctor`
+therefore holds its `oneshot` the way `Reload` does. `daemon_reachable` is answered by the daemon
+having answered at all; when it does not answer, `cli::diagnose` builds the report locally from
+`doctor::unreachable` and exits 1 per this task's own exit rule rather than the transport row of the
+exit table - a doctor that prints nothing when the daemon is down would diagnose nothing.
+
+➕ `upstream_reachable` dials TCP rather than completing a SOCKS5 handshake: `EHOSTUNREACH` is what
+the Local Network denial surfaces as, and it surfaces at connect. `tokio_socks` would bury the
+`ErrorKind` this check exists to name. `system_proxy` passes only when macOS points http and https at
+the HTTP front end and socks at the SOCKS5 one - "some proxy is configured" would pass a machine
+still pointing at ClashX - and it is the check that names a `networksetup` read failure Task 10
+deliberately reported as "every setting off".
+
+➕ `log_writable` reads the mode of the state directory instead of writing a probe file, so `doctor`
+never leaves anything behind. Beyond the listed file: `cli/mod.rs` gains `diagnose` and the `doctor`
+module, `daemon/state.rs` serves `Command::Doctor` and gains a `listen()` helper `status` shares.
+The two tests that used `doctor` as a stand-in for an unserved command moved on - the state test to
+`Command::Subscribe` (Task 12), the cli one to a `render` call, since no JSON-capable verb answers a
+daemon error any more.
 
 ### Task 12: `nhop tail`
 
