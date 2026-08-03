@@ -1,22 +1,18 @@
 use std::env;
+use std::io;
 use std::process::ExitCode;
 
-use nhop::daemon;
+use nhop::cli;
 use nhop_ipc::Paths;
 
-const USAGE_EXIT: u8 = 4;
 const INTERNAL_EXIT: u8 = 1;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut arguments = env::args().skip(1);
-    let Some(command) = arguments.next() else {
-        println!("nhop {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    };
-    if command != "start" {
-        eprintln!("nhop: unknown command {command:?}");
-        return ExitCode::from(USAGE_EXIT);
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    let mut borrowed = Vec::with_capacity(arguments.len());
+    for argument in &arguments {
+        borrowed.push(argument.as_str());
     }
     let paths = match Paths::from_env() {
         Ok(paths) => paths,
@@ -25,11 +21,6 @@ async fn main() -> ExitCode {
             return ExitCode::from(INTERNAL_EXIT);
         }
     };
-    match daemon::run(&paths).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(failure) => {
-            eprintln!("nhop: {failure}");
-            ExitCode::from(failure.exit_code())
-        }
-    }
+    let exit = cli::run(&paths, &borrowed, &mut io::stdout(), &mut io::stderr()).await;
+    ExitCode::from(exit.code())
 }

@@ -55,16 +55,6 @@ pub enum StartFailure {
     Io(#[from] io::Error),
 }
 
-impl StartFailure {
-    /// Returns the process exit code this failure is reported as.
-    pub fn exit_code(&self) -> u8 {
-        match self {
-            Self::AlreadyRunning(_owner) => 1,
-            Self::Io(_failure) => 1,
-        }
-    }
-}
-
 /// Exclusive claim on the pid file, held for as long as the daemon runs.
 #[derive(Debug)]
 pub struct InstanceGuard {
@@ -378,7 +368,6 @@ mod tests {
 
         let failure = InstanceGuard::acquire(&paths).unwrap_err();
 
-        assert_eq!(failure.exit_code(), 1);
         let StartFailure::AlreadyRunning(owner) = &failure else {
             panic!("a held lock must report the owner: {failure}");
         };
@@ -428,6 +417,5 @@ mod tests {
         let StartFailure::Io(_failure) = &failure else {
             panic!("an unusable state directory must fail with io: {failure}");
         };
-        assert_eq!(failure.exit_code(), 1);
     }
 }

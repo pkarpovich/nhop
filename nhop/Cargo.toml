@@ -8,8 +8,11 @@ rust-version.workspace = true
 nhop-ipc.workspace = true
 
 arc-swap.workspace = true
+argh.workspace = true
 fs2.workspace = true
+humantime.workspace = true
 ipnet.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

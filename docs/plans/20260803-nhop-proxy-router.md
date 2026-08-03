@@ -384,17 +384,35 @@ explicitly, so adding a handler is a compiler-guided edit.
 - Create: `nhop/src/cli/mod.rs`, `nhop/src/cli/client.rs`
 - Modify: `nhop/src/main.rs`
 
-- [ ] declare the `argh` tree: `start`, `require`, `prefer`, `never`, `upstream`, `listen`,
+- [x] declare the `argh` tree: `start`, `require`, `prefer`, `never`, `upstream`, `listen`,
       `reload`, `on`, `off`, `status`, `rules`, `test`, `logs`, `tail`, `doctor`, `proxy` - the
       rule verbs take `<kind> <value>` per the Rule surface section
-- [ ] every read command takes `--json`: with it, a single JSON document on stdout and nothing else
-- [ ] map `ErrKind` and transport failures onto the Exit codes table; a missing socket is exit 2
+- [x] every read command takes `--json`: with it, a single JSON document on stdout and nothing else
+- [x] map `ErrKind` and transport failures onto the Exit codes table; a missing socket is exit 2
       with a one-line hint on stderr
-- [ ] no interactive prompting anywhere
-- [ ] write tests for parsing each subcommand, including an unknown rule kind (exit 4)
-- [ ] write tests asserting `--json` output parses as JSON and human text never leaks to stdout
-- [ ] write tests for the `ErrKind` -> exit code mapping, one case per row of the table
-- [ ] run `mise run check` - must pass before task 5
+- [x] no interactive prompting anywhere
+- [x] write tests for parsing each subcommand, including an unknown rule kind (exit 4)
+- [x] write tests asserting `--json` output parses as JSON and human text never leaks to stdout
+- [x] write tests for the `ErrKind` -> exit code mapping, one case per row of the table
+- [x] run `mise run check` - must pass before task 5
+
+➕ `cli::Exit` is the single owner of the Exit codes table: one variant per row, `code()` renders
+the number, and `of_err`/`of_unreachable`/`of_start` are the only mappings into it. Task 3's
+`StartFailure::exit_code()` duplicated the last row and is removed, so the table cannot drift.
+
+➕ `run(paths, arguments, out, err)` writes through `&mut dyn Write` rather than `println!`, which
+is what lets the tests assert that `--json` puts one document on stdout and that error text never
+leaves stderr. `main.rs` passes `io::stdout()`/`io::stderr()`. Nothing reads stdin anywhere.
+
+➕ `logs`, `tail` and `proxy` parse fully - including `--json` and `proxy --service`, default
+`Wi-Fi` - but answer "not implemented yet" on stderr with exit 1 until Tasks 9, 12 and 13 land,
+mirroring how Task 3 left unserved daemon commands. Mutating commands send `load: None`; Task 5
+adds the `NHOP_LOAD_ID` forwarding. Human rendering of `status`, `rules` and `test` is terse here;
+Tasks 10 and 11 own the rich form and the `doctor` exit code.
+
+➕ Beyond the listed files: `nhop/src/lib.rs` exports the new `cli` module, and `nhop/Cargo.toml`
+gains `argh`, `serde` (the `Serialize` bound behind `--json`) and `humantime` (RFC3339 timestamps
+in human `status`).
 
 ### Task 5: Init script execution and the atomic load protocol
 
