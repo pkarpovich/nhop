@@ -951,15 +951,26 @@ as a routine failure.
 
 ### Task 16: [Final] Documentation
 
-- [ ] README contains H2 sections titled exactly `Commands`, `Init file`, `Rule classes`,
+- [x] README contains H2 sections titled exactly `Commands`, `Init file`, `Rule classes`,
       `Filesystem contract`, `Install`, `Uninstall`; `Commands` lists every subcommand from Task 4,
       one line each; `Filesystem contract` reproduces the four paths from Technical Details
-- [ ] record the three constraints a future reader will not guess: the SOCKS port pinning of an
+- [x] record the three constraints a future reader will not guess: the SOCKS port pinning of an
       existing client, the Local Network signing requirement and its misleading `EHOSTUNREACH`, and
       why the daemon must keep listening when rules are cleared
-- [ ] verify with `rg -c '^## (Commands|Init file|Rule classes|Filesystem contract|Install|Uninstall)$' README.md` returning 6
-- [ ] move this plan to `docs/plans/completed/`
-- [ ] run `mise run check`
+- [x] verify with `rg -c '^## (Commands|Init file|Rule classes|Filesystem contract|Install|Uninstall)$' README.md` returning 6
+- [x] move this plan to `docs/plans/completed/`
+- [x] run `mise run check`
+
+➕ `Commands` is a table rather than a bullet list, one row per subcommand, and carries the exit-code
+table's five rows as a closing line - the codes are part of what a scripted caller needs and had no
+other home. `Rule classes` covers the four kinds and the precedence rule beside the three classes,
+because the canonical surface names a class and a kind together and splitting them across sections
+would leave neither readable alone.
+
+➕ The three constraints are their own H2, `Three constraints behind the design`, placed after
+`Uninstall`: each of them is a thing that looks arbitrary in the sections above (the default ports,
+the signing step, what `off` does), so they read as the answers to questions the reference sections
+raise rather than as preamble.
 
 ## Post-Completion
 

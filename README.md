@@ -17,6 +17,100 @@ presence; everything is driven from the CLI.
 - listens for HTTP CONNECT and SOCKS5 on the ports the previous setup used, so
   clients pinned to them need no reconfiguration
 
+## Commands
+
+`nhop start` is the daemon. Everything else connects to its socket, sends one
+command and exits. The rule verbs and `upstream`, `listen`, `on`, `off` and
+`reload` mutate the ruleset; `status`, `rules`, `test`, `logs`, `tail` and
+`doctor` read. Every read command takes `--json` and then prints one JSON
+document on stdout and nothing else.
+
+| Command | What it does |
+|---|---|
+| `nhop start` | runs the daemon in the foreground until it is signalled |
+| `nhop require <kind> <value>` | adds a rule that must traverse the upstream |
+| `nhop prefer <kind> <value>` | adds a rule that tries the upstream, direct when it is down |
+| `nhop never <kind> <value>` | adds a rule that is always dialled directly |
+| `nhop upstream socks5://<ip>:<port>` | points the router at its one SOCKS5 upstream |
+| `nhop listen <http addr> <socks addr>` | moves the two front ends |
+| `nhop reload [path]` | re-runs the init script, or a different file and remembers it |
+| `nhop on` | re-runs the remembered init script |
+| `nhop off` | clears the live ruleset while both front ends keep listening |
+| `nhop status` | reports uptime, listeners, upstream health, last load, rule counts, system proxy |
+| `nhop rules` | lists the live ruleset in declaration order |
+| `nhop test <host>:<port>` | reports where a destination would be routed, without dialling it |
+| `nhop logs` | prints the daemon log; `-f` follows, `--since 15m` limits the window |
+| `nhop tail` | follows routing decisions as they are made |
+| `nhop doctor` | runs the seven diagnostic checks |
+| `nhop proxy on\|off\|status` | reads or sets the macOS proxy settings; `--service`, default `Wi-Fi` |
+
+Exit codes: 0 success, 2 nothing there (no socket, no daemon, unknown thing), 3
+upstream down, 4 malformed arguments, 1 everything else.
+
+## Rule classes
+
+One canonical form, used on the command line and in the init file:
+
+```
+nhop <require|prefer|never> <suffix|cidr|port|keyword> <value>
+```
+
+The three classes differ only in what happens when the upstream is down:
+
+- `require` - must traverse the upstream. With the upstream down the connection
+  fails at once: `502 Bad Gateway` on the HTTP front end, reply `0x04` on the
+  SOCKS5 one, exit 3 from the CLI. For what only exists behind the upstream.
+- `prefer` - tries the upstream and falls back to a direct connection when it is
+  down. For public services routed through the upstream only for traffic volume.
+- `never` - always dialled directly, and matched before every other rule.
+
+That split is why nothing has to be toggled when the upstream goes away: bulk
+traffic self-heals to direct and internal traffic fails honestly.
+
+The four kinds:
+
+- `suffix` - exact or dot-boundary match, case-insensitive, trailing dot stripped
+- `cidr` - matches only hosts that are IP literals; a hostname never matches one
+- `port` - exact equality, no ranges
+- `keyword` - case-insensitive substring of the host, never of the port
+
+Precedence: `never` rules first, then the rest in declaration order, first match
+wins, no match is direct.
+
+## Init file
+
+`~/.config/nhop/init` is the profile. The daemon runs it as a program at start
+and on `reload`, so its shebang picks the interpreter - fish, loops and all. It
+runs with the working directory set to `~/.config/nhop` and the directory of the
+running `nhop` binary prepended to `PATH`, so a plain `nhop` inside it reaches
+the daemon whose run it belongs to.
+
+Loads are atomic. The daemon stamps each run with an id, passes it to the script
+in the environment, and the CLI hands it back on every mutating command, so those
+commands accumulate in a staging ruleset instead of touching live traffic. The
+staged set goes live only when the script exits zero; a failed command, a
+non-zero exit or a run exceeding 30 seconds leaves the previous ruleset serving
+traffic and records which command failed in `nhop status`. A half-applied rule
+set on a router means traffic silently taking the wrong path, which is why there
+is no incremental mode.
+
+A missing init file is not an error. Until the first load commits the ruleset is
+empty and every connection is direct - `nhop status` says so.
+
+`packaging/nhop.init.example` is a commented starting point with placeholders.
+
+## Filesystem contract
+
+| Path | Purpose |
+|---|---|
+| `~/.config/nhop/init` | executable rule script, run at daemon start and on `reload` |
+| `~/.local/state/nhop/nhop.sock` | IPC socket, mode 0600 |
+| `~/.local/state/nhop/nhop.pid` | single-instance guard, held under an advisory `flock` |
+| `~/.local/state/nhop/nhop.log` | JSON-lines log, daily rotation, 7 files kept |
+
+The socket deliberately does not live in `/tmp`: a world-writable socket would
+let any local process rewrite this machine's traffic routing.
+
 ## Install
 
 Everything below is one-time setup. Commands are written for fish.
@@ -115,3 +209,28 @@ rm -r ~/.config/nhop ~/.local/state/nhop
 
 Confirm with `nhop proxy status` before removing the binary - all three settings
 must read `off`.
+
+## Three constraints behind the design
+
+Each of these looks like an arbitrary choice and is not.
+
+**The default ports are not a preference.** An API client on the target machine
+is pinned to `127.0.0.1:7891` SOCKS5 by hand and ignores the macOS system proxy
+entirely. That is why the front ends default to `127.0.0.1:7890` (HTTP) and
+`127.0.0.1:7891` (SOCKS5), and why moving the SOCKS port with `nhop listen`
+breaks that client silently - it will keep dialling 7891.
+
+**The binary must be signed, and the failure does not look like a permission
+problem.** macOS Local Network privacy denies local-subnet access to binaries
+that are not properly signed and reports the denial as `EHOSTUNREACH`, "No route
+to host" - never as a permission error. An ad-hoc-signed build therefore looks
+like a broken upstream. `nhop doctor` names this: on `EHOSTUNREACH` while
+dialling the upstream it reports a probable Local Network denial and the remedy.
+The permission has to be confirmed under launchd, not only from a terminal.
+
+**`nhop off` clears the rules but keeps both listeners bound, on purpose.** For
+the pinned client above, a closed port is not "no proxying" - it is
+`connection refused`, i.e. no connectivity at all. With the listeners up and the
+ruleset empty every connection is served and dialled directly, which is what
+"off" has to mean here. The same reasoning applies to stopping the daemon: don't,
+unless the system proxy is off and the pinned client is expected to fail.
