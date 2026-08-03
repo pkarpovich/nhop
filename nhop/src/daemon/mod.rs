@@ -6,16 +6,28 @@ pub mod state;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 use fs2::FileExt;
 use nhop_ipc::{Command, Paths};
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::daemon::state::StateHandle;
+use crate::daemon::state::{
+    DEFAULT_HTTP_LISTEN, DEFAULT_SOCKS_LISTEN, LOAD_TIMEOUT, Live, StateConfig, StateHandle,
+};
+use crate::proxy::{self, DirectHop, Listen, NextHop};
+
+/// Addresses both front ends bind until an init script moves them.
+pub const DEFAULT_LISTEN: Listen = Listen {
+    http: DEFAULT_HTTP_LISTEN,
+    socks: DEFAULT_SOCKS_LISTEN,
+};
 
 /// Identifier of a process on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,11 +132,161 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+/// One listener and the task accepting on it.
+#[derive(Debug)]
+struct Accepting {
+    addr: SocketAddr,
+    accepting: JoinHandle<()>,
+}
+
+impl Drop for Accepting {
+    fn drop(&mut self) {
+        let Self { addr: _, accepting } = self;
+        accepting.abort();
+    }
+}
+
+/// The two listeners a running daemon accepts traffic on.
+#[derive(Debug)]
+pub struct Bound {
+    live: Live,
+    hop: Arc<dyn NextHop>,
+    http: Accepting,
+    socks: Accepting,
+}
+
+impl Bound {
+    fn rebind(&mut self, listen: Listen) -> io::Result<Listen> {
+        let Listen { http, socks } = listen;
+        let http = bind_tcp(http)?;
+        let socks = bind_tcp(socks)?;
+        self.http = accept_http(http, self.live.clone(), self.hop.clone())?;
+        self.socks = accept_socks(socks)?;
+        Ok(self.listen())
+    }
+
+    fn listen(&self) -> Listen {
+        let Self {
+            live: _,
+            hop: _,
+            http,
+            socks,
+        } = self;
+        Listen {
+            http: http.addr,
+            socks: socks.addr,
+        }
+    }
+}
+
+/// Front ends the daemon serves traffic on.
+#[derive(Debug)]
+pub enum Frontends {
+    /// Nothing is listening, so a load that moves the addresses only records them.
+    Unbound,
+    /// Both front ends hold an address.
+    Bound(Bound),
+}
+
+impl Frontends {
+    /// Binds both front ends and starts accepting on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] when either address cannot be bound, leaving neither bound.
+    ///
+    /// [`io::Error`]: std::io::Error
+    pub fn bind(live: Live, hop: Arc<dyn NextHop>, listen: Listen) -> io::Result<Self> {
+        let Listen { http, socks } = listen;
+        let http = bind_tcp(http)?;
+        let socks = bind_tcp(socks)?;
+        let http = accept_http(http, live.clone(), hop.clone())?;
+        let socks = accept_socks(socks)?;
+        Ok(Self::Bound(Bound {
+            live,
+            hop,
+            http,
+            socks,
+        }))
+    }
+
+    /// Returns the addresses the front ends hold, absent while nothing is bound.
+    pub fn listening(&self) -> Option<Listen> {
+        match self {
+            Self::Unbound => None,
+            Self::Bound(bound) => Some(bound.listen()),
+        }
+    }
+
+    /// Moves both front ends, leaving the connections they already accepted alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] when either address cannot be bound, in which case the front ends
+    /// keep the addresses they already hold.
+    ///
+    /// [`io::Error`]: std::io::Error
+    pub fn rebind(&mut self, listen: Listen) -> io::Result<Listen> {
+        match self {
+            Self::Unbound => Ok(listen),
+            Self::Bound(bound) => bound.rebind(listen),
+        }
+    }
+}
+
+fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    TcpListener::from_std(listener)
+}
+
+fn accept_http(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io::Result<Accepting> {
+    let addr = listener.local_addr()?;
+    let accepting = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let ctx = live.accepted();
+            let hop = hop.clone();
+            tokio::spawn(async move {
+                let _served = proxy::http::serve(stream, ctx, hop.as_ref()).await;
+            });
+        }
+    });
+    Ok(Accepting { addr, accepting })
+}
+
+fn accept_socks(listener: TcpListener) -> io::Result<Accepting> {
+    let addr = listener.local_addr()?;
+    let accepting = tokio::spawn(async move {
+        loop {
+            let Ok((_stream, _peer)) = listener.accept().await else {
+                return;
+            };
+        }
+    });
+    Ok(Accepting { addr, accepting })
+}
+
+/// Binds both front ends before the init script runs, so no rule can land on an unbound port.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when either address cannot be bound.
+///
+/// [`io::Error`]: std::io::Error
+pub fn spawn_frontends(live: &Live, listen: Listen) -> io::Result<Frontends> {
+    Frontends::bind(live.clone(), Arc::new(DirectHop), listen)
+}
+
 /// Running daemon: the single-instance claim, the state task and the IPC server.
+#[derive(Debug)]
 pub struct Daemon {
     guard: InstanceGuard,
     state: StateHandle,
     socket_file: PathBuf,
+    listen: Listen,
     shutdown: oneshot::Sender<()>,
     served: JoinHandle<()>,
 }
@@ -133,6 +295,11 @@ impl Daemon {
     /// Returns the handle every command travels through.
     pub fn state(&self) -> &StateHandle {
         &self.state
+    }
+
+    /// Returns the addresses the front ends were bound on.
+    pub fn listen(&self) -> Listen {
+        self.listen
     }
 
     /// Returns the path clients connect to.
@@ -146,6 +313,7 @@ impl Daemon {
             guard,
             state: _,
             socket_file,
+            listen: _,
             shutdown,
             served,
         } = self;
@@ -156,19 +324,39 @@ impl Daemon {
     }
 }
 
-/// Claims the pid file, starts the state task and begins serving IPC clients.
+/// Claims the pid file, binds every listener and starts serving.
 ///
 /// The init script runs in the background once the socket is served, so a script that calls back
 /// into the CLI reaches a daemon that is already answering.
 ///
 /// # Errors
 ///
-/// Returns [`StartFailure`] when another daemon is running or the socket cannot be bound.
+/// Returns [`StartFailure`] when another daemon is running or a listener cannot be bound.
 pub fn start(paths: &Paths) -> Result<Daemon, StartFailure> {
+    start_on(paths, DEFAULT_LISTEN)
+}
+
+/// Starts the daemon with front ends on addresses other than [`DEFAULT_LISTEN`].
+///
+/// # Errors
+///
+/// Returns [`StartFailure`] when another daemon is running or a listener cannot be bound.
+pub fn start_on(paths: &Paths, listen: Listen) -> Result<Daemon, StartFailure> {
     let guard = InstanceGuard::acquire(paths)?;
     let socket_file = paths.socket_file();
     let listener = ipc_server::bind(&socket_file)?;
-    let state = state::spawn(paths);
+    let live = Live::default();
+    let frontends = spawn_frontends(&live, listen)?;
+    let listen = frontends.listening().unwrap_or(listen);
+    let state = state::spawn(
+        paths,
+        StateConfig {
+            live,
+            frontends,
+            listen,
+            load_timeout: LOAD_TIMEOUT,
+        },
+    );
     let (shutdown, signalled) = oneshot::channel();
     let served = tokio::spawn(ipc_server::serve(listener, state.clone(), signalled));
     tokio::spawn({
@@ -181,6 +369,7 @@ pub fn start(paths: &Paths) -> Result<Daemon, StartFailure> {
         guard,
         state,
         socket_file,
+        listen,
         shutdown,
         served,
     })
@@ -217,12 +406,22 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    use crate::daemon::state::{DEFAULT_HTTP_LISTEN, DEFAULT_SOCKS_LISTEN};
-
     use super::*;
 
     fn paths_in(home: &tempfile::TempDir) -> Paths {
         Paths::from_home(home.path())
+    }
+
+    fn ephemeral() -> Listen {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        Listen {
+            http: addr,
+            socks: addr,
+        }
+    }
+
+    fn start_ephemeral(paths: &Paths) -> Daemon {
+        start_on(paths, ephemeral()).unwrap()
     }
 
     async fn ask(socket_file: &Path, line: &str) -> Response {
@@ -244,7 +443,7 @@ mod tests {
     async fn a_fresh_daemon_answers_status_over_the_socket() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths_in(&home);
-        let daemon = start(&paths).unwrap();
+        let daemon = start_ephemeral(&paths);
 
         let answer = ask_command(daemon.socket_file(), &Command::Status).await;
 
@@ -269,19 +468,58 @@ mod tests {
         assert_eq!(rules.prefer, 0);
         assert_eq!(rules.never, 0);
         assert_eq!(init_path, None);
-        assert_eq!(http_listen, DEFAULT_HTTP_LISTEN);
-        assert_eq!(socks_listen, DEFAULT_SOCKS_LISTEN);
-        assert!(!http_bound);
-        assert!(!socks_bound);
+        let Listen { http, socks } = daemon.listen();
+        assert_eq!(http_listen, http);
+        assert_eq!(socks_listen, socks);
+        assert!(http_bound);
+        assert!(socks_bound);
 
         daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn both_front_ends_answer_before_any_rule_is_loaded() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths_in(&home);
+        let daemon = start_ephemeral(&paths);
+        let Listen { http, socks } = daemon.listen();
+
+        assert!(tokio::net::TcpStream::connect(http).await.is_ok());
+        assert!(tokio::net::TcpStream::connect(socks).await.is_ok());
+        assert_ne!(http.port(), 0);
+        assert_ne!(socks.port(), 0);
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_address_another_listener_holds_refuses_the_start() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths_in(&home);
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Listen { http: _, socks } = ephemeral();
+
+        let started = start_on(
+            &paths,
+            Listen {
+                http: squatter.local_addr().unwrap(),
+                socks,
+            },
+        );
+
+        let Err(failure) = started else {
+            panic!("a held address must refuse the start");
+        };
+        let StartFailure::Io(_failure) = &failure else {
+            panic!("a held address must fail with io: {failure}");
+        };
     }
 
     #[tokio::test]
     async fn one_connection_carries_one_command_per_line() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths_in(&home);
-        let daemon = start(&paths).unwrap();
+        let daemon = start_ephemeral(&paths);
 
         let stream = UnixStream::connect(daemon.socket_file()).await.unwrap();
         let (reader, mut writer) = stream.into_split();
@@ -309,7 +547,7 @@ mod tests {
     async fn a_malformed_line_is_answered_with_invalid_args() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths_in(&home);
-        let daemon = start(&paths).unwrap();
+        let daemon = start_ephemeral(&paths);
 
         let answer = ask(daemon.socket_file(), "{not json").await;
 
@@ -326,7 +564,7 @@ mod tests {
     async fn the_socket_is_readable_only_by_its_owner() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths_in(&home);
-        let daemon = start(&paths).unwrap();
+        let daemon = start_ephemeral(&paths);
 
         let socket = fs::metadata(daemon.socket_file()).unwrap();
         assert!(socket.file_type().is_socket());
@@ -339,7 +577,7 @@ mod tests {
     async fn a_clean_shutdown_removes_the_socket_and_the_pid_file() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths_in(&home);
-        let daemon = start(&paths).unwrap();
+        let daemon = start_ephemeral(&paths);
         assert!(paths.socket_file().exists());
         assert!(paths.pid_file().exists());
 
@@ -357,7 +595,7 @@ mod tests {
         fs::write(paths.pid_file(), b"4294967294\n").unwrap();
         fs::write(paths.socket_file(), b"not a socket").unwrap();
 
-        let daemon = start(&paths).unwrap();
+        let daemon = start_ephemeral(&paths);
 
         assert!(
             fs::metadata(paths.socket_file())

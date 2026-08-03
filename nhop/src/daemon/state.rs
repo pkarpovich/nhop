@@ -1,3 +1,4 @@
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -5,14 +6,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwap;
 use nhop_ipc::{
-    Command, ErrKind, HealthState, LastLoadView, LoadId, LoadOutcome, Paths, Response, RuleClass,
+    Command, ErrKind, LastLoadView, LoadId, LoadOutcome, Paths, Response, RuleClass,
     RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView, Timestamp,
     UpstreamAddr,
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
-use crate::daemon::staging::{Committed, FailedCommand, Listen, LoadIds, Staging};
+use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
+use crate::proxy::{
+    ConnCtx, EventTx, HealthHandle, InvalidUpstream, Listen, NO_UPSTREAM, Upstream,
+};
 use crate::rules::{InvalidRule, RuleId, Ruleset};
 
 /// Address the HTTP front end binds until the init script moves it.
@@ -73,17 +78,115 @@ impl LiveRules {
     }
 }
 
+/// Upstream serving traffic, published the same way the ruleset is.
+#[derive(Debug, Clone)]
+pub struct LiveUpstream(Arc<ArcSwap<SocketAddr>>);
+
+impl Default for LiveUpstream {
+    fn default() -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(NO_UPSTREAM)))
+    }
+}
+
+impl LiveUpstream {
+    /// Returns the address new connections are handed to at this instant.
+    pub fn snapshot(&self) -> SocketAddr {
+        let Self(live) = self;
+        **live.load()
+    }
+
+    /// Swaps in an address for connections accepted from now on.
+    pub fn publish(&self, addr: SocketAddr) {
+        let Self(live) = self;
+        live.store(Arc::new(addr));
+    }
+}
+
+/// Everything a front end reads without going through the state task.
+#[derive(Debug, Clone, Default)]
+pub struct Live {
+    rules: LiveRules,
+    upstream: LiveUpstream,
+    health: HealthHandle,
+    events: EventTx,
+}
+
+impl Live {
+    /// Returns the context one accepted connection is routed by.
+    pub fn accepted(&self) -> ConnCtx {
+        let Self {
+            rules,
+            upstream,
+            health,
+            events,
+        } = self;
+        ConnCtx {
+            rules: rules.snapshot(),
+            health: health.clone(),
+            upstream: upstream.snapshot(),
+            events: events.clone(),
+        }
+    }
+
+    /// Returns the ruleset publication.
+    pub fn rules(&self) -> &LiveRules {
+        &self.rules
+    }
+
+    /// Returns the upstream publication.
+    pub fn upstream(&self) -> &LiveUpstream {
+        &self.upstream
+    }
+
+    /// Returns the upstream verdict.
+    pub fn health(&self) -> &HealthHandle {
+        &self.health
+    }
+}
+
+/// What the state task starts with.
+#[derive(Debug)]
+pub struct StateConfig {
+    /// Cells the front ends read their per-connection snapshot from.
+    pub live: Live,
+    /// Front ends a committed load rebinds.
+    pub frontends: Frontends,
+    /// Addresses the front ends were bound on.
+    pub listen: Listen,
+    /// How long an init-script run may take before it is killed.
+    pub load_timeout: Duration,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            live: Live::default(),
+            frontends: Frontends::Unbound,
+            listen: Listen {
+                http: DEFAULT_HTTP_LISTEN,
+                socks: DEFAULT_SOCKS_LISTEN,
+            },
+            load_timeout: LOAD_TIMEOUT,
+        }
+    }
+}
+
 /// Client end of the task that owns every piece of mutable daemon state.
 #[derive(Debug, Clone)]
 pub struct StateHandle {
     requests: mpsc::Sender<Request>,
-    rules: LiveRules,
+    live: Live,
 }
 
 impl StateHandle {
     /// Returns the publication a connection takes its ruleset snapshot from.
     pub fn rules(&self) -> &LiveRules {
-        &self.rules
+        self.live.rules()
+    }
+
+    /// Returns the cells the front ends read.
+    pub fn live(&self) -> &Live {
+        &self.live
     }
 
     /// Sends one command to the state task and waits for its single reply.
@@ -107,18 +210,25 @@ fn state_gone() -> Response {
 }
 
 /// Starts the state task and returns the handle every command travels through.
-pub fn spawn(paths: &Paths) -> StateHandle {
-    spawn_with_timeout(paths, LOAD_TIMEOUT)
-}
-
-/// Starts the state task with an init-run timeout other than [`LOAD_TIMEOUT`].
-pub fn spawn_with_timeout(paths: &Paths, load_timeout: Duration) -> StateHandle {
-    let rules = LiveRules::default();
+pub fn spawn(paths: &Paths, config: StateConfig) -> StateHandle {
+    let StateConfig {
+        live,
+        frontends,
+        listen,
+        load_timeout,
+    } = config;
     let (requests, inbox) = mpsc::channel(REQUEST_CAPACITY);
     let (finished, completions) = mpsc::channel(1);
-    let state = DaemonState::new(paths.clone(), rules.clone(), load_timeout, finished);
+    let state = DaemonState::new(
+        paths.clone(),
+        live.clone(),
+        frontends,
+        listen,
+        load_timeout,
+        finished,
+    );
     tokio::spawn(serve(state, inbox, completions));
-    StateHandle { requests, rules }
+    StateHandle { requests, live }
 }
 
 async fn serve(
@@ -175,13 +285,11 @@ struct Settled {
 struct DaemonState {
     started: Instant,
     paths: Paths,
-    rules: LiveRules,
+    live: Live,
+    frontends: Frontends,
     http_listen: SocketAddr,
-    http_bind: BindState,
     socks_listen: SocketAddr,
-    socks_bind: BindState,
     upstream: UpstreamAddr,
-    health: HealthState,
     health_changed_at: SystemTime,
     init_path: Option<PathBuf>,
     last_load: Option<LastLoadView>,
@@ -194,20 +302,21 @@ struct DaemonState {
 impl DaemonState {
     fn new(
         paths: Paths,
-        rules: LiveRules,
+        live: Live,
+        frontends: Frontends,
+        listen: Listen,
         load_timeout: Duration,
         finished: mpsc::Sender<ScriptOutcome>,
     ) -> Self {
+        let Listen { http, socks } = listen;
         Self {
             started: Instant::now(),
             paths,
-            rules,
-            http_listen: DEFAULT_HTTP_LISTEN,
-            http_bind: BindState::Unbound,
-            socks_listen: DEFAULT_SOCKS_LISTEN,
-            socks_bind: BindState::Unbound,
+            live,
+            frontends,
+            http_listen: http,
+            socks_listen: socks,
             upstream: UpstreamAddr(String::new()),
-            health: HealthState::Down,
             health_changed_at: SystemTime::now(),
             init_path: None,
             last_load: None,
@@ -246,7 +355,7 @@ impl DaemonState {
             Command::Reload { path } => self.reload(path, reply),
             Command::On => self.reload(None, reply),
             Command::Off => {
-                self.rules.publish(Ruleset::default());
+                self.live.rules().publish(Ruleset::default());
                 answer(reply, Response::Ok);
             }
             Command::Test { host: _, port: _ } | Command::Doctor | Command::Subscribe => {
@@ -278,9 +387,9 @@ impl DaemonState {
                 None => vanished(),
             },
             Target::Live => {
-                let mut rules = self.rules.snapshot().as_ref().clone();
+                let mut rules = self.live.rules().snapshot().as_ref().clone();
                 let Err(failure) = rules.push(class, kind, value) else {
-                    self.rules.publish(rules);
+                    self.live.rules().publish(rules);
                     return Response::Ok;
                 };
                 invalid(&failure)
@@ -303,14 +412,22 @@ impl DaemonState {
                 None => vanished(),
             },
             Target::Live => {
-                self.rules.publish(Ruleset::default());
+                self.live.rules().publish(Ruleset::default());
                 Response::Ok
             }
         }
     }
 
     fn set_upstream(&mut self, addr: UpstreamAddr, load: Option<LoadId>) -> Response {
-        match self.target(load) {
+        let target = self.target(load);
+        let upstream = match Upstream::parse(addr) {
+            Ok(upstream) => upstream,
+            Err(failure) => {
+                self.reject_staged(&target);
+                return unreadable(&failure);
+            }
+        };
+        match target {
             Target::Refused(refusal) => *refusal,
             Target::Staged => match &mut self.load {
                 Some(InFlight {
@@ -318,13 +435,13 @@ impl DaemonState {
                     staged,
                     reply: _,
                 }) => {
-                    staged.set_upstream(addr);
+                    staged.set_upstream(upstream);
                     Response::Ok
                 }
                 None => vanished(),
             },
             Target::Live => {
-                self.upstream = addr;
+                self.adopt_upstream(Some(upstream));
                 Response::Ok
             }
         }
@@ -345,12 +462,36 @@ impl DaemonState {
                 None => vanished(),
             },
             Target::Live => {
-                let Listen { http, socks } = listen;
-                self.http_listen = http;
-                self.socks_listen = socks;
-                Response::Ok
+                let Err(failure) = self.rebind(listen) else {
+                    return Response::Ok;
+                };
+                unbindable(&failure)
             }
         }
+    }
+
+    fn reject_staged(&mut self, target: &Target) {
+        match target {
+            Target::Staged => {}
+            Target::Live => return,
+            Target::Refused(_refusal) => return,
+        }
+        let Some(InFlight {
+            id: _,
+            staged,
+            reply: _,
+        }) = &mut self.load
+        else {
+            return;
+        };
+        staged.fail(FailedCommand::SetUpstream);
+    }
+
+    fn rebind(&mut self, listen: Listen) -> io::Result<()> {
+        let Listen { http, socks } = self.frontends.rebind(listen)?;
+        self.http_listen = http;
+        self.socks_listen = socks;
+        Ok(())
     }
 
     fn in_flight(&self) -> Option<LoadId> {
@@ -454,11 +595,19 @@ impl DaemonState {
         match outcome {
             ScriptOutcome::Succeeded => {
                 let Some(failed) = staged.failure() else {
-                    self.commit(staged);
+                    let Err(failure) = self.commit(staged) else {
+                        return Settled {
+                            outcome: LoadOutcome::Ok,
+                            command: None,
+                            message: None,
+                        };
+                    };
                     return Settled {
-                        outcome: LoadOutcome::Ok,
-                        command: None,
-                        message: None,
+                        outcome: LoadOutcome::Failed,
+                        command: Some(FailedCommand::SetListen.name().to_owned()),
+                        message: Some(format!(
+                            "the init script could not move the front ends: {failure}"
+                        )),
                     };
                 };
                 Settled {
@@ -494,42 +643,52 @@ impl DaemonState {
         }
     }
 
-    fn commit(&mut self, staged: Staging) {
+    fn commit(&mut self, staged: Staging) -> io::Result<()> {
         let Committed {
             rules,
             upstream,
             listen,
         } = staged.commit();
-        self.rules.publish(rules);
-        self.adopt_upstream(upstream);
-        self.adopt_listen(listen);
+        let Some(listen) = listen else {
+            self.publish(rules, upstream);
+            return Ok(());
+        };
+        self.rebind(listen)?;
+        self.publish(rules, upstream);
+        Ok(())
     }
 
-    fn adopt_upstream(&mut self, upstream: Option<UpstreamAddr>) {
+    fn publish(&mut self, rules: Ruleset, upstream: Option<Upstream>) {
+        self.live.rules().publish(rules);
+        self.adopt_upstream(upstream);
+    }
+
+    fn adopt_upstream(&mut self, upstream: Option<Upstream>) {
         let Some(upstream) = upstream else {
             return;
         };
-        self.upstream = upstream;
+        self.upstream = upstream.written().clone();
+        self.live.upstream().publish(upstream.socket());
     }
 
-    fn adopt_listen(&mut self, listen: Option<Listen>) {
-        let Some(Listen { http, socks }) = listen else {
-            return;
-        };
-        self.http_listen = http;
-        self.socks_listen = socks;
+    fn bind_state(&self) -> BindState {
+        match &self.frontends {
+            Frontends::Unbound => BindState::Unbound,
+            Frontends::Bound(_bound) => BindState::Bound,
+        }
     }
 
     fn status(&self) -> StatusView {
-        let rules = self.rules.snapshot();
+        let rules = self.live.rules().snapshot();
+        let bound = self.bind_state().is_bound();
         StatusView {
             uptime_secs: self.started.elapsed().as_secs(),
             http_listen: self.http_listen,
-            http_bound: self.http_bind.is_bound(),
+            http_bound: bound,
             socks_listen: self.socks_listen,
-            socks_bound: self.socks_bind.is_bound(),
+            socks_bound: bound,
             upstream: self.upstream.clone(),
-            health: self.health,
+            health: self.live.health().state(),
             health_changed_at: Timestamp(self.health_changed_at),
             init_path: self.init_path.clone(),
             last_load: self.last_load.clone(),
@@ -547,7 +706,7 @@ impl DaemonState {
     }
 
     fn rule_views(&self) -> Vec<RuleView> {
-        let rules = self.rules.snapshot();
+        let rules = self.live.rules().snapshot();
         let mut views = Vec::with_capacity(rules.rules().len());
         for rule in rules.rules() {
             let RuleId(index) = rule.id();
@@ -588,6 +747,20 @@ fn invalid(failure: &InvalidRule) -> Response {
     }
 }
 
+fn unreadable(failure: &InvalidUpstream) -> Response {
+    Response::Err {
+        kind: ErrKind::InvalidArgs,
+        message: failure.to_string(),
+    }
+}
+
+fn unbindable(failure: &io::Error) -> Response {
+    Response::Err {
+        kind: ErrKind::Internal,
+        message: format!("cannot move the front ends: {failure}"),
+    }
+}
+
 fn unserved() -> Response {
     Response::Err {
         kind: ErrKind::Internal,
@@ -613,7 +786,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use nhop_ipc::{DecisionKind, Host, Port, RuleKind, RuleValue};
+    use nhop_ipc::{DecisionKind, HealthState, Host, Port, RuleKind, RuleValue};
 
     use crate::rules::Decision;
 
@@ -643,7 +816,7 @@ mod tests {
 
     fn spawn_here() -> (tempfile::TempDir, StateHandle) {
         let (home, paths) = temp_paths();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         (home, state)
     }
 
@@ -713,7 +886,7 @@ mod tests {
     async fn an_init_run_that_exits_zero_swaps_its_rules_in() {
         let (home, paths) = temp_paths();
         write_handshake_script(&paths, home.path(), 0);
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         let reloading = tokio::spawn({
             let state = state.clone();
             async move { state.call(Command::Reload { path: None }).await }
@@ -765,7 +938,7 @@ mod tests {
     async fn an_init_run_that_exits_non_zero_leaves_the_previous_rules_live() {
         let (home, paths) = temp_paths();
         write_handshake_script(&paths, home.path(), 1);
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         state.rules().publish(ruleset(&[(
             RuleClass::Prefer,
             RuleKind::Suffix,
@@ -821,7 +994,7 @@ mod tests {
     async fn a_command_of_another_run_is_refused_while_one_is_in_flight() {
         let (home, paths) = temp_paths();
         write_handshake_script(&paths, home.path(), 0);
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         let reloading = tokio::spawn({
             let state = state.clone();
             async move { state.call(Command::Reload { path: None }).await }
@@ -863,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_carrying_a_stale_run_is_refused_once_the_run_is_over() {
         let (_home, paths) = temp_paths();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
 
         let answer = state
             .call(add_rule_command(
@@ -886,7 +1059,13 @@ mod tests {
     async fn a_run_that_outlives_the_timeout_is_killed_and_discarded() {
         let (home, paths) = temp_paths();
         write_script(&paths, "#!/bin/sh\nsleep 30\n");
-        let state = spawn_with_timeout(&paths, Duration::from_millis(100));
+        let state = spawn(
+            &paths,
+            StateConfig {
+                load_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+        );
         state.rules().publish(ruleset(&[(
             RuleClass::Prefer,
             RuleKind::Suffix,
@@ -919,7 +1098,7 @@ mod tests {
     async fn a_rejected_rule_fails_the_run_even_when_the_script_exits_zero() {
         let (home, paths) = temp_paths();
         write_handshake_script(&paths, home.path(), 0);
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         let reloading = tokio::spawn({
             let state = state.clone();
             async move { state.call(Command::Reload { path: None }).await }
@@ -972,7 +1151,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_init_file_is_reported_and_leaves_the_ruleset_empty() {
         let (_home, paths) = temp_paths();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
 
         let answer = state.call(Command::Reload { path: None }).await;
 
@@ -994,7 +1173,7 @@ mod tests {
         fs::create_dir_all(paths.config_dir()).unwrap();
         fs::write(&elsewhere, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
 
         let answer = state
             .call(Command::Reload {
@@ -1015,7 +1194,7 @@ mod tests {
         fs::create_dir_all(paths.config_dir()).unwrap();
         fs::write(&elsewhere, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         state
             .call(Command::Reload {
                 path: Some(elsewhere.clone()),
@@ -1043,7 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_outside_a_run_applies_at_once() {
         let (_home, paths) = temp_paths();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
 
         assert_eq!(
             state
@@ -1095,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_value_outside_a_run_leaves_the_live_rules_alone() {
         let (_home, paths) = temp_paths();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         state
             .call(add_rule_command(
                 RuleClass::Require,
@@ -1126,7 +1305,7 @@ mod tests {
     async fn the_upstream_and_the_listen_addresses_of_a_run_move_only_on_commit() {
         let (home, paths) = temp_paths();
         write_handshake_script(&paths, home.path(), 0);
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
         let reloading = tokio::spawn({
             let state = state.clone();
             async move { state.call(Command::Reload { path: None }).await }
@@ -1167,7 +1346,7 @@ mod tests {
         let (_home, paths) = temp_paths();
         write_script(&paths, "#!/bin/sh\nexit 0\n");
         fs::set_permissions(paths.init_file(), fs::Permissions::from_mode(0o644)).unwrap();
-        let state = spawn(&paths);
+        let state = spawn(&paths, StateConfig::default());
 
         let answer = state.call(Command::Reload { path: None }).await;
 

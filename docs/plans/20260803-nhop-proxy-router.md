@@ -477,34 +477,63 @@ failing halfway leaves no rule behind.
 - Create: `nhop/src/proxy/mod.rs`, `nhop/src/proxy/http.rs`, `nhop/tests/support/mod.rs`
 - Modify: `nhop/src/daemon/mod.rs`
 
-- [ ] in `proxy/mod.rs` define the single boundary the front ends use:
+- [x] in `proxy/mod.rs` define the single boundary the front ends use:
       `struct ConnCtx { rules: Arc<Ruleset>, health: HealthHandle, upstream: SocketAddr, events: EventTx }`
       and `trait NextHop { async fn dial(&self, host: &Host, port: Port, decision: Decision) -> io::Result<TcpStream> }`.
       Task 8 supplies the real implementation; this task uses a test double
-- [ ] in `daemon/mod.rs` add `spawn_frontends(state)`: bind `TcpListener` on the configured HTTP and
+- [x] in `daemon/mod.rs` add `spawn_frontends(state)`: bind `TcpListener` on the configured HTTP and
       SOCKS addresses (defaults `127.0.0.1:7890` and `127.0.0.1:7891`), **before** the init script
       runs, and spawn a task per accepted stream with a `ConnCtx` carrying the ruleset snapshot
-- [ ] `SetListen` inside a load takes effect only on commit; rebinding closes the old listener and
+- [x] `SetListen` inside a load takes effect only on commit; rebinding closes the old listener and
       keeps existing connections; if the new bind fails the old listener is retained and the load fails
-- [ ] parse the request head into a single `[u8; 8192]` stack buffer up to `\r\n\r\n`; no `Vec` or
+- [x] parse the request head into a single `[u8; 8192]` stack buffer up to `\r\n\r\n`; no `Vec` or
       `String` for the head; exceeding it closes the connection
-- [ ] `CONNECT host:port` - reply `200 Connection established` only after the next hop is dialled,
+- [x] `CONNECT host:port` - reply `200 Connection established` only after the next hop is dialled,
       so a failed dial is a proper error response and not a dead tunnel
-- [ ] absolute-form plain HTTP (`GET http://host/path`): authority from the request target, falling
+- [x] absolute-form plain HTTP (`GET http://host/path`): authority from the request target, falling
       back to the `Host` header, default port 80; forward the original bytes verbatim; **handle
       exactly one such request per client connection and close after relaying the response**, so a
       later request can never inherit the first request's next hop
-- [ ] failures: `UpstreamDown` rendering per Technical Details; a failed direct dial is `502` with a
+- [x] failures: `UpstreamDown` rendering per Technical Details; a failed direct dial is `502` with a
       one-line body naming host:port; a malformed request line is `400`
-- [ ] relay with `tokio::io::copy_bidirectional`
-- [ ] create the shared harness in `nhop/tests/support/mod.rs`: `StubSocks5::start()` returning a
+- [x] relay with `tokio::io::copy_bidirectional`
+- [x] create the shared harness in `nhop/tests/support/mod.rs`: `StubSocks5::start()` returning a
       handle whose `requests()` reports `{atyp, host, port}` and which echoes payload bytes;
       `StubOrigin::start()` echoing and counting connections; `TestDaemon::start(paths, upstream)`
       exposing ephemeral HTTP, SOCKS and IPC addresses. Tasks 7, 8 and 15 reuse this module
-- [ ] write tests for CONNECT through to the stub origin, for absolute-form GET, for the 8 KiB cap,
+- [x] write tests for CONNECT through to the stub origin, for absolute-form GET, for the 8 KiB cap,
       for a malformed request line, for the 502-on-require-down case, and for a second pipelined
       request not being proxied
-- [ ] run `mise run check` - must pass before task 7
+- [x] run `mise run check` - must pass before task 7
+
+➕ `NextHop` returns `Pin<Box<dyn Future>>` rather than `async fn`: an `async fn` in a trait is not
+dyn-compatible, and the front ends hold the dialer as `Arc<dyn NextHop>` so it can be swapped for
+Task 8's without threading a type parameter through `DaemonState` and every test. One box per dial.
+
+➕ `spawn_frontends(live, listen)` takes the published cells, not `StateHandle`: the listeners must
+exist before the state task so the state task can own and rebind them. `daemon::start_on(paths,
+listen)` is the same start path with explicit addresses - every test uses it with port 0, so no test
+touches 7890/7891, and `Daemon::listen()` reports what the kernel actually handed out. `state::spawn`
+now takes one `StateConfig` instead of the `spawn`/`spawn_with_timeout` pair.
+
+➕ Until Task 8 lands, the dialer is `DirectHop`, which dials the destination directly whatever the
+decision, and the SOCKS listener accepts and closes. Both are replaced in place (Tasks 8 and 7); the
+`UpstreamDown` path is proven here with the `DownHop` double from the harness.
+
+➕ `Upstream` (parsed in `proxy/mod.rs`) is validated when `set_upstream` is issued, not at commit:
+`ConnCtx.upstream` is a `SocketAddr`, so `socks5://<ip>:<port>` is now the accepted form and a
+hostname is rejected with `ErrKind::InvalidArgs`. `LiveUpstream` publishes it beside `LiveRules`,
+both bundled in `Live` alongside `HealthHandle` and `EventTx`; `Live::accepted()` is the single place
+a `ConnCtx` is built. Until an init script names one, the published address is `NO_UPSTREAM`
+(`127.0.0.1:0`), which fails to dial at once. `staging::FailedCommand` gains `set_upstream` and
+`set_listen` so a run rejected on either is reported by name, and `Listen` moved from `staging.rs` to
+`proxy/mod.rs`. `BindState` in `status` is now derived from the front ends themselves.
+
+➕ Beyond the listed files: `nhop/src/lib.rs` exports `proxy`, `daemon/state.rs` and
+`daemon/staging.rs` are modified as above, `nhop/tests/http_proxy.rs` holds the socket-level tests,
+and `nhop/tests/init_run.rs` plus the `cli` tests move to ephemeral front-end ports. The harness
+carries `#![allow(dead_code)]` because each test binary compiles it separately and none uses all of
+it, and it adds two `NextHop` doubles (`StubHop`, `DownHop`) that Tasks 7 and 8 reuse.
 
 ### Task 7: SOCKS5 front end
 

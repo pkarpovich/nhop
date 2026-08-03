@@ -1,0 +1,333 @@
+use std::io;
+use std::str;
+
+use nhop_ipc::{Host, Port};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::net::TcpStream;
+
+use crate::proxy::{ConnCtx, NextHop, UpstreamDown};
+
+/// Largest request head the front end reads, in bytes.
+pub const HEAD_LIMIT: usize = 8192;
+
+const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+const BAD_REQUEST: &str = "400 Bad Request";
+const BAD_GATEWAY: &str = "502 Bad Gateway";
+const DEFAULT_PORT: Port = Port(80);
+
+/// What the client asked the front end to do with its connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    /// `CONNECT host:port`, an opaque tunnel.
+    Connect,
+    /// Any other method, carrying its authority in the request target or the `Host` header.
+    Absolute,
+}
+
+/// The single request one client connection carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Request {
+    method: Method,
+    host: Host,
+    port: Port,
+}
+
+/// Serves one connection of the HTTP front end and closes it.
+///
+/// Exactly one request is routed per connection: whatever the client pipelined behind the head is
+/// discarded, so a later request can never inherit this one's next hop.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when the client or the next hop fails while the head is read, the answer
+/// is written or the relay is running.
+///
+/// [`io::Error`]: std::io::Error
+pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io::Result<()> {
+    let mut buffer = [0u8; HEAD_LIMIT];
+    let Some(len) = read_head(&mut client, &mut buffer).await? else {
+        return Ok(());
+    };
+    let head = &buffer[..len];
+    let Some(request) = parse_head(head) else {
+        return respond(&mut client, BAD_REQUEST, "nhop: malformed request").await;
+    };
+    let Request { method, host, port } = request;
+    let decision = ctx.rules.decide(&host, port);
+    let dialled = hop.dial(&host, port, decision).await;
+    let mut next = match dialled {
+        Ok(next) => next,
+        Err(failure) => return refuse(&mut client, &failure, &host, port).await,
+    };
+    match method {
+        Method::Connect => {
+            client.write_all(ESTABLISHED).await?;
+            client.flush().await?;
+        }
+        Method::Absolute => {
+            next.write_all(head).await?;
+            next.flush().await?;
+        }
+    }
+    let _relayed = copy_bidirectional(&mut client, &mut next).await?;
+    Ok(())
+}
+
+async fn read_head(
+    client: &mut TcpStream,
+    buffer: &mut [u8; HEAD_LIMIT],
+) -> io::Result<Option<usize>> {
+    let mut len = 0;
+    loop {
+        if len == buffer.len() {
+            return Ok(None);
+        }
+        let read = client.read(&mut buffer[len..]).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let scanned = len.saturating_sub(3);
+        len += read;
+        let Some(end) = head_end(&buffer[..len], scanned) else {
+            continue;
+        };
+        return Ok(Some(end));
+    }
+}
+
+fn head_end(buffer: &[u8], from: usize) -> Option<usize> {
+    let last = buffer.len().checked_sub(4)?;
+    for index in from..=last {
+        if &buffer[index..index + 4] == b"\r\n\r\n" {
+            return Some(index + 4);
+        }
+    }
+    None
+}
+
+fn parse_head(head: &[u8]) -> Option<Request> {
+    let Ok(head) = str::from_utf8(head) else {
+        return None;
+    };
+    let (line, headers) = head.split_once("\r\n")?;
+    let mut fields = line.split(' ');
+    let method = fields.next()?;
+    let target = fields.next()?;
+    let version = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    if method == "CONNECT" {
+        let (host, port) = split_authority(target, None)?;
+        return Some(Request {
+            method: Method::Connect,
+            host,
+            port,
+        });
+    }
+    let authority = match absolute_authority(target) {
+        Some(authority) => authority,
+        None => header(headers, "host")?,
+    };
+    let (host, port) = split_authority(authority, Some(DEFAULT_PORT))?;
+    Some(Request {
+        method: Method::Absolute,
+        host,
+        port,
+    })
+}
+
+fn absolute_authority(target: &str) -> Option<&str> {
+    let rest = target.strip_prefix("http://")?;
+    let Some((authority, _path)) = rest.split_once('/') else {
+        return Some(rest);
+    };
+    Some(authority)
+}
+
+fn header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    for line in headers.split("\r\n") {
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        if field.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+fn split_authority(authority: &str, fallback: Option<Port>) -> Option<(Host, Port)> {
+    let Some(bracketed) = authority.strip_prefix('[') else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return named(authority, fallback?);
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            return None;
+        };
+        return named(host, Port(port));
+    };
+    let (host, rest) = bracketed.split_once(']')?;
+    let Some(port) = rest.strip_prefix(':') else {
+        return named(host, fallback?);
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return None;
+    };
+    named(host, Port(port))
+}
+
+fn named(host: &str, port: Port) -> Option<(Host, Port)> {
+    if host.is_empty() {
+        return None;
+    }
+    Some((Host(host.to_owned()), port))
+}
+
+async fn refuse(
+    client: &mut TcpStream,
+    failure: &io::Error,
+    host: &Host,
+    port: Port,
+) -> io::Result<()> {
+    let Some(down) = UpstreamDown::carried_by(failure) else {
+        let Host(host) = host;
+        let Port(port) = port;
+        let body = format!("nhop: cannot reach {host}:{port}");
+        return respond(client, BAD_GATEWAY, &body).await;
+    };
+    respond(client, BAD_GATEWAY, &down.to_string()).await
+}
+
+async fn respond(client: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        len = body.len()
+    );
+    client.write_all(head.as_bytes()).await?;
+    client.write_all(body.as_bytes()).await?;
+    client.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(head: &str) -> Option<Request> {
+        parse_head(head.as_bytes())
+    }
+
+    fn request(method: Method, host: &str, port: u16) -> Option<Request> {
+        Some(Request {
+            method,
+            host: Host(host.to_owned()),
+            port: Port(port),
+        })
+    }
+
+    #[test]
+    fn a_connect_request_names_its_authority() {
+        assert_eq!(
+            parse("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            request(Method::Connect, "example.com", 443)
+        );
+    }
+
+    #[test]
+    fn a_connect_request_without_a_port_is_malformed() {
+        assert_eq!(parse("CONNECT example.com HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(parse("CONNECT example.com:https HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn an_absolute_form_request_takes_its_authority_from_the_target() {
+        assert_eq!(
+            parse(
+                "GET http://example.com/index.html HTTP/1.1\r\nHost: elsewhere.example.net\r\n\r\n"
+            ),
+            request(Method::Absolute, "example.com", 80)
+        );
+        assert_eq!(
+            parse("GET http://example.com:8080/ HTTP/1.1\r\n\r\n"),
+            request(Method::Absolute, "example.com", 8080)
+        );
+        assert_eq!(
+            parse("GET http://example.com HTTP/1.1\r\n\r\n"),
+            request(Method::Absolute, "example.com", 80)
+        );
+    }
+
+    #[test]
+    fn an_origin_form_request_falls_back_to_the_host_header() {
+        assert_eq!(
+            parse("GET /index.html HTTP/1.1\r\nAccept: */*\r\nHost: example.com:8080\r\n\r\n"),
+            request(Method::Absolute, "example.com", 8080)
+        );
+        assert_eq!(
+            parse("POST /submit HTTP/1.1\r\nhost:  example.com \r\n\r\n"),
+            request(Method::Absolute, "example.com", 80)
+        );
+    }
+
+    #[test]
+    fn an_origin_form_request_without_a_host_header_is_malformed() {
+        assert_eq!(
+            parse("GET /index.html HTTP/1.1\r\nAccept: */*\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_malformed_request_line_is_rejected() {
+        assert_eq!(parse("GET\r\n\r\n"), None);
+        assert_eq!(parse("GET /index.html\r\n\r\n"), None);
+        assert_eq!(
+            parse("GET / HTTP/1.1 extra\r\nHost: example.com\r\n\r\n"),
+            None
+        );
+        assert_eq!(parse("GET / SPDY/1.1\r\nHost: example.com\r\n\r\n"), None);
+        assert_eq!(parse("\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn a_bracketed_address_keeps_its_colons() {
+        assert_eq!(
+            parse("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n\r\n"),
+            request(Method::Connect, "2001:db8::1", 443)
+        );
+        assert_eq!(
+            parse("GET http://[2001:db8::1]/ HTTP/1.1\r\n\r\n"),
+            request(Method::Absolute, "2001:db8::1", 80)
+        );
+    }
+
+    #[test]
+    fn an_empty_authority_is_rejected() {
+        assert_eq!(parse("CONNECT :443 HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(parse("GET http://:80/ HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn the_head_ends_at_the_first_blank_line() {
+        let head = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody";
+        assert_eq!(head_end(head, 0), Some(head.len() - 4));
+    }
+
+    #[test]
+    fn a_head_that_has_not_ended_is_not_found() {
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\n", 0), None);
+        assert_eq!(head_end(b"\r\n\r", 0), None);
+        assert_eq!(head_end(b"", 0), None);
+    }
+
+    #[test]
+    fn the_scan_resumes_across_a_split_terminator() {
+        let head = b"GET / HTTP/1.1\r\n\r\n";
+        let boundary = head.len() - 2;
+        assert_eq!(head_end(&head[..boundary], 0), None);
+        assert_eq!(head_end(head, boundary.saturating_sub(3)), Some(head.len()));
+    }
+}

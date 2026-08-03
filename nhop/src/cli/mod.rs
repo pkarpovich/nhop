@@ -768,7 +768,15 @@ mod tests {
 
     async fn running_daemon() -> (tempfile::TempDir, Paths, Daemon) {
         let (home, paths) = temp_paths();
-        let daemon = daemon::start(&paths).unwrap();
+        let ephemeral = "127.0.0.1:0".parse().unwrap();
+        let daemon = daemon::start_on(
+            &paths,
+            crate::proxy::Listen {
+                http: ephemeral,
+                socks: ephemeral,
+            },
+        )
+        .unwrap();
         (home, paths, daemon)
     }
 

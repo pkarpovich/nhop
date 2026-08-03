@@ -1,7 +1,6 @@
-use std::net::SocketAddr;
+use nhop_ipc::{LoadId, RuleClass, RuleKind, RuleValue};
 
-use nhop_ipc::{LoadId, RuleClass, RuleKind, RuleValue, UpstreamAddr};
-
+use crate::proxy::{Listen, Upstream};
 use crate::rules::{InvalidRule, Ruleset};
 
 /// Command an init run was rejected on, named as it appears on the wire.
@@ -9,6 +8,10 @@ use crate::rules::{InvalidRule, Ruleset};
 pub enum FailedCommand {
     /// `add_rule` - the value could not be read as its kind.
     AddRule,
+    /// `set_upstream` - the address could not be read.
+    SetUpstream,
+    /// `set_listen` - the front ends could not be moved to the address.
+    SetListen,
 }
 
 impl FailedCommand {
@@ -16,17 +19,10 @@ impl FailedCommand {
     pub fn name(self) -> &'static str {
         match self {
             Self::AddRule => "add_rule",
+            Self::SetUpstream => "set_upstream",
+            Self::SetListen => "set_listen",
         }
     }
-}
-
-/// Addresses the front ends bind, held until the run that set them commits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Listen {
-    /// Address the HTTP front end binds.
-    pub http: SocketAddr,
-    /// Address the SOCKS5 front end binds.
-    pub socks: SocketAddr,
 }
 
 /// State a successful init run replaces the live state with.
@@ -35,7 +31,7 @@ pub struct Committed {
     /// Rules the run declared, in declaration order.
     pub rules: Ruleset,
     /// Upstream the run set, absent when it set none.
-    pub upstream: Option<UpstreamAddr>,
+    pub upstream: Option<Upstream>,
     /// Front-end addresses the run set, absent when it set none.
     pub listen: Option<Listen>,
 }
@@ -47,7 +43,7 @@ pub struct Committed {
 #[derive(Debug, Default)]
 pub struct Staging {
     rules: Ruleset,
-    upstream: Option<UpstreamAddr>,
+    upstream: Option<Upstream>,
     listen: Option<Listen>,
     failed: Option<FailedCommand>,
 }
@@ -78,8 +74,8 @@ impl Staging {
     }
 
     /// Points the run at an upstream.
-    pub fn set_upstream(&mut self, addr: UpstreamAddr) {
-        self.upstream = Some(addr);
+    pub fn set_upstream(&mut self, upstream: Upstream) {
+        self.upstream = Some(upstream);
     }
 
     /// Moves the front ends the run commits.
@@ -107,7 +103,8 @@ impl Staging {
         }
     }
 
-    fn fail(&mut self, command: FailedCommand) {
+    /// Marks the run as failed, keeping the command it was first rejected on.
+    pub fn fail(&mut self, command: FailedCommand) {
         match self.failed {
             Some(_first) => {}
             None => self.failed = Some(command),
@@ -130,7 +127,7 @@ impl LoadIds {
 
 #[cfg(test)]
 mod tests {
-    use nhop_ipc::{Host, Port};
+    use nhop_ipc::{Host, Port, UpstreamAddr};
 
     use crate::rules::{Decision, RuleId};
 
@@ -145,6 +142,10 @@ mod tests {
             http: "127.0.0.1:18080".parse().unwrap(),
             socks: "127.0.0.1:18081".parse().unwrap(),
         }
+    }
+
+    fn upstream(written: &str) -> Upstream {
+        Upstream::parse(UpstreamAddr(written.to_owned())).unwrap()
     }
 
     #[test]
@@ -214,21 +215,29 @@ mod tests {
     #[test]
     fn the_upstream_and_the_listen_addresses_travel_with_the_run() {
         let mut staging = Staging::default();
-        staging.set_upstream(UpstreamAddr("socks5://192.0.2.10:1080".to_owned()));
+        staging.set_upstream(upstream("socks5://192.0.2.10:1080"));
         staging.set_listen(listen());
-        staging.set_upstream(UpstreamAddr("socks5://192.0.2.11:1080".to_owned()));
+        staging.set_upstream(upstream("socks5://192.0.2.11:1080"));
 
         let Committed {
             rules: _,
-            upstream,
+            upstream: staged_upstream,
             listen: staged,
         } = staging.commit();
 
-        assert_eq!(
-            upstream,
-            Some(UpstreamAddr("socks5://192.0.2.11:1080".to_owned()))
-        );
+        assert_eq!(staged_upstream, Some(upstream("socks5://192.0.2.11:1080")));
         assert_eq!(staged, Some(listen()));
+    }
+
+    #[test]
+    fn a_command_can_fail_a_run_the_staging_itself_did_not_reject() {
+        let mut staging = Staging::default();
+        staging.fail(FailedCommand::SetUpstream);
+        staging.fail(FailedCommand::SetListen);
+
+        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstream));
+        assert_eq!(FailedCommand::SetUpstream.name(), "set_upstream");
+        assert_eq!(FailedCommand::SetListen.name(), "set_listen");
     }
 
     #[test]
