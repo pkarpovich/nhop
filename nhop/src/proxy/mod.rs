@@ -1,4 +1,5 @@
 pub mod http;
+pub mod socks5;
 
 use std::fmt;
 use std::future::Future;

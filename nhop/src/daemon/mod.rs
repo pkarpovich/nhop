@@ -161,7 +161,7 @@ impl Bound {
         let http = bind_tcp(http)?;
         let socks = bind_tcp(socks)?;
         self.http = accept_http(http, self.live.clone(), self.hop.clone())?;
-        self.socks = accept_socks(socks)?;
+        self.socks = accept_socks(socks, self.live.clone(), self.hop.clone())?;
         Ok(self.listen())
     }
 
@@ -201,7 +201,7 @@ impl Frontends {
         let http = bind_tcp(http)?;
         let socks = bind_tcp(socks)?;
         let http = accept_http(http, live.clone(), hop.clone())?;
-        let socks = accept_socks(socks)?;
+        let socks = accept_socks(socks, live.clone(), hop.clone())?;
         Ok(Self::Bound(Bound {
             live,
             hop,
@@ -257,13 +257,18 @@ fn accept_http(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io::
     Ok(Accepting { addr, accepting })
 }
 
-fn accept_socks(listener: TcpListener) -> io::Result<Accepting> {
+fn accept_socks(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io::Result<Accepting> {
     let addr = listener.local_addr()?;
     let accepting = tokio::spawn(async move {
         loop {
-            let Ok((_stream, _peer)) = listener.accept().await else {
+            let Ok((stream, _peer)) = listener.accept().await else {
                 return;
             };
+            let ctx = live.accepted();
+            let hop = hop.clone();
+            tokio::spawn(async move {
+                let _served = proxy::socks5::serve(stream, ctx, hop.as_ref()).await;
+            });
         }
     });
     Ok(Accepting { addr, accepting })

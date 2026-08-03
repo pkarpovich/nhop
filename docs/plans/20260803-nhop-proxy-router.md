@@ -541,19 +541,36 @@ it, and it adds two `NextHop` doubles (`StubHop`, `DownHop`) that Tasks 7 and 8 
 - Create: `nhop/src/proxy/socks5.rs`
 - Modify: `nhop/src/proxy/mod.rs`
 
-- [ ] no-auth handshake and `CONNECT` for address types IPv4 (`0x01`), domain (`0x03`) and IPv6
+- [x] no-auth handshake and `CONNECT` for address types IPv4 (`0x01`), domain (`0x03`) and IPv6
       (`0x04`); reject `BIND` and `UDP ASSOCIATE`
-- [ ] reply codes: success `0x00`, general failure `0x01`, host unreachable `0x04`, command not
+- [x] reply codes: success `0x00`, general failure `0x01`, host unreachable `0x04`, command not
       supported `0x07`, address type not supported `0x08`. The success reply carries ATYP `0x01`
       with BND.ADDR `0.0.0.0` and BND.PORT `0` - deliberate, the tunnel is opaque
-- [ ] pass the **domain name** to the upstream when the client sent one - never resolve locally
+- [x] pass the **domain name** to the upstream when the client sent one - never resolve locally
       first, because internal names only resolve inside the upstream's network
-- [ ] `UpstreamDown` renders as reply code `0x04` per Technical Details
-- [ ] byte-layout notes are the one place `//` comments are allowed
-- [ ] write tests for the handshake and each address type against the shared stubs
-- [ ] write tests asserting the exact reply bytes for success and for `BIND`
-- [ ] write a test asserting a domain-type request reaches the stub upstream as a name, not an IP
-- [ ] run `mise run check` - must pass before task 8
+- [x] `UpstreamDown` renders as reply code `0x04` per Technical Details
+- [x] byte-layout notes are the one place `//` comments are allowed
+- [x] write tests for the handshake and each address type against the shared stubs
+- [x] write tests asserting the exact reply bytes for success and for `BIND`
+- [x] write a test asserting a domain-type request reaches the stub upstream as a name, not an IP
+- [x] run `mise run check` - must pass before task 8
+
+➕ The name-not-an-IP assertion is made at the `NextHop` boundary, not against `StubSocks5`: the
+dialer wired into the front ends is still Task 6's `DirectHop`, so nothing in this task can put
+bytes on a SOCKS5 upstream. `a_domain_request_reaches_the_next_hop_as_a_name` asserts `StubHop`
+was handed `Host("example.com")` verbatim, which is the same property one boundary earlier -
+resolving locally would have turned it into an IP. Task 8 carries the name the rest of the way and
+asserts it on `StubSocks5.requests()`.
+
+➕ Parsing (`greet`, `request`) and reply writing (`answer`, `chosen`) are generic over
+`AsyncRead`/`AsyncWrite` rather than taking `TcpStream`, so the byte-level cases are unit tests over
+slices; `serve` keeps `TcpStream` because `copy_bidirectional` relays it. `Reply` owns the five
+codes in one place, and a malformed domain (non-UTF-8 or zero length) answers `0x01` rather than
+`0x08` - the address type was served, its content was not.
+
+➕ A greeting that offers no supported method, or names another SOCKS version, is answered
+`[0x05, 0xff]` and closed. `daemon/mod.rs` now hands `accept_socks` the same `Live` and
+`Arc<dyn NextHop>` the HTTP front end gets, replacing the accept-and-close loop in place.
 
 ### Task 8: Upstream dialer and health state
 
