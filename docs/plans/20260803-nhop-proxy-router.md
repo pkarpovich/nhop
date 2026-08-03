@@ -420,29 +420,56 @@ in human `status`).
 - Create: `nhop/src/daemon/init_script.rs`, `nhop/src/daemon/staging.rs`
 - Modify: `nhop/src/daemon/state.rs`
 
-- [ ] run `$HOME/.config/nhop/init` as a program (no explicit shell) so its shebang chooses the
+- [x] run `$HOME/.config/nhop/init` as a program (no explicit shell) so its shebang chooses the
       interpreter; set the working directory to the config directory and prepend the directory of
       the current executable to `PATH`
-- [ ] **load protocol**: the daemon generates a `LoadId(u64)` per run and passes it to the child as
+- [x] **load protocol**: the daemon generates a `LoadId(u64)` per run and passes it to the child as
       env `NHOP_LOAD_ID`; the CLI forwards it in the `load` field of every mutating command.
       Commands carrying the current id append to staging. Commands with no id or a stale id while a
       load is in progress are rejected with `ErrKind::LoadInProgress`, as is a second `Reload`.
       Commands with no id outside a load apply immediately as a one-command transaction
-- [ ] the run is bounded by a **30 s** timeout; on timeout the child is killed, staging is
+- [x] the run is bounded by a **30 s** timeout; on timeout the child is killed, staging is
       discarded and the previous ruleset stays live
-- [ ] on exit status zero, swap staging into the live `ArcSwap`; on non-zero or a failed command,
+- [x] on exit status zero, swap staging into the live `ArcSwap`; on non-zero or a failed command,
       discard staging and record which command failed
-- [ ] record `last_load { at, outcome: ok|failed|timed_out, command }`, returned by both `Reload`
+- [x] record `last_load { at, outcome: ok|failed|timed_out, command }`, returned by both `Reload`
       and `Status`
-- [ ] a missing init file is not an error: the ruleset stays empty. **Until the first load commits,
+- [x] a missing init file is not an error: the ruleset stays empty. **Until the first load commits,
       the ruleset is empty and every connection is `Direct`** - state this in `status`
-- [ ] `Reload{path}` runs a different file and remembers it; `Off` clears the live ruleset without
+- [x] `Reload{path}` runs a different file and remembers it; `Off` clears the live ruleset without
       forgetting the path; `On` re-runs it
-- [ ] write tests with a generated init script: success applies rules; non-zero exit after adding
+- [x] write tests with a generated init script: success applies rules; non-zero exit after adding
       rules leaves the previous set intact; missing file yields an empty set
-- [ ] write tests for a concurrent command rejected with `LoadInProgress` and for the timeout path
-- [ ] write a test asserting the child receives the executable's directory on `PATH` and `NHOP_LOAD_ID`
-- [ ] run `mise run check` - must pass before task 6
+- [x] write tests for a concurrent command rejected with `LoadInProgress` and for the timeout path
+- [x] write a test asserting the child receives the executable's directory on `PATH` and `NHOP_LOAD_ID`
+- [x] run `mise run check` - must pass before task 6
+
+➕ The state task no longer blocks on a load. `Reload`/`On` stage the run, spawn the script as a
+separate task and hold the caller's `oneshot` until it finishes, so the commands the script sends
+back over the socket are served by the same actor while its own run is still in flight - awaiting
+the child inside the actor would deadlock every init script that calls the CLI. Completion arrives
+on a second channel the actor selects on.
+
+➕ `Reload`/`On` answer `Response::Status` when the run commits (that is where `last_load` is
+returned from) and `Response::Err{Internal}` when it fails or times out, so a scripted `nhop reload`
+exits non-zero on a failed load instead of silently succeeding. A run whose script file does not
+exist answers `ErrKind::NotFound` and touches no state; at daemon start that answer is discarded,
+which is what keeps a missing init file from being an error.
+
+➕ Staging starts empty rather than from the live ruleset - the init file is the whole profile - and
+`SetUpstream`/`SetListen` inside a run are held until commit alongside the rules. Task 6 picks the
+listen addresses up from there when it wires the rebinding.
+
+➕ Beyond the listed files: `daemon/mod.rs` fires the startup load once the socket is served,
+`cli/mod.rs` reads `NHOP_LOAD_ID` and forwards it on every mutating verb, `nhop-ipc` owns the
+`LOAD_ID_ENV` name plus `Display`/`FromStr` for `LoadId` so daemon and client cannot spell the
+handshake differently, and the workspace `tokio` gains the `process` feature.
+
+➕ `nhop/tests/init_run.rs` added: the state-level tests drive the protocol with the daemon's own
+handle, so nothing there proves the CLI forwards the id end to end. This integration test runs a
+real init script that calls the built binary (`CARGO_BIN_EXE_nhop`, with the script exporting its
+own `HOME`) and asserts both that a whole rule set arrives in declaration order and that a script
+failing halfway leaves no rule behind.
 
 ### Task 6: Front-end wiring and the HTTP proxy
 

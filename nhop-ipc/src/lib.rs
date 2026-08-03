@@ -11,7 +11,8 @@ mod paths;
 mod view;
 
 pub use command::{
-    Command, ErrKind, Host, LoadId, Port, Response, RuleClass, RuleKind, RuleValue, UpstreamAddr,
+    Command, ErrKind, Host, InvalidLoadId, LOAD_ID_ENV, LoadId, Port, Response, RuleClass,
+    RuleKind, RuleValue, UpstreamAddr,
 };
 pub use paths::{HomeNotFound, Paths};
 pub use view::{

@@ -1,14 +1,45 @@
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::view::{CheckView, DecisionView, EventView, RuleView, StatusView};
 
+/// Environment variable the daemon tags an init-script run with.
+///
+/// The script inherits it and the command-line client forwards it as the `load` field of every
+/// mutating command, which is what makes a run atomic.
+pub const LOAD_ID_ENV: &str = "NHOP_LOAD_ID";
+
 /// Identifier of a single init-script run, grouping the commands it stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LoadId(pub u64);
+
+/// Rejection of a load identifier that is not a number.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid load id {0:?}")]
+pub struct InvalidLoadId(String);
+
+impl fmt::Display for LoadId {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(id) = self;
+        write!(out, "{id}")
+    }
+}
+
+impl FromStr for LoadId {
+    type Err = InvalidLoadId;
+
+    fn from_str(id: &str) -> Result<Self, Self::Err> {
+        let Ok(parsed) = id.trim().parse::<u64>() else {
+            return Err(InvalidLoadId(id.to_owned()));
+        };
+        Ok(Self(parsed))
+    }
+}
 
 /// Hostname or IP literal a connection is destined for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +374,21 @@ mod tests {
             serde_json::to_string(&ErrKind::LoadInProgress).unwrap(),
             r#""load_in_progress""#
         );
+    }
+
+    #[test]
+    fn a_load_id_renders_and_reads_back_as_a_bare_number() {
+        assert_eq!(LoadId(7).to_string(), "7");
+        assert_eq!("7".parse::<LoadId>().unwrap(), LoadId(7));
+        assert_eq!(" 7\n".parse::<LoadId>().unwrap(), LoadId(7));
+    }
+
+    #[test]
+    fn a_load_id_that_is_not_a_number_is_rejected() {
+        let failure = "seven".parse::<LoadId>().unwrap_err();
+        assert!(failure.to_string().contains("seven"), "{failure}");
+        assert!("-1".parse::<LoadId>().is_err());
+        assert!("".parse::<LoadId>().is_err());
     }
 
     #[test]

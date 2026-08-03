@@ -1,4 +1,6 @@
+mod init_script;
 mod ipc_server;
+mod staging;
 pub mod state;
 
 use std::fmt;
@@ -8,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use fs2::FileExt;
-use nhop_ipc::Paths;
+use nhop_ipc::{Command, Paths};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -156,6 +158,9 @@ impl Daemon {
 
 /// Claims the pid file, starts the state task and begins serving IPC clients.
 ///
+/// The init script runs in the background once the socket is served, so a script that calls back
+/// into the CLI reaches a daemon that is already answering.
+///
 /// # Errors
 ///
 /// Returns [`StartFailure`] when another daemon is running or the socket cannot be bound.
@@ -163,9 +168,15 @@ pub fn start(paths: &Paths) -> Result<Daemon, StartFailure> {
     let guard = InstanceGuard::acquire(paths)?;
     let socket_file = paths.socket_file();
     let listener = ipc_server::bind(&socket_file)?;
-    let state = state::spawn();
+    let state = state::spawn(paths);
     let (shutdown, signalled) = oneshot::channel();
     let served = tokio::spawn(ipc_server::serve(listener, state.clone(), signalled));
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let _ = state.call(Command::Reload { path: None }).await;
+        }
+    });
     Ok(Daemon {
         guard,
         state,

@@ -1,5 +1,6 @@
 mod client;
 
+use std::env;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -8,8 +9,9 @@ use std::str::FromStr;
 use argh::{EarlyExit, FromArgs};
 use nhop_ipc::{
     CheckView, Command, DecisionKind, DecisionView, ErrKind, EventView, HealthState, Host,
-    LastLoadView, LoadOutcome, Paths, Port, Response, RuleClass, RuleCountsView, RuleKind,
-    RuleValue, RuleView, StatusView, SystemProxyView, Timestamp, UpstreamAddr,
+    LOAD_ID_ENV, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response, RuleClass,
+    RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView, Timestamp,
+    UpstreamAddr,
 };
 use serde::Serialize;
 
@@ -367,30 +369,27 @@ async fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Exit {
+    let load = load_of_env();
     match command {
         Subcommand::Start(Start {}) => start(paths, err).await,
         Subcommand::Require(Require { kind, value }) => {
-            let command = add_rule(RuleClass::Require, kind, value);
+            let command = add_rule(RuleClass::Require, kind, value, load);
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Prefer(Prefer { kind, value }) => {
-            let command = add_rule(RuleClass::Prefer, kind, value);
+            let command = add_rule(RuleClass::Prefer, kind, value, load);
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Never(Never { kind, value }) => {
-            let command = add_rule(RuleClass::Never, kind, value);
+            let command = add_rule(RuleClass::Never, kind, value, load);
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Upstream(Upstream { addr }) => {
-            let command = Command::SetUpstream { addr, load: None };
+            let command = Command::SetUpstream { addr, load };
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Listen(Listen { http, socks }) => {
-            let command = Command::SetListen {
-                http,
-                socks,
-                load: None,
-            };
+            let command = Command::SetListen { http, socks, load };
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Reload(Reload { path }) => {
@@ -423,13 +422,25 @@ async fn dispatch(
     }
 }
 
-fn add_rule(class: RuleClass, kind: RuleKind, value: RuleValue) -> Command {
+fn add_rule(class: RuleClass, kind: RuleKind, value: RuleValue, load: Option<LoadId>) -> Command {
     Command::AddRule {
         class,
         kind,
         value,
-        load: None,
+        load,
     }
+}
+
+fn load_of_env() -> Option<LoadId> {
+    let id = env::var_os(LOAD_ID_ENV)?;
+    load_of(id.to_str()?)
+}
+
+fn load_of(id: &str) -> Option<LoadId> {
+    let Ok(id) = id.parse::<LoadId>() else {
+        return None;
+    };
+    Some(id)
 }
 
 fn unserved(name: &str, err: &mut dyn Write) -> Exit {
@@ -705,7 +716,7 @@ fn load_name(last_load: &Option<LastLoadView>) -> String {
         command,
     }) = last_load
     else {
-        return "never".to_owned();
+        return "never - the ruleset is empty and every connection is direct".to_owned();
     };
     let Timestamp(at) = at;
     let at = humantime::format_rfc3339_seconds(*at);
@@ -1041,6 +1052,12 @@ mod tests {
             "{out}"
         );
         assert!(
+            out.contains(
+                "last load     never - the ruleset is empty and every connection is direct"
+            ),
+            "{out}"
+        );
+        assert!(
             serde_json::from_str::<serde_json::Value>(&out).is_err(),
             "{out}"
         );
@@ -1063,16 +1080,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rule_verb_reaches_the_daemon() {
+    async fn a_rule_verb_outside_an_init_run_applies_at_once() {
         let (_home, paths, daemon) = running_daemon().await;
 
         let (exit, out, err) = invoke(&paths, &["require", "suffix", "example.com"]).await;
 
-        assert_eq!(exit, Exit::Failed);
+        assert_eq!(exit, Exit::Success);
         assert!(out.is_empty(), "{out}");
-        assert!(err.contains("yet"), "{err}");
+        assert!(err.is_empty(), "{err}");
+
+        let (exit, out, err) = invoke(&paths, &["rules"]).await;
+        assert_eq!(exit, Exit::Success);
+        assert_eq!(out, "0  require  suffix  example.com\n");
+        assert!(err.is_empty(), "{err}");
 
         daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_rule_verb_with_a_malformed_value_exits_four() {
+        let (_home, paths, daemon) = running_daemon().await;
+
+        let (exit, out, err) = invoke(&paths, &["prefer", "cidr", "nonsense"]).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        assert_eq!(exit.code(), 4);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("cidr"), "{err}");
+
+        daemon.shutdown().await;
+    }
+
+    #[test]
+    fn a_load_id_is_forwarded_only_when_it_reads_as_a_number() {
+        assert_eq!(load_of("7"), Some(LoadId(7)));
+        assert_eq!(load_of(" 7 "), Some(LoadId(7)));
+        assert_eq!(load_of("seven"), None);
+        assert_eq!(load_of(""), None);
+        let Command::AddRule {
+            class,
+            kind,
+            value,
+            load,
+        } = add_rule(
+            RuleClass::Require,
+            RuleKind::Suffix,
+            value("example.com"),
+            Some(LoadId(7)),
+        )
+        else {
+            panic!("a rule verb must build an add_rule command");
+        };
+        assert_eq!(class, RuleClass::Require);
+        assert_eq!(kind, RuleKind::Suffix);
+        assert_eq!(value, RuleValue("example.com".to_owned()));
+        assert_eq!(load, Some(LoadId(7)));
     }
 
     #[tokio::test]
