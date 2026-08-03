@@ -1,4 +1,7 @@
 mod client;
+pub mod explain;
+pub mod status;
+pub mod system_proxy;
 
 use std::env;
 use std::io::{self, Write};
@@ -17,6 +20,7 @@ use nhop_ipc::{
 use serde::Serialize;
 
 use crate::cli::client::Unreachable;
+use crate::cli::system_proxy::NetworkService;
 use crate::daemon::{self, StartFailure};
 use crate::logging::{self, LoggedDecision, Window};
 
@@ -141,21 +145,6 @@ enum Follow {
 impl Follow {
     fn of(follow: bool) -> Self {
         if follow { Self::Keep } else { Self::Stop }
-    }
-}
-
-/// macOS network service the system proxy settings belong to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NetworkService(String);
-
-impl FromStr for NetworkService {
-    type Err = InvalidDestination;
-
-    fn from_str(service: &str) -> Result<Self, Self::Err> {
-        if service.is_empty() {
-            return Err(InvalidDestination(service.to_owned()));
-        }
-        Ok(Self(service.to_owned()))
     }
 }
 
@@ -376,7 +365,7 @@ struct Proxy {
     #[argh(positional)]
     action: ProxyAction,
     /// network service the settings belong to
-    #[argh(option, default = "NetworkService(String::from(\"Wi-Fi\"))")]
+    #[argh(option, default = "NetworkService::default()")]
     service: NetworkService,
 }
 
@@ -1234,12 +1223,40 @@ mod tests {
     async fn a_daemon_error_keeps_stdout_empty_even_with_json() {
         let (_home, paths, daemon) = running_daemon().await;
 
-        let (exit, out, err) = invoke(&paths, &["test", "example.com:443", "--json"]).await;
+        let (exit, out, err) = invoke(&paths, &["doctor", "--json"]).await;
 
         assert_eq!(exit, Exit::Failed);
         assert_eq!(exit.code(), 1);
         assert!(out.is_empty(), "{out}");
         assert!(err.contains("yet"), "{err}");
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prints_one_decision_document_and_one_human_line() {
+        let (_home, paths, daemon) = running_daemon().await;
+        invoke(&paths, &["upstream", "socks5://192.0.2.10:1080"]).await;
+        invoke(&paths, &["require", "suffix", "example.com"]).await;
+
+        let (exit, out, err) = invoke(&paths, &["test", "api.example.com:443", "--json"]).await;
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert_eq!(
+            serde_json::from_str::<DecisionView>(&out).unwrap(),
+            DecisionView {
+                decision: DecisionKind::Upstream,
+                rule_index: Some(0),
+                class: Some(RuleClass::Require),
+                next_hop: "socks5://192.0.2.10:1080".to_owned(),
+            }
+        );
+
+        let (exit, out, err) = invoke(&paths, &["test", "example.net:443"]).await;
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out, "direct via no rule to example.net:443\n");
 
         daemon.shutdown().await;
     }

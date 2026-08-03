@@ -671,22 +671,53 @@ green.
 **Files:**
 - Create: `nhop/src/cli/status.rs`, `nhop/src/cli/explain.rs`, `nhop/src/cli/system_proxy.rs`
 
-- [ ] create `system_proxy.rs` with `trait SystemProxyReader { fn read(&self, service: &str) -> Result<SystemProxy> }`
+- [x] create `system_proxy.rs` with `trait SystemProxyReader { fn read(&self, service: &str) -> Result<SystemProxy> }`
       and a real implementation shelling out to `networksetup -getwebproxy/-getsecurewebproxy/-getsocksfirewallproxy`,
       executed by the **daemon**. Task 13 extends this same module with the write path; do not add a
       second parser
-- [ ] `status` returns `StatusView` exactly as defined in the IPC contract, built by a pure
+- [x] `status` returns `StatusView` exactly as defined in the IPC contract, built by a pure
       `status_json(state, proxy) -> serde_json::Value` so it can be tested without invoking
       `networksetup`
-- [ ] `rules` returns `RuleView` in declaration order; `test <host:port>` returns `DecisionView`
+- [x] `rules` returns `RuleView` in declaration order; `test <host:port>` returns `DecisionView`
       without opening any connection
-- [ ] all three honour `--json`
-- [ ] write tests for `test` covering a require match, a prefer match, a never match and no match,
+- [x] all three honour `--json`
+- [x] write tests for `test` covering a require match, a prefer match, a never match and no match,
       asserting the exact `DecisionView` including `rule_index`
-- [ ] write a golden test comparing `status_json` over a fixed state and a fixed `SystemProxy`
+- [x] write a golden test comparing `status_json` over a fixed state and a fixed `SystemProxy`
       fixture against a checked-in `nhop/tests/golden/status.json`, byte for byte
-- [ ] write tests parsing `networksetup` fixture strings into `SystemProxy`
-- [ ] run `mise run check` - must pass before task 11
+- [x] write tests parsing `networksetup` fixture strings into `SystemProxy`
+- [x] run `mise run check` - must pass before task 11
+
+➕ The reader is injected rather than reached for: `StateConfig` carries
+`proxy: Arc<dyn SystemProxyReader>`, `daemon::start_on` wires the real `Networksetup` and
+`StateConfig::default()` wires `NoSystemProxy`, which answers "every setting off" without spawning
+anything. Without that seam every unit test asserting a `StatusView` would depend on the proxy
+settings of the machine running it - and on the operator's machine those are set. `NoSystemProxy` is
+also the honest reader anywhere `networksetup` does not exist. A read that fails is reported as every
+setting off, because the contract has no field for the failure; naming it is Task 11's
+`system_proxy` check.
+
+➕ `NetworkService` moved from `cli/mod.rs` into `system_proxy.rs`, where the rest of the macOS
+surface lives, and gained `Default` (`Wi-Fi`) plus its own `EmptyService` rejection instead of
+borrowing `InvalidDestination`. `ProxyKind::read_flag` is the single place the three `networksetup`
+flags are spelled, so Task 13 adds `write_flag` beside it rather than a second table. The daemon
+reads the default service; `--service` stays a Task 13 concern.
+
+➕ `test` renders `Ruleset::decide` and never consults the health verdict: `DecisionView` carries no
+health field, and the four cases this task pins are the four rule outcomes. A `prefer` match
+therefore answers `upstream` even while the upstream is down - that is the ruleset's answer, and the
+fallback belongs to the dialer. `next_hop` is the upstream as the init script wrote it for an
+upstream decision, `host:port` otherwise, and `none` when no upstream has been named.
+
+➕ `status_json` is `status_view` one step further, so the golden file carries the keys in the order
+`serde_json::Map` holds them (alphabetical), not the order the contract lists them. `DaemonStatus` is
+the pure input: everything `status` reports that the daemon knows without asking macOS.
+
+➕ Beyond the listed files: `daemon/state.rs` takes the reader, serves `Command::Test` and delegates
+both view builders to `cli/explain.rs`; `daemon/mod.rs` wires `Networksetup`; `cli/mod.rs` declares
+the three modules and imports `NetworkService`; `BindState::is_bound` became public because
+`status_view` renders it. The cli test that used `test` as a stand-in for an unserved command now
+uses `doctor`, which Task 11 will take over in turn.
 
 ### Task 11: `nhop doctor`
 

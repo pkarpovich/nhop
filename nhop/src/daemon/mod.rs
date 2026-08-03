@@ -18,6 +18,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::cli::system_proxy::Networksetup;
 use crate::daemon::state::{
     DEFAULT_HTTP_LISTEN, DEFAULT_SOCKS_LISTEN, LOAD_TIMEOUT, Live, StateConfig, StateHandle,
 };
@@ -367,6 +368,7 @@ pub fn start_on(paths: &Paths, listen: Listen) -> Result<Daemon, StartFailure> {
             frontends,
             listen,
             load_timeout: LOAD_TIMEOUT,
+            proxy: Arc::new(Networksetup),
         },
     );
     let (shutdown, signalled) = oneshot::channel();

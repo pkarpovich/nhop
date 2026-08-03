@@ -1,0 +1,26 @@
+{
+  "health": "up",
+  "health_changed_at": "2026-02-02T02:40:00Z",
+  "http_bound": true,
+  "http_listen": "127.0.0.1:7890",
+  "init_path": "/Users/operator/.config/nhop/init",
+  "last_load": {
+    "at": "2026-02-02T02:40:00Z",
+    "command": null,
+    "outcome": "ok"
+  },
+  "rules": {
+    "never": 1,
+    "prefer": 3,
+    "require": 2
+  },
+  "socks_bound": true,
+  "socks_listen": "127.0.0.1:7891",
+  "system_proxy": {
+    "http": "127.0.0.1:7890",
+    "https": "127.0.0.1:7890",
+    "socks": "127.0.0.1:7891"
+  },
+  "upstream": "socks5://192.0.2.10:1080",
+  "uptime_secs": 3600
+}

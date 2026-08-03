@@ -6,18 +6,20 @@ use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwap;
 use nhop_ipc::{
-    Command, ErrKind, LastLoadView, LoadId, LoadOutcome, Paths, Response, RuleClass,
-    RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView, Timestamp,
-    UpstreamAddr,
+    Command, DecisionView, ErrKind, Host, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response,
+    RuleClass, RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, Timestamp, UpstreamAddr,
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cli::explain;
+use crate::cli::status::{DaemonStatus, status_view};
+use crate::cli::system_proxy::{NetworkService, NoSystemProxy, SystemProxyReader};
 use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
 use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
 use crate::proxy::{ConnCtx, EventTx, InvalidUpstream, Listen, NO_UPSTREAM, Upstream};
-use crate::rules::{InvalidRule, RuleId, Ruleset};
-use crate::upstream::{Health, HealthHandle};
+use crate::rules::{InvalidRule, Ruleset};
+use crate::upstream::HealthHandle;
 
 /// Address the HTTP front end binds until the init script moves it.
 pub const DEFAULT_HTTP_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890);
@@ -42,7 +44,8 @@ pub enum BindState {
 }
 
 impl BindState {
-    fn is_bound(self) -> bool {
+    /// Returns how the wire reports the state.
+    pub fn is_bound(self) -> bool {
         match self {
             Self::Bound => true,
             Self::Unbound => false,
@@ -154,6 +157,8 @@ pub struct StateConfig {
     pub listen: Listen,
     /// How long an init-script run may take before it is killed.
     pub load_timeout: Duration,
+    /// Where `status` reads the system proxy settings from.
+    pub proxy: Arc<dyn SystemProxyReader>,
 }
 
 impl Default for StateConfig {
@@ -166,6 +171,7 @@ impl Default for StateConfig {
                 socks: DEFAULT_SOCKS_LISTEN,
             },
             load_timeout: LOAD_TIMEOUT,
+            proxy: Arc::new(NoSystemProxy),
         }
     }
 }
@@ -215,6 +221,7 @@ pub fn spawn(paths: &Paths, config: StateConfig) -> StateHandle {
         frontends,
         listen,
         load_timeout,
+        proxy,
     } = config;
     let (requests, inbox) = mpsc::channel(REQUEST_CAPACITY);
     let (finished, completions) = mpsc::channel(1);
@@ -224,6 +231,7 @@ pub fn spawn(paths: &Paths, config: StateConfig) -> StateHandle {
         frontends,
         listen,
         load_timeout,
+        proxy,
         finished,
     );
     tokio::spawn(serve(state, inbox, completions));
@@ -294,6 +302,8 @@ struct DaemonState {
     load_ids: LoadIds,
     load: Option<InFlight>,
     load_timeout: Duration,
+    proxy: Arc<dyn SystemProxyReader>,
+    service: NetworkService,
     finished: mpsc::Sender<ScriptOutcome>,
 }
 
@@ -304,6 +314,7 @@ impl DaemonState {
         frontends: Frontends,
         listen: Listen,
         load_timeout: Duration,
+        proxy: Arc<dyn SystemProxyReader>,
         finished: mpsc::Sender<ScriptOutcome>,
     ) -> Self {
         let Listen { http, socks } = listen;
@@ -320,6 +331,8 @@ impl DaemonState {
             load_ids: LoadIds::default(),
             load: None,
             load_timeout,
+            proxy,
+            service: NetworkService::default(),
             finished,
         }
     }
@@ -355,9 +368,10 @@ impl DaemonState {
                 self.live.rules().publish(Ruleset::default());
                 answer(reply, Response::Ok);
             }
-            Command::Test { host: _, port: _ } | Command::Doctor | Command::Subscribe => {
-                answer(reply, unserved());
+            Command::Test { host, port } => {
+                answer(reply, Response::Decision(self.decision(&host, port)));
             }
+            Command::Doctor | Command::Subscribe => answer(reply, unserved()),
         }
     }
 
@@ -677,45 +691,35 @@ impl DaemonState {
 
     fn status(&self) -> StatusView {
         let rules = self.live.rules().snapshot();
-        let bound = self.bind_state().is_bound();
-        let Health { state, changed_at } = self.live.health().verdict();
-        StatusView {
-            uptime_secs: self.started.elapsed().as_secs(),
-            http_listen: self.http_listen,
-            http_bound: bound,
-            socks_listen: self.socks_listen,
-            socks_bound: bound,
-            upstream: self.upstream.clone(),
-            health: state,
-            health_changed_at: Timestamp(changed_at),
-            init_path: self.init_path.clone(),
-            last_load: self.last_load.clone(),
-            rules: RuleCountsView {
-                require: counted(rules.count(RuleClass::Require)),
-                prefer: counted(rules.count(RuleClass::Prefer)),
-                never: counted(rules.count(RuleClass::Never)),
+        let proxy = self.proxy.read(&self.service).unwrap_or_default();
+        status_view(
+            &DaemonStatus {
+                uptime_secs: self.started.elapsed().as_secs(),
+                listen: Listen {
+                    http: self.http_listen,
+                    socks: self.socks_listen,
+                },
+                bound: self.bind_state(),
+                upstream: self.upstream.clone(),
+                health: self.live.health().verdict(),
+                init_path: self.init_path.clone(),
+                last_load: self.last_load.clone(),
+                rules: RuleCountsView {
+                    require: counted(rules.count(RuleClass::Require)),
+                    prefer: counted(rules.count(RuleClass::Prefer)),
+                    never: counted(rules.count(RuleClass::Never)),
+                },
             },
-            system_proxy: SystemProxyView {
-                http: None,
-                https: None,
-                socks: None,
-            },
-        }
+            &proxy,
+        )
     }
 
     fn rule_views(&self) -> Vec<RuleView> {
-        let rules = self.live.rules().snapshot();
-        let mut views = Vec::with_capacity(rules.rules().len());
-        for rule in rules.rules() {
-            let RuleId(index) = rule.id();
-            views.push(RuleView {
-                index: counted(index),
-                class: rule.class(),
-                kind: rule.kind(),
-                value: rule.value().clone(),
-            });
-        }
-        views
+        explain::rule_views(&self.live.rules().snapshot())
+    }
+
+    fn decision(&self, host: &Host, port: Port) -> DecisionView {
+        explain::decision_view(&self.live.rules().snapshot(), &self.upstream, host, port)
     }
 }
 
@@ -784,9 +788,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use nhop_ipc::{DecisionKind, HealthState, Host, Port, RuleKind, RuleValue};
+    use nhop_ipc::{DecisionKind, HealthState, RuleKind, RuleValue, SystemProxyView};
 
-    use crate::rules::Decision;
+    use crate::cli::system_proxy::{ProxyEndpoint, ProxyFailure, SystemProxy};
+    use crate::rules::{Decision, RuleId};
 
     use super::*;
 
@@ -1461,6 +1466,127 @@ mod tests {
                     value: RuleValue("22".to_owned()),
                 },
             ]
+        );
+    }
+
+    /// Reader that reports a configured proxy for the service the operator uses, and nothing else.
+    #[derive(Debug)]
+    struct WifiProxy;
+
+    impl SystemProxyReader for WifiProxy {
+        fn read(&self, service: &NetworkService) -> Result<SystemProxy, ProxyFailure> {
+            let NetworkService(service) = service;
+            if service != "Wi-Fi" {
+                return Ok(SystemProxy::default());
+            }
+            Ok(SystemProxy {
+                http: Some(ProxyEndpoint::new("127.0.0.1", 7890)),
+                https: Some(ProxyEndpoint::new("127.0.0.1", 7890)),
+                socks: None,
+            })
+        }
+    }
+
+    /// Reader that cannot reach macOS at all.
+    #[derive(Debug)]
+    struct UnreadableProxy;
+
+    impl SystemProxyReader for UnreadableProxy {
+        fn read(&self, _service: &NetworkService) -> Result<SystemProxy, ProxyFailure> {
+            Err(ProxyFailure::Unreadable("-getwebproxy"))
+        }
+    }
+
+    fn spawn_reading(paths: &Paths, proxy: Arc<dyn SystemProxyReader>) -> StateHandle {
+        spawn(
+            paths,
+            StateConfig {
+                proxy,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_settings_the_reader_answered_for_the_wifi_service() {
+        let (_home, paths) = temp_paths();
+        let state = spawn_reading(&paths, Arc::new(WifiProxy));
+
+        let status = status_of(&state).await;
+
+        assert_eq!(
+            status.system_proxy,
+            SystemProxyView {
+                http: Some("127.0.0.1:7890".to_owned()),
+                https: Some("127.0.0.1:7890".to_owned()),
+                socks: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_that_cannot_be_read_are_reported_as_off() {
+        let (_home, paths) = temp_paths();
+        let state = spawn_reading(&paths, Arc::new(UnreadableProxy));
+
+        let status = status_of(&state).await;
+
+        assert_eq!(
+            status.system_proxy,
+            SystemProxyView {
+                http: None,
+                https: None,
+                socks: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reports_where_a_destination_would_go_without_dialling_it() {
+        let (_home, state) = spawn_here();
+        state
+            .call(Command::SetUpstream {
+                addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                load: None,
+            })
+            .await;
+        state.rules().publish(ruleset(&[
+            (RuleClass::Never, RuleKind::Suffix, "intranet.example.com"),
+            (RuleClass::Require, RuleKind::Suffix, "example.com"),
+        ]));
+
+        let answer = state
+            .call(Command::Test {
+                host: Host("api.example.com".to_owned()),
+                port: Port(443),
+            })
+            .await;
+
+        assert_eq!(
+            answer,
+            Response::Decision(DecisionView {
+                decision: DecisionKind::Upstream,
+                rule_index: Some(1),
+                class: Some(RuleClass::Require),
+                next_hop: "socks5://192.0.2.10:1080".to_owned(),
+            })
+        );
+
+        let answer = state
+            .call(Command::Test {
+                host: Host("example.net".to_owned()),
+                port: Port(443),
+            })
+            .await;
+
+        assert_eq!(
+            answer,
+            Response::Decision(DecisionView {
+                decision: DecisionKind::Direct,
+                rule_index: None,
+                class: None,
+                next_hop: "example.net:443".to_owned(),
+            })
         );
     }
 
