@@ -858,19 +858,51 @@ Task 4 fixed that verb's flags to `--service`.
   `packaging/nhop.init.example`
 - Modify: `README.md`
 
-- [ ] `build-signed.sh` builds release, codesigns with the Developer ID identity (team id passed as
+- [x] `build-signed.sh` builds release, codesigns with the Developer ID identity (team id passed as
       an argument, never hardcoded), verifies with `codesign --verify --strict`, prints the identifier
-- [ ] the plist sets `RunAtLoad=true` and `KeepAlive=true` (restart-on-crash is launchd's
+- [x] the plist sets `RunAtLoad=true` and `KeepAlive=true` (restart-on-crash is launchd's
       responsibility; no timing is asserted) and points `StandardOutPath`/`StandardErrorPath` at the
       state directory
-- [ ] `nhop.init.example` is a commented fish script using the canonical rule surface with **clearly
+- [x] `nhop.init.example` is a commented fish script using the canonical rule surface with **clearly
       marked placeholders** (`nhop upstream socks5://192.0.2.10:1080  # replace`, `example.com`
       hostnames). It is illustrative, not ready to run, and the file says so on its first line
-- [ ] README documents install, the one-time `sudo nhop proxy on`, granting Local Network on first
+- [x] README documents install, the one-time `sudo nhop proxy on`, granting Local Network on first
       run, and the uninstall order (`proxy off` **before** removing the agent)
-- [ ] write a test asserting the plist parses and contains the expected label, `KeepAlive` and
+- [x] write a test asserting the plist parses and contains the expected label, `KeepAlive` and
       program path shape
-- [ ] run `mise run check` - must pass before task 15
+- [x] run `mise run check` - must pass before task 15
+
+➕ The plist carries `{{HOME}}` where an absolute home directory has to go: launchd expands neither
+`~` nor `$HOME`, so a checked-in LaunchAgent cannot name the operator's home and the install step
+substitutes it with one `sed`. A third test asserts `{{HOME}}` is the *only* placeholder in the file,
+so a token added later cannot silently survive that substitution.
+
+➕ The plist also sets `EnvironmentVariables.PATH`. launchd's default PATH omits Homebrew, so
+`#!/usr/bin/env fish` in the init script would not resolve under the agent even though it resolves
+from a terminal - the same class of "works by hand, fails under launchd" failure the Local Network
+permission has. The redirects are `launchd.out.log`/`launchd.err.log`, not `nhop.log*`, because
+`logging::files` picks up everything named `nhop.log*` and `nhop logs` would otherwise print
+launchd's stderr interleaved with the daemon's JSON lines.
+
+➕ The example's shebang is on the second line: the first line is the "not ready to run" notice this
+task requires, and a shebang that is not the first line is not a shebang. That is what makes the
+file inert if copied unedited - the README's copy step says to delete that line so the shebang leads.
+
+➕ `build-signed.sh` resolves the identity from the team id rather than taking an identity name:
+`security find-identity -v -p codesigning` is filtered to the `Developer ID Application` line whose
+name ends in `(<team id>)` and signs by its hash, so nothing about the operator's certificate is
+written down here. The lookup pipeline ends in `|| true` because `set -euo pipefail` would otherwise
+abort on the failing `grep` before the "no such identity" message could be printed. The signing run
+itself is a Post-Completion step: `codesign --sign` needs keychain access, which this session must
+not prompt for.
+
+➕ Beyond the listed files: `nhop/tests/packaging.rs` holds the plist test - nothing under `src/`
+reads the packaging directory. It parses with `plutil -convert json -o -` and asserts over the JSON,
+rather than adding a plist dependency for one file; when `plutil` is absent the two parse tests
+return early, as the Task 13 `proxy status` test already does for `networksetup`, while the
+placeholder test still runs. The README's `## Status` section ("implementation not started") is
+removed rather than updated - Task 16 owns the rest of the README, and `## Install`/`## Uninstall`
+are added here under the exact headings it requires.
 
 ### Task 15: Verify acceptance criteria
 

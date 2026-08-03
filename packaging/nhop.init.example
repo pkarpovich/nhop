@@ -1,0 +1,38 @@
+# EXAMPLE ONLY - illustrative, not ready to run: replace every line marked `# replace`.
+#!/usr/bin/env fish
+# Delete the first line of this file so the shebang leads, then `chmod +x` it.
+#
+# The daemon runs this file as a program, so its shebang picks the interpreter. It runs with the
+# working directory set to ~/.config/nhop and the directory of the running nhop binary prepended
+# to PATH, so plain `nhop` below reaches the daemon this run belongs to.
+#
+# Every command here is staged: the ruleset only goes live when this script exits zero. A failed
+# command or a non-zero exit leaves the previous ruleset serving traffic.
+
+# The one upstream, as socks5://<ip>:<port>. A hostname is rejected - the address is dialled, not
+# resolved through the routing rules it defines.
+nhop upstream socks5://192.0.2.10:1080  # replace
+
+# Move the front ends off 127.0.0.1:7890 (HTTP) and 127.0.0.1:7891 (SOCKS5) if something else
+# already owns those ports. Clients pinned to the SOCKS port need it left alone.
+# nhop listen 127.0.0.1:7890 127.0.0.1:7891
+
+# never - dialled directly whatever any later rule says, and matched before all of them.
+nhop never suffix example-router.test  # replace
+nhop never cidr 198.51.100.0/24  # replace
+
+# require - must traverse the upstream. With the upstream down these fail at once: 502 on the HTTP
+# front end, reply 0x04 on the SOCKS5 one. Use it for what only exists behind the upstream.
+nhop require suffix internal.example.com  # replace
+nhop require cidr 192.0.2.0/24  # replace
+nhop require keyword corp-only  # replace
+
+# prefer - tries the upstream and falls back to a direct connection when it is down. Use it for
+# public services routed through the upstream only for traffic volume.
+nhop prefer suffix example.net  # replace
+nhop prefer port 8443  # replace
+
+# The init file is a program, so a rule set can be generated.
+for host in one.example.org two.example.org  # replace
+    nhop prefer suffix $host
+end
