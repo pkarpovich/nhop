@@ -1,0 +1,8 @@
+[package]
+name = "nhop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nhop-ipc.workspace = true

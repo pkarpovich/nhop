@@ -212,7 +212,16 @@ enum ErrKind { NotFound, UpstreamDown, InvalidArgs, LoadInProgress, Internal }
 ```
 
 `class` is `require|prefer|never`; `kind` is `suffix|cidr|port|keyword`; `load` is
-`Option<LoadId>` (see Task 5). View structs, with JSON key names and types:
+`Option<LoadId>` (see Task 5).
+
+⚠️ **Envelope, settled in Task 1.** `Command` carries `#[serde(tag = "cmd", rename_all = "snake_case")]`
+as specified. `Response` cannot: serde refuses to internally-tag a newtype variant holding a
+sequence, which `Rules(Vec<RuleView>)` and `Doctor(Vec<CheckView>)` both are. `Response` therefore
+uses adjacent tagging, `#[serde(tag = "resp", content = "data", rename_all = "snake_case")]`, which
+keeps the variant shapes exactly as listed above and the wire form readable
+(`{"resp":"rules","data":[...]}`, `{"resp":"ok"}`).
+
+View structs, with JSON key names and types:
 
 - `RuleView { index: u32, class: String, kind: String, value: String }`
 - `DecisionView { decision: "direct"|"never"|"upstream", rule_index: u32|null, class: String|null, next_hop: String }`
@@ -266,6 +275,9 @@ injectable so tests use 50 ms.
 The socket deliberately does **not** live in `/tmp`: a world-writable socket would let any local
 process rewrite this machine's traffic routing.
 
+These four paths are exposed by `Paths` as `init_file()`, `socket_file()`, `pid_file()` and
+`log_file()` (Task 1); later tasks use those accessors instead of repeating the file names.
+
 ### System proxy bypass list (Task 13)
 
 A named constant, separate from the daemon's `never` rules (those apply only to traffic that
@@ -285,21 +297,22 @@ already reached nhop): `localhost`, `127.0.0.1`, `*.local`, `169.254/16`.
 - Create: `Cargo.toml`, `nhop-ipc/Cargo.toml`, `nhop-ipc/src/lib.rs`, `nhop-ipc/src/command.rs`,
   `nhop-ipc/src/view.rs`, `nhop-ipc/src/paths.rs`, `nhop/Cargo.toml`, `nhop/src/main.rs`
 
-- [ ] create a two-member workspace (`nhop`, `nhop-ipc`) with shared `[workspace.package]` and
+- [x] create a two-member workspace (`nhop`, `nhop-ipc`) with shared `[workspace.package]` and
       `[workspace.dependencies]`
-- [ ] define `Command`, `Response`, `ErrKind` and the five view structs **exactly** as listed in
+- [x] define `Command`, `Response`, `ErrKind` and the five view structs **exactly** as listed in
       the IPC contract section, with serde derives and `#[serde(tag = "cmd", rename_all = "snake_case")]`
-      so the wire form is readable in logs
-- [ ] add `Paths { config_dir, state_dir }` with pure `Paths::from_home(&Path)` and
+      so the wire form is readable in logs (see the ⚠️ envelope note in the IPC contract for the
+      `Response` tagging)
+- [x] add `Paths { config_dir, state_dir }` with pure `Paths::from_home(&Path)` and
       `Paths::from_env()` (reads `$HOME` once, used only by `main`); every daemon and CLI entry
       point takes `Paths` as a parameter, so no test ever mutates the environment
-- [ ] `state_dir()` creates the directory with mode 0700 when missing, idempotently
-- [ ] add `#![warn(missing_docs)]` and rustdoc per the Code-Quality bar
-- [ ] `nhop/src/main.rs` compiles as a stub printing the version
-- [ ] write tests for `Paths::from_home` (creation, mode, idempotent second call) with `tempfile`
-- [ ] write tests round-tripping every `Command` and `Response` variant through `serde_json`, plus
+- [x] `state_dir()` creates the directory with mode 0700 when missing, idempotently
+- [x] add `#![warn(missing_docs)]` and rustdoc per the Code-Quality bar
+- [x] `nhop/src/main.rs` compiles as a stub printing the version
+- [x] write tests for `Paths::from_home` (creation, mode, idempotent second call) with `tempfile`
+- [x] write tests round-tripping every `Command` and `Response` variant through `serde_json`, plus
       one unknown-variant case asserting a clean error
-- [ ] run `mise run check` - must pass before task 2
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: Rule model and the decision engine
 

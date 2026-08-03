@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["nhop", "nhop-ipc"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[workspace.dependencies]
+nhop-ipc = { path = "nhop-ipc" }
+
+anyhow = "1"
+arc-swap = "1"
+argh = "0.1"
+dirs = "6"
+fs2 = "0.4"
+humantime = "2"
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "signal",
+  "time",
+  "sync",
+] }
+tokio-socks = "0.5"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+tempfile = "3"
