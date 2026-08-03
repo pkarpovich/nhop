@@ -578,21 +578,44 @@ codes in one place, and a malformed domain (non-UTF-8 or zero length) answers `0
 - Create: `nhop/src/upstream/mod.rs`, `nhop/src/upstream/health.rs`
 - Modify: `nhop/src/daemon/state.rs`
 
-- [ ] implement the `NextHop` trait from Task 6 over `tokio_socks`, honouring the constants in
+- [x] implement the `NextHop` trait from Task 6 over `tokio_socks`, honouring the constants in
       Technical Details; this replaces the test double, it does not introduce a new call path
-- [ ] `health.rs` owns the verdict as `{ state: Up|Down, changed_at: SystemTime }` - `SystemTime`,
+- [x] `health.rs` owns the verdict as `{ state: Up|Down, changed_at: SystemTime }` - `SystemTime`,
       not `Instant`, because `status` and `doctor` must render it as RFC3339
-- [ ] transitions exactly as specified: one failure (real dial or probe) flips Down, one success
+- [x] transitions exactly as specified: one failure (real dial or probe) flips Down, one success
       flips Up, no probing while Up, probe interval injectable for tests
-- [ ] while Down, decisions are made without dialling: `Prefer` goes direct at once, `Require` fails
+- [x] while Down, decisions are made without dialling: `Prefer` goes direct at once, `Require` fails
       at once with `UpstreamDown`
-- [ ] a `Require` or `Prefer` dial failure while the verdict is Up marks the upstream Down; `Prefer`
+- [x] a `Require` or `Prefer` dial failure while the verdict is Up marks the upstream Down; `Prefer`
       additionally falls back to a direct connection for that connection
-- [ ] write tests with the upstream at a closed port: `Prefer` reaches the direct stub, `Require`
+- [x] write tests with the upstream at a closed port: `Prefer` reaches the direct stub, `Require`
       returns `UpstreamDown`
-- [ ] write a test asserting the flip back to Up once the stub upstream starts accepting
-- [ ] write a test asserting a dial to a black-holed address fails within 3 s
-- [ ] run `mise run check` - must pass before task 9
+- [x] write a test asserting the flip back to Up once the stub upstream starts accepting
+- [x] write a test asserting a dial to a black-holed address fails within 3 s
+- [x] run `mise run check` - must pass before task 9
+
+➕ `HealthHandle` moved from `proxy/mod.rs` to `upstream/health.rs`, which is what "health.rs owns
+the verdict" requires: the handle now publishes `Health { state, changed_at }` as one unit, so the
+verdict and the instant it settled cannot drift apart. `changed_at` moves only when the verdict
+turns over, via `ArcSwap::rcu` so concurrent dial failures cannot lose the transition. `state.rs`
+drops its own `health_changed_at` field and renders both from that one snapshot.
+
+➕ The probe is a single loop started with the dialer rather than a task spawned on each Down
+transition: it wakes every interval and probes only while the verdict is Down. A daemon starts Down,
+so without it nothing would ever discover an upstream that is up - a claim-a-flag-on-transition
+design never probes before the first dial failure. `UpstreamHop` aborts the loop on drop.
+
+➕ `UpstreamHop` reads the upstream address from `LiveUpstream` at dial time rather than from
+`ConnCtx`: `NextHop::dial` takes no context (Task 6 fixed that signature) and the verdict must be
+current at dial time, not at accept time. `DirectHop` is removed - `Decision::Direct` and
+`Decision::Never` dial exactly as it did, and `Decision::Upstream { class: Never }` is served the
+same way rather than by a wildcard arm.
+
+➕ `nhop/tests/upstream_dialer.rs` added: the stub SOCKS5 upstream lives in the Task 6 harness, so
+every case needing one is an integration test there rather than a unit test under `src/`. It also
+carries the assertion Task 7 deferred - a domain request reaches `StubSocks5.requests()` as
+`{atyp: 0x03, host: "example.com"}`, never resolved locally. `nhop/Cargo.toml` gains `tokio-socks`,
+and the two front-end test files import `HealthHandle` from its new module.
 
 ### Task 9: Structured logging and `nhop logs`
 

@@ -21,7 +21,8 @@ use tokio::task::JoinHandle;
 use crate::daemon::state::{
     DEFAULT_HTTP_LISTEN, DEFAULT_SOCKS_LISTEN, LOAD_TIMEOUT, Live, StateConfig, StateHandle,
 };
-use crate::proxy::{self, DirectHop, Listen, NextHop};
+use crate::proxy::{self, Listen, NextHop};
+use crate::upstream::{PROBE_INTERVAL, UpstreamHop};
 
 /// Addresses both front ends bind until an init script moves them.
 pub const DEFAULT_LISTEN: Listen = Listen {
@@ -282,7 +283,12 @@ fn accept_socks(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io:
 ///
 /// [`io::Error`]: std::io::Error
 pub fn spawn_frontends(live: &Live, listen: Listen) -> io::Result<Frontends> {
-    Frontends::bind(live.clone(), Arc::new(DirectHop), listen)
+    let hop = UpstreamHop::start(
+        live.upstream().clone(),
+        live.health().clone(),
+        PROBE_INTERVAL,
+    );
+    Frontends::bind(live.clone(), Arc::new(hop), listen)
 }
 
 /// Running daemon: the single-instance claim, the state task and the IPC server.

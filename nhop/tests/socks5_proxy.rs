@@ -3,8 +3,9 @@ mod support;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use nhop::proxy::{ConnCtx, EventTx, HealthHandle, NextHop, socks5};
+use nhop::proxy::{ConnCtx, EventTx, NextHop, socks5};
 use nhop::rules::{Decision, Host, Port, RuleClass, RuleId, RuleKind, RuleValue, Ruleset};
+use nhop::upstream::HealthHandle;
 use nhop_ipc::Paths;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

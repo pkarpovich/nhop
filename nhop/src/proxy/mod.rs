@@ -8,12 +8,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use nhop_ipc::{EventView, HealthState, Host, Port, UpstreamAddr};
+use nhop_ipc::{EventView, Host, Port, UpstreamAddr};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::rules::{Decision, RuleId, Ruleset};
+use crate::upstream::HealthHandle;
 
 /// Addresses the two front ends listen on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,30 +74,6 @@ impl Upstream {
     /// Returns the address the dialer connects to.
     pub fn socket(&self) -> SocketAddr {
         self.socket
-    }
-}
-
-/// Verdict on the upstream, shared by the state task and every connection.
-#[derive(Debug, Clone)]
-pub struct HealthHandle(Arc<ArcSwap<HealthState>>);
-
-impl Default for HealthHandle {
-    fn default() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(HealthState::Down)))
-    }
-}
-
-impl HealthHandle {
-    /// Returns the verdict in force at this instant.
-    pub fn state(&self) -> HealthState {
-        let Self(verdict) = self;
-        **verdict.load()
-    }
-
-    /// Publishes a new verdict.
-    pub fn set(&self, state: HealthState) {
-        let Self(verdict) = self;
-        verdict.store(Arc::new(state));
     }
 }
 
@@ -194,28 +170,9 @@ pub trait NextHop: fmt::Debug + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>>;
 }
 
-/// Next hop that dials every destination directly, whatever the decision.
-#[derive(Debug, Default)]
-pub struct DirectHop;
-
-impl NextHop for DirectHop {
-    fn dial<'a>(
-        &'a self,
-        host: &'a Host,
-        port: Port,
-        _decision: Decision,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>> {
-        Box::pin(async move {
-            let Host(host) = host;
-            let Port(port) = port;
-            TcpStream::connect((host.as_str(), port)).await
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use nhop_ipc::{Host, Port, RuleClass, RuleKind, RuleValue};
+    use nhop_ipc::{HealthState, Host, Port};
 
     use super::*;
 
@@ -271,14 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn health_starts_down_and_follows_what_is_published() {
-        let health = HealthHandle::default();
-        assert_eq!(health.state(), HealthState::Down);
-        health.set(HealthState::Up);
-        assert_eq!(health.clone().state(), HealthState::Up);
-    }
-
-    #[test]
     fn a_discarded_event_reaches_nobody() {
         EventTx::default().publish(event());
     }
@@ -293,34 +242,6 @@ mod tests {
 
         assert_eq!(events.recv().await, Some(event()));
         assert!(events.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn the_direct_hop_reaches_a_listener_whatever_the_decision() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut ruleset = Ruleset::default();
-        ruleset
-            .push(
-                RuleClass::Require,
-                RuleKind::Suffix,
-                RuleValue("localhost".to_owned()),
-            )
-            .unwrap();
-
-        let dialled = DirectHop
-            .dial(
-                &Host(addr.ip().to_string()),
-                Port(addr.port()),
-                Decision::Upstream {
-                    class: RuleClass::Require,
-                    rule: RuleId(0),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(dialled.peer_addr().unwrap(), addr);
     }
 
     fn event() -> EventView {

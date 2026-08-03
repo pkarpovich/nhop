@@ -15,10 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
 use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
-use crate::proxy::{
-    ConnCtx, EventTx, HealthHandle, InvalidUpstream, Listen, NO_UPSTREAM, Upstream,
-};
+use crate::proxy::{ConnCtx, EventTx, InvalidUpstream, Listen, NO_UPSTREAM, Upstream};
 use crate::rules::{InvalidRule, RuleId, Ruleset};
+use crate::upstream::{Health, HealthHandle};
 
 /// Address the HTTP front end binds until the init script moves it.
 pub const DEFAULT_HTTP_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890);
@@ -290,7 +289,6 @@ struct DaemonState {
     http_listen: SocketAddr,
     socks_listen: SocketAddr,
     upstream: UpstreamAddr,
-    health_changed_at: SystemTime,
     init_path: Option<PathBuf>,
     last_load: Option<LastLoadView>,
     load_ids: LoadIds,
@@ -317,7 +315,6 @@ impl DaemonState {
             http_listen: http,
             socks_listen: socks,
             upstream: UpstreamAddr(String::new()),
-            health_changed_at: SystemTime::now(),
             init_path: None,
             last_load: None,
             load_ids: LoadIds::default(),
@@ -681,6 +678,7 @@ impl DaemonState {
     fn status(&self) -> StatusView {
         let rules = self.live.rules().snapshot();
         let bound = self.bind_state().is_bound();
+        let Health { state, changed_at } = self.live.health().verdict();
         StatusView {
             uptime_secs: self.started.elapsed().as_secs(),
             http_listen: self.http_listen,
@@ -688,8 +686,8 @@ impl DaemonState {
             socks_listen: self.socks_listen,
             socks_bound: bound,
             upstream: self.upstream.clone(),
-            health: self.live.health().state(),
-            health_changed_at: Timestamp(self.health_changed_at),
+            health: state,
+            health_changed_at: Timestamp(changed_at),
             init_path: self.init_path.clone(),
             last_load: self.last_load.clone(),
             rules: RuleCountsView {
