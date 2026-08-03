@@ -446,21 +446,26 @@ impl DaemonState {
     }
 
     fn set_upstream(&mut self, addr: UpstreamAddr, load: Option<LoadId>) -> Response {
-        let target = self.target(load);
-        let upstream = match Upstream::parse(addr) {
-            Ok(upstream) => upstream,
-            Err(failure) => {
-                self.reject_staged(&target);
-                return unreadable(&failure);
-            }
-        };
-        match target {
+        match self.target(load) {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => self.staged(|staged| {
-                staged.set_upstream(upstream);
-                Response::Ok
-            }),
+            Target::Staged => {
+                let upstream = match Upstream::parse(addr) {
+                    Ok(upstream) => upstream,
+                    Err(failure) => {
+                        self.fail_staged();
+                        return unreadable(&failure);
+                    }
+                };
+                self.staged(|staged| {
+                    staged.set_upstream(upstream);
+                    Response::Ok
+                })
+            }
             Target::Live => {
+                let upstream = match Upstream::parse(addr) {
+                    Ok(upstream) => upstream,
+                    Err(failure) => return unreadable(&failure),
+                };
                 self.adopt_upstream(Some(upstream));
                 Response::Ok
             }
@@ -483,12 +488,7 @@ impl DaemonState {
         }
     }
 
-    fn reject_staged(&mut self, target: &Target) {
-        match target {
-            Target::Staged => {}
-            Target::Live => return,
-            Target::Refused(_refusal) => return,
-        }
+    fn fail_staged(&mut self) {
         let Some(InFlight {
             id: _,
             staged,
@@ -1061,6 +1061,10 @@ mod tests {
             Command::ClearRules { load: None },
             Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                load: None,
+            },
+            Command::SetUpstream {
+                addr: UpstreamAddr("192.0.2.10".to_owned()),
                 load: None,
             },
             Command::Reload { path: None },

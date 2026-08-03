@@ -71,7 +71,11 @@ impl Suffix {
         let RuleValue(suffix) = value;
         let suffix = suffix.strip_suffix('.').unwrap_or(suffix);
         let suffix = suffix.to_lowercase();
-        if suffix.is_empty() || suffix.contains(char::is_whitespace) {
+        if suffix.is_empty()
+            || suffix.contains(char::is_whitespace)
+            || suffix.starts_with('.')
+            || suffix.contains('*')
+        {
             return Err(InvalidRule::new(
                 RuleKind::Suffix,
                 value,
@@ -320,6 +324,18 @@ mod tests {
         assert!(failure.message().contains("suffix"), "{failure}");
         assert!(
             rejection(RuleKind::Suffix, "  ")
+                .message()
+                .contains("suffix")
+        );
+    }
+
+    #[test]
+    fn suffix_rejects_spellings_that_would_match_nothing() {
+        let failure = rejection(RuleKind::Suffix, ".example.com");
+        assert_eq!(failure.err_kind(), ErrKind::InvalidArgs);
+        assert!(failure.message().contains("suffix"), "{failure}");
+        assert!(
+            rejection(RuleKind::Suffix, "*.example.com")
                 .message()
                 .contains("suffix")
         );
