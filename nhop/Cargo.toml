@@ -6,3 +6,6 @@ rust-version.workspace = true
 
 [dependencies]
 nhop-ipc.workspace = true
+
+ipnet.workspace = true
+thiserror.workspace = true

@@ -319,18 +319,28 @@ already reached nhop): `localhost`, `127.0.0.1`, `*.local`, `169.254/16`.
 **Files:**
 - Create: `nhop/src/rules/mod.rs`, `nhop/src/rules/matcher.rs`, `nhop/src/rules/ruleset.rs`
 
-- [ ] define newtypes `Host`, `Port`, `RuleId(usize)` (index in declaration order within the
+- [x] define newtypes `Host`, `Port`, `RuleId(usize)` (index in declaration order within the
       current ruleset, invalidated by a reload), and enums `RuleKind`, `RuleClass`, and
       `Decision { Direct, Never{rule}, Upstream{class, rule} }` - `Never` and `Direct` both dial
       directly but render differently in `test`, `status` and the log event
-- [ ] implement each kind exactly as the Rule surface section defines it
-- [ ] implement `Ruleset::decide(&self, host: &Host, port: Port) -> Decision` with precedence:
+- [x] implement each kind exactly as the Rule surface section defines it
+- [x] implement `Ruleset::decide(&self, host: &Host, port: Port) -> Decision` with precedence:
       `never` rules first, then rules in declaration order, first match wins, default `Direct`
-- [ ] value parsers reject malformed input with `ErrKind::InvalidArgs`
-- [ ] write tests for suffix (exact, sub-domain, shared-tail non-match, case, trailing dot)
-- [ ] write tests for cidr (in range, out of range, hostname must not match), port, keyword
-- [ ] write tests for precedence and for each parser's rejection case
-- [ ] run `mise run check` - must pass before task 3
+- [x] value parsers reject malformed input with `ErrKind::InvalidArgs`
+- [x] write tests for suffix (exact, sub-domain, shared-tail non-match, case, trailing dot)
+- [x] write tests for cidr (in range, out of range, hostname must not match), port, keyword
+- [x] write tests for precedence and for each parser's rejection case
+- [x] run `mise run check` - must pass before task 3
+
+➕ `Host`, `Port`, `RuleClass` and `RuleKind` are re-exported from `nhop-ipc` by `rules/mod.rs`
+rather than redefined, since Task 1 already defined them as the wire contract; redefining them in
+`nhop` would be exactly the daemon/client drift the split crate exists to prevent. `RuleId` and
+`Decision` are new here.
+
+➕ `nhop/src/lib.rs` added: `nhop` is now a lib + bin crate. A binary-only crate reports every
+routing type as `dead_code` until `main` calls it, which `cargo clippy -D warnings` turns into a
+failed gate; the lib target also gives Tasks 6 and 15 a way to reach the daemon from
+`nhop/tests/`. `main.rs` is unchanged.
 
 ### Task 3: Daemon skeleton, state ownership and the IPC server
 
