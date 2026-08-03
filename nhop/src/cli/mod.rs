@@ -1,10 +1,11 @@
 mod client;
 
 use std::env;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use argh::{EarlyExit, FromArgs};
 use nhop_ipc::{
@@ -17,8 +18,12 @@ use serde::Serialize;
 
 use crate::cli::client::Unreachable;
 use crate::daemon::{self, StartFailure};
+use crate::logging::{self, LoggedDecision, Window};
 
 const BINARY: &str = "nhop";
+
+/// How long `logs -f` waits between reads of the file it follows.
+const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Code the process exits with, one variant per row of the exit-code table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +125,25 @@ impl FromStr for Destination {
     }
 }
 
+/// Stretch of the log `--since` limits the output to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Since(Duration);
+
+/// Whether `logs` stops at the end of the log or keeps reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// Stops once the kept files have been printed.
+    Stop,
+    /// Keeps printing what is appended, until the process is stopped.
+    Keep,
+}
+
+impl Follow {
+    fn of(follow: bool) -> Self {
+        if follow { Self::Keep } else { Self::Stop }
+    }
+}
+
 /// macOS network service the system proxy settings belong to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkService(String);
@@ -161,6 +185,15 @@ fn parse_value(value: &str) -> Result<RuleValue, String> {
 
 fn parse_upstream(addr: &str) -> Result<UpstreamAddr, String> {
     Ok(UpstreamAddr(addr.to_owned()))
+}
+
+fn parse_since(window: &str) -> Result<Since, String> {
+    let Ok(window) = humantime::parse_duration(window) else {
+        return Err(format!(
+            "expected a duration like 15m, 2h or 3d, got {window:?}"
+        ));
+    };
+    Ok(Since(window))
 }
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
@@ -306,6 +339,12 @@ struct Test {
 /// print the daemon log
 #[argh(subcommand, name = "logs")]
 struct Logs {
+    /// keep printing what the daemon appends
+    #[argh(switch, short = 'f')]
+    follow: bool,
+    /// only lines younger than this duration, as 15m, 2h or 3d
+    #[argh(option, from_str_fn(parse_since))]
+    since: Option<Since>,
     /// print the raw JSON lines
     #[argh(switch)]
     json: bool,
@@ -410,7 +449,11 @@ async fn dispatch(
             let command = Command::Test { host, port };
             ask(paths, command, Output::of(json), out, err).await
         }
-        Subcommand::Logs(Logs { json: _ }) => unserved("logs", err),
+        Subcommand::Logs(Logs {
+            follow,
+            since,
+            json,
+        }) => logs(paths, Follow::of(follow), since, Output::of(json), out, err).await,
         Subcommand::Tail(Tail { json: _ }) => unserved("tail", err),
         Subcommand::Doctor(Doctor { json }) => {
             ask(paths, Command::Doctor, Output::of(json), out, err).await
@@ -454,6 +497,109 @@ async fn start(paths: &Paths, err: &mut dyn Write) -> Exit {
     };
     let _ = writeln!(err, "nhop: {failure}");
     Exit::of_start(&failure)
+}
+
+async fn logs(
+    paths: &Paths,
+    follow: Follow,
+    since: Option<Since>,
+    output: Output,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    let window = match since {
+        Some(Since(window)) => Window::reaching_back(window),
+        None => Window::All,
+    };
+    let files = match logging::files(paths) {
+        Ok(files) => files,
+        Err(failure) => {
+            let _ = writeln!(err, "nhop: cannot read the log directory: {failure}");
+            return Exit::Missing;
+        }
+    };
+    let Some((current, kept)) = files.split_last() else {
+        let _ = writeln!(
+            err,
+            "nhop: no log file yet, run `nhop start` to write one at {}",
+            paths.log_file().display()
+        );
+        return Exit::Missing;
+    };
+    for file in kept {
+        let Ok(_offset) = print_from(file, 0, window, output, out) else {
+            return unreadable_log(file, err);
+        };
+    }
+    let Ok(offset) = print_from(current, 0, window, output, out) else {
+        return unreadable_log(current, err);
+    };
+    match follow {
+        Follow::Stop => Exit::Success,
+        Follow::Keep => keep_reading(paths, current.clone(), offset, window, output, out).await,
+    }
+}
+
+async fn keep_reading(
+    paths: &Paths,
+    mut current: PathBuf,
+    mut offset: u64,
+    window: Window,
+    output: Output,
+    out: &mut dyn Write,
+) -> Exit {
+    loop {
+        tokio::time::sleep(FOLLOW_INTERVAL).await;
+        let Ok(files) = logging::files(paths) else {
+            return Exit::Missing;
+        };
+        let Some(newest) = files.last() else {
+            continue;
+        };
+        if newest != &current {
+            current = newest.clone();
+            offset = 0;
+        }
+        let Ok(read) = print_from(&current, offset, window, output, out) else {
+            return Exit::Failed;
+        };
+        offset = read;
+    }
+}
+
+fn print_from(
+    file: &Path,
+    offset: u64,
+    window: Window,
+    output: Output,
+    out: &mut dyn Write,
+) -> io::Result<u64> {
+    let (lines, offset) = logging::read_from(file, offset)?;
+    for line in lines {
+        if !window.holds(&line) {
+            continue;
+        }
+        match output {
+            Output::Json => writeln!(out, "{line}")?,
+            Output::Human => render_log(&line, out)?,
+        }
+    }
+    Ok(offset)
+}
+
+fn render_log(line: &str, out: &mut dyn Write) -> io::Result<()> {
+    let Some(LoggedDecision { at, event }) = logging::logged(line) else {
+        return writeln!(out, "{line}");
+    };
+    let Timestamp(at) = at;
+    write!(out, "{}  ", humantime::format_rfc3339_seconds(at))?;
+    render_event(&event, out);
+    Ok(())
+}
+
+fn unreadable_log(file: &Path, err: &mut dyn Write) -> Exit {
+    let _ = writeln!(err, "nhop: cannot read {}", file.display());
+    Exit::Failed
 }
 
 async fn ask(
@@ -867,10 +1013,21 @@ mod tests {
                 json: true,
             })
         );
-        assert_eq!(parse(&["logs"]), Subcommand::Logs(Logs { json: false }));
         assert_eq!(
-            parse(&["logs", "--json"]),
-            Subcommand::Logs(Logs { json: true })
+            parse(&["logs"]),
+            Subcommand::Logs(Logs {
+                follow: false,
+                since: None,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(&["logs", "--json", "-f", "--since", "2h"]),
+            Subcommand::Logs(Logs {
+                follow: true,
+                since: Some(Since(Duration::from_secs(7200))),
+                json: true,
+            })
         );
         assert_eq!(parse(&["tail"]), Subcommand::Tail(Tail { json: false }));
         assert_eq!(
@@ -1149,17 +1306,141 @@ mod tests {
     async fn the_verbs_of_later_tasks_report_themselves_as_unimplemented() {
         let (_home, paths) = temp_paths();
 
-        for verb in ["logs", "tail"] {
-            let (exit, out, err) = invoke(&paths, &[verb]).await;
-            assert_eq!(exit, Exit::Failed, "{verb}");
-            assert!(out.is_empty(), "{verb}");
-            assert!(err.contains(verb), "{err}");
-        }
+        let (exit, out, err) = invoke(&paths, &["tail"]).await;
+        assert_eq!(exit, Exit::Failed);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("tail"), "{err}");
 
         let (exit, out, err) = invoke(&paths, &["proxy", "on"]).await;
         assert_eq!(exit, Exit::Failed);
         assert!(out.is_empty(), "{out}");
         assert!(err.contains("proxy"), "{err}");
+    }
+
+    fn write_log(paths: &Paths, day: &str, lines: &[String]) {
+        let file = paths.state_dir().unwrap().join(format!("nhop.log.{day}"));
+        let mut written = String::new();
+        for line in lines {
+            written.push_str(line);
+            written.push('\n');
+        }
+        std::fs::write(file, written).unwrap();
+    }
+
+    fn log_line(at: &str, host: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{at}","level":"INFO","fields":{{"host":"{host}","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","duration_ms":9}},"target":"nhop::proxy"}}"#
+        )
+    }
+
+    fn now() -> String {
+        humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
+    }
+
+    #[tokio::test]
+    async fn logs_prints_the_kept_rotations_in_chronological_order() {
+        let (_home, paths) = temp_paths();
+        write_log(
+            &paths,
+            "2026-08-01",
+            &[log_line("2026-08-01T10:00:00Z", "oldest.example.com")],
+        );
+        write_log(
+            &paths,
+            "2026-08-02",
+            &[log_line("2026-08-02T10:00:00Z", "middle.example.com")],
+        );
+        write_log(
+            &paths,
+            "2026-08-03",
+            &[log_line("2026-08-03T10:00:00Z", "newest.example.com")],
+        );
+
+        let (exit, out, err) = invoke(&paths, &["logs", "--json"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        let hosts: Vec<&str> = out.lines().collect();
+        assert_eq!(hosts.len(), 3, "{out}");
+        assert!(hosts[0].contains("oldest.example.com"), "{out}");
+        assert!(hosts[1].contains("middle.example.com"), "{out}");
+        assert!(hosts[2].contains("newest.example.com"), "{out}");
+        for line in hosts {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_renders_a_decision_line_as_text_and_leaves_the_rest_alone() {
+        let (_home, paths) = temp_paths();
+        write_log(
+            &paths,
+            "2026-08-03",
+            &[
+                log_line("2026-08-03T10:00:00Z", "api.example.com"),
+                r#"{"timestamp":"2026-08-03T10:00:01Z","fields":{"message":"hello"}}"#.to_owned(),
+            ],
+        );
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        let mut lines = out.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "2026-08-03T10:00:00Z  api.example.com:443  upstream via rule 2 (require)  upstream up  9ms  -"
+            )
+        );
+        assert!(lines.next().unwrap().contains("hello"), "{out}");
+        assert_eq!(lines.next(), None);
+    }
+
+    #[tokio::test]
+    async fn logs_since_keeps_only_the_lines_inside_the_window() {
+        let (_home, paths) = temp_paths();
+        write_log(
+            &paths,
+            "2026-08-03",
+            &[
+                log_line("2020-01-01T00:00:00Z", "old.example.com"),
+                log_line(&now(), "fresh.example.com"),
+            ],
+        );
+
+        let (exit, out, err) = invoke(&paths, &["logs", "--json", "--since", "15m"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("fresh.example.com"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn logs_with_a_malformed_duration_exits_four() {
+        let (_home, paths) = temp_paths();
+        write_log(&paths, "2026-08-03", &[log_line(&now(), "api.example.com")]);
+
+        let (exit, out, err) = invoke(&paths, &["logs", "--since", "forever"]).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        assert_eq!(exit.code(), 4);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("forever"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn logs_without_a_log_file_exits_two_with_a_hint() {
+        let (_home, paths) = temp_paths();
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Missing);
+        assert_eq!(exit.code(), 2);
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.contains("nhop start"), "{err}");
     }
 
     #[test]

@@ -6,7 +6,8 @@ use nhop_ipc::{Host, Port};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::TcpStream;
 
-use crate::proxy::{ConnCtx, NextHop, UpstreamDown};
+use crate::proxy::{ConnCtx, NextHop, Routed, UpstreamDown};
+use crate::rules::Decision;
 
 const VERSION: u8 = 0x05;
 const NO_AUTH: u8 = 0x00;
@@ -74,10 +75,14 @@ enum Requested {
 /// A domain-type request travels to the next hop as the name the client wrote: internal names
 /// resolve only inside the upstream's network, so resolving here would route them nowhere.
 ///
+/// A connection that reached a decision leaves exactly one line in the log, whether it was relayed
+/// or refused.
+///
 /// # Errors
 ///
 /// Returns [`io::Error`] when the client or the next hop fails while the request is read, the
-/// reply is written or the relay is running.
+/// reply is written or the relay is running. A refused dial is such a failure, reported after the
+/// client has been answered.
 ///
 /// [`io::Error`]: std::io::Error
 pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io::Result<()> {
@@ -90,13 +95,29 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
         Requested::Refused(reply) => return answer(&mut client, reply).await,
     };
     let decision = ctx.rules.decide(&host, port);
-    let dialled = hop.dial(&host, port, decision).await;
+    let routed = Routed::begun(&ctx, &host, port, decision);
+    let served = relay(&mut client, &host, port, decision, hop).await;
+    routed.ended(served.as_ref().err());
+    served
+}
+
+async fn relay(
+    client: &mut TcpStream,
+    host: &Host,
+    port: Port,
+    decision: Decision,
+    hop: &dyn NextHop,
+) -> io::Result<()> {
+    let dialled = hop.dial(host, port, decision).await;
     let mut next = match dialled {
         Ok(next) => next,
-        Err(failure) => return answer(&mut client, refusal(&failure)).await,
+        Err(failure) => {
+            answer(client, refusal(&failure)).await?;
+            return Err(failure);
+        }
     };
-    answer(&mut client, Reply::Granted).await?;
-    let _relayed = copy_bidirectional(&mut client, &mut next).await?;
+    answer(client, Reply::Granted).await?;
+    let _relayed = copy_bidirectional(client, &mut next).await?;
     Ok(())
 }
 

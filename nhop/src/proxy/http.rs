@@ -5,7 +5,8 @@ use nhop_ipc::{Host, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::TcpStream;
 
-use crate::proxy::{ConnCtx, NextHop, UpstreamDown};
+use crate::proxy::{ConnCtx, NextHop, Routed, UpstreamDown};
+use crate::rules::Decision;
 
 /// Largest request head the front end reads, in bytes.
 pub const HEAD_LIMIT: usize = 8192;
@@ -35,12 +36,14 @@ struct Request {
 /// Serves one connection of the HTTP front end and closes it.
 ///
 /// Exactly one request is routed per connection: whatever the client pipelined behind the head is
-/// discarded, so a later request can never inherit this one's next hop.
+/// discarded, so a later request can never inherit this one's next hop. A connection that reached
+/// a decision leaves exactly one line in the log, whether it was relayed or refused.
 ///
 /// # Errors
 ///
 /// Returns [`io::Error`] when the client or the next hop fails while the head is read, the answer
-/// is written or the relay is running.
+/// is written or the relay is running. A refused dial is such a failure, reported after the client
+/// has been answered.
 ///
 /// [`io::Error`]: std::io::Error
 pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io::Result<()> {
@@ -54,10 +57,28 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
     };
     let Request { method, host, port } = request;
     let decision = ctx.rules.decide(&host, port);
-    let dialled = hop.dial(&host, port, decision).await;
+    let routed = Routed::begun(&ctx, &host, port, decision);
+    let served = relay(&mut client, head, method, &host, port, decision, hop).await;
+    routed.ended(served.as_ref().err());
+    served
+}
+
+async fn relay(
+    client: &mut TcpStream,
+    head: &[u8],
+    method: Method,
+    host: &Host,
+    port: Port,
+    decision: Decision,
+    hop: &dyn NextHop,
+) -> io::Result<()> {
+    let dialled = hop.dial(host, port, decision).await;
     let mut next = match dialled {
         Ok(next) => next,
-        Err(failure) => return refuse(&mut client, &failure, &host, port).await,
+        Err(failure) => {
+            refuse(client, &failure, host, port).await?;
+            return Err(failure);
+        }
     };
     match method {
         Method::Connect => {
@@ -69,7 +90,7 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
             next.flush().await?;
         }
     }
-    let _relayed = copy_bidirectional(&mut client, &mut next).await?;
+    let _relayed = copy_bidirectional(client, &mut next).await?;
     Ok(())
 }
 

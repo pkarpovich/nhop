@@ -7,11 +7,13 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
-use nhop_ipc::{EventView, Host, Port, UpstreamAddr};
+use nhop_ipc::{EventView, HealthState, Host, Port, UpstreamAddr};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::logging;
 use crate::rules::{Decision, RuleId, Ruleset};
 use crate::upstream::HealthHandle;
 
@@ -150,6 +152,58 @@ pub struct ConnCtx {
     pub upstream: SocketAddr,
     /// Sink the decision is published to.
     pub events: EventTx,
+}
+
+/// One connection, from the decision that routed it to the line it leaves in the log.
+///
+/// The verdict is taken when the decision is made and the duration when the connection ends, so
+/// the event reports what the routing actually saw.
+#[derive(Debug)]
+pub struct Routed {
+    host: Host,
+    port: Port,
+    decision: Decision,
+    upstream: HealthState,
+    started: Instant,
+}
+
+impl Routed {
+    /// Records the decision a connection was routed by.
+    pub fn begun(ctx: &ConnCtx, host: &Host, port: Port, decision: Decision) -> Self {
+        Self {
+            host: host.clone(),
+            port,
+            decision,
+            upstream: ctx.health.state(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Emits the single event this connection produces, once it has ended.
+    pub fn ended(self, failure: Option<&io::Error>) {
+        let Self {
+            host,
+            port,
+            decision,
+            upstream,
+            started,
+        } = self;
+        logging::decision(&EventView {
+            host,
+            port,
+            decision: decision.kind(),
+            rule_index: matched_index(decision),
+            class: decision.class(),
+            upstream,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            error: failure.map(io::Error::to_string),
+        });
+    }
+}
+
+fn matched_index(decision: Decision) -> Option<u32> {
+    let RuleId(index) = decision.rule()?;
+    Some(u32::try_from(index).unwrap_or(u32::MAX))
 }
 
 /// Opens the connection a [`Decision`] calls for.

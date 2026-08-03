@@ -623,17 +623,48 @@ and the two front-end test files import `HealthHandle` from its new module.
 - Create: `nhop/src/logging.rs`
 - Modify: `nhop/src/daemon/mod.rs`, `nhop/src/cli/mod.rs`
 
-- [ ] initialise `tracing-subscriber` with the JSON formatter over
+- [x] initialise `tracing-subscriber` with the JSON formatter over
       `tracing_appender::rolling::daily(state_dir, "nhop.log")`, keeping 7 files - daily, because
       `tracing-appender` has no size-based rotation; the Filesystem contract says the same
-- [ ] emit one event per connection decision whose fields are exactly `EventView` from the IPC
+- [x] emit one event per connection decision whose fields are exactly `EventView` from the IPC
       contract; never log request bodies, headers or credentials
-- [ ] `nhop logs` prints the current file and the kept rotations in chronological order; `-f`
+- [x] `nhop logs` prints the current file and the kept rotations in chronological order; `-f`
       follows; `--since <dur>` accepts `humantime` durations (`15m`, `2h`, `3d`) and exits 4 on a
       malformed value; `--json` emits raw lines
-- [ ] write tests for the `--since` filter and the malformed-duration exit code over a fixture file
-- [ ] write a test parsing emitted lines into a `deny_unknown_fields` struct matching `EventView`
-- [ ] run `mise run check` - must pass before task 10
+- [x] write tests for the `--since` filter and the malformed-duration exit code over a fixture file
+- [x] write a test parsing emitted lines into a `deny_unknown_fields` struct matching `EventView`
+- [x] run `mise run check` - must pass before task 10
+
+➕ `logging::start` is called from `daemon::run` only, not from `start`/`start_on`: installing a
+process-wide subscriber is a one-shot, and every test starts several daemons in one process. Tests
+build the same subscriber with `logging::subscriber(paths)` and scope it with
+`tracing::subscriber::with_default`, so what they assert on is the daemon's real formatter and
+appender. The filter is the constant `nhop=info`, read from no environment variable, so a log line
+never depends on the shell a test ran in.
+
+➕ Beyond the listed files: `proxy/mod.rs` gains `Routed`, and `proxy/http.rs` and
+`proxy/socks5.rs` call it. A decision is only made in a front end, so that is the only place one
+event per connection can be emitted. `Routed::begun` captures the verdict when the decision is
+made, `Routed::ended` measures the connection and writes the line; Task 12 adds the
+`ctx.events.publish` call to the same place. Both front ends now hand the relay to an inner `relay`
+function so a refused dial is answered *and* reported as the connection's error - `serve` therefore
+returns `Err` on a refusal where it returned `Ok` before, which nothing reads.
+
+➕ tracing cannot record a null, so an absent `rule_index`, `class` or `error` is an absent field
+rather than `"field":null`; the `deny_unknown_fields` test covers both shapes and `logged()` reads
+either back into an `EventView`. The wire spellings the log uses are pinned to the serde spellings
+by `the_logged_names_are_the_names_the_wire_uses`.
+
+➕ `nhop/tests/decision_log.rs` added: nothing under `src/` can prove the front ends emit at all,
+because that needs a real connection through a running daemon and a process-wide subscriber. Its
+own test binary installs one and asserts that an HTTP tunnel and a SOCKS5 relay leave exactly one
+line each, with the decision they were routed by.
+
+⚠️ Pre-existing flake, not introduced here and not fixed here: the Task 5 state tests time out in
+`await_load_id` (`PATIENCE` = 2 s) when the machine is loaded enough that the `/bin/sh` handshake
+script does not reach its first write in time. Reproduced identically on the commit before this
+task by running four `cargo test -p nhop --lib` processes at once; a single `mise run check` is
+green.
 
 ### Task 10: `status`, `rules`, `test` and the system-proxy reader
 

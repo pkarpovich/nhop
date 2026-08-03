@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::daemon::state::{
     DEFAULT_HTTP_LISTEN, DEFAULT_SOCKS_LISTEN, LOAD_TIMEOUT, Live, StateConfig, StateHandle,
 };
+use crate::logging;
 use crate::proxy::{self, Listen, NextHop};
 use crate::upstream::{PROBE_INTERVAL, UpstreamHop};
 
@@ -388,11 +389,15 @@ pub fn start_on(paths: &Paths, listen: Listen) -> Result<Daemon, StartFailure> {
 
 /// Runs the daemon until SIGINT or SIGTERM arrives.
 ///
+/// This is the one entry point that installs the log: [`start`] and [`start_on`] leave the log of
+/// the process alone, so a test can run several daemons at once.
+///
 /// # Errors
 ///
-/// Returns [`StartFailure`] when the daemon cannot start or the signal handlers cannot be
-/// installed.
+/// Returns [`StartFailure`] when the log cannot be opened, the daemon cannot start or the signal
+/// handlers cannot be installed.
 pub async fn run(paths: &Paths) -> Result<(), StartFailure> {
+    logging::start(paths)?;
     let daemon = start(paths)?;
     await_stop_signal().await?;
     daemon.shutdown().await;
