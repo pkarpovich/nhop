@@ -8,7 +8,7 @@ mod tail;
 use std::env;
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{self, Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -425,7 +425,10 @@ async fn dispatch(
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Reload(Reload { path }) => {
-            ask(paths, Command::Reload { path }, Output::Human, out, err).await
+            let command = Command::Reload {
+                path: reload_path(path),
+            };
+            ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::On(On {}) => ask(paths, Command::On, Output::Human, out, err).await,
         Subcommand::Off(Off {}) => ask(paths, Command::Off, Output::Human, out, err).await,
@@ -464,6 +467,15 @@ fn add_rule(class: RuleClass, kind: RuleKind, value: RuleValue, load: Option<Loa
         value,
         load,
     }
+}
+
+/// Resolves the script against the directory the caller ran in, which the daemon does not share.
+fn reload_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    let path = path?;
+    let Ok(absolute) = path::absolute(&path) else {
+        return Some(path);
+    };
+    Some(absolute)
 }
 
 fn load_of_env() -> Option<LoadId> {
@@ -1518,6 +1530,20 @@ mod tests {
         assert_eq!(kind, RuleKind::Suffix);
         assert_eq!(value, RuleValue("example.com".to_owned()));
         assert_eq!(load, Some(LoadId(7)));
+    }
+
+    #[test]
+    fn a_relative_reload_path_is_resolved_before_it_leaves_the_caller() {
+        let here = env::current_dir().unwrap();
+        assert_eq!(
+            reload_path(Some(PathBuf::from("other-init"))),
+            Some(here.join("other-init"))
+        );
+        assert_eq!(
+            reload_path(Some(PathBuf::from("/tmp/other-init"))),
+            Some(PathBuf::from("/tmp/other-init"))
+        );
+        assert_eq!(reload_path(None), None);
     }
 
     #[tokio::test]
