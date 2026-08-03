@@ -145,6 +145,11 @@ impl Live {
     pub fn health(&self) -> &HealthHandle {
         &self.health
     }
+
+    /// Returns the fan-out the front ends publish their decisions to.
+    pub fn events(&self) -> &EventTx {
+        &self.events
+    }
 }
 
 /// What the state task starts with.
@@ -373,7 +378,7 @@ impl DaemonState {
                 answer(reply, Response::Decision(self.decision(&host, port)));
             }
             Command::Doctor => self.doctor(reply),
-            Command::Subscribe => answer(reply, unserved()),
+            Command::Subscribe => answer(reply, streamed()),
         }
     }
 
@@ -787,10 +792,11 @@ fn unbindable(failure: &io::Error) -> Response {
     }
 }
 
-fn unserved() -> Response {
+fn streamed() -> Response {
     Response::Err {
         kind: ErrKind::Internal,
-        message: "the daemon does not serve this command yet".to_owned(),
+        message: "subscribe is served by the connection it arrives on, not by the state task"
+            .to_owned(),
     }
 }
 
@@ -1615,14 +1621,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_of_a_later_task_reports_an_internal_error() {
+    async fn subscribe_belongs_to_the_connection_and_not_to_the_state_task() {
         let (_home, state) = spawn_here();
 
         let Response::Err { kind, message } = state.call(Command::Subscribe).await else {
-            panic!("an unserved command must answer with an error");
+            panic!("the state task must refuse to answer subscribe");
         };
         assert_eq!(kind, ErrKind::Internal);
-        assert!(message.contains("yet"), "{message}");
+        assert!(message.contains("connection"), "{message}");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod explain;
 pub mod status;
 pub mod system_proxy;
+mod tail;
 
 use std::env;
 use std::io::{self, Write};
@@ -444,7 +445,9 @@ async fn dispatch(
             since,
             json,
         }) => logs(paths, Follow::of(follow), since, Output::of(json), out, err).await,
-        Subcommand::Tail(Tail { json: _ }) => unserved("tail", err),
+        Subcommand::Tail(Tail { json }) => {
+            tail::follow(&paths.socket_file(), Output::of(json), out, err).await
+        }
         Subcommand::Doctor(Doctor { json }) => diagnose(paths, Output::of(json), out, err).await,
         Subcommand::Proxy(Proxy {
             action: _,
@@ -1398,15 +1401,23 @@ mod tests {
     async fn the_verbs_of_later_tasks_report_themselves_as_unimplemented() {
         let (_home, paths) = temp_paths();
 
-        let (exit, out, err) = invoke(&paths, &["tail"]).await;
-        assert_eq!(exit, Exit::Failed);
-        assert!(out.is_empty(), "{out}");
-        assert!(err.contains("tail"), "{err}");
-
         let (exit, out, err) = invoke(&paths, &["proxy", "on"]).await;
         assert_eq!(exit, Exit::Failed);
         assert!(out.is_empty(), "{out}");
         assert!(err.contains("proxy"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tail_without_a_daemon_exits_two_with_a_one_line_hint_on_stderr() {
+        let (_home, paths) = temp_paths();
+
+        let (exit, out, err) = invoke(&paths, &["tail", "--json"]).await;
+
+        assert_eq!(exit, Exit::Missing);
+        assert_eq!(exit.code(), 2);
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.contains("nhop start"), "{err}");
     }
 
     fn write_log(paths: &Paths, day: &str, lines: &[String]) {

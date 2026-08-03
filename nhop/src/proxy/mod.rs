@@ -6,7 +6,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nhop_ipc::{EventView, HealthState, Host, Port, UpstreamAddr};
@@ -79,25 +79,108 @@ impl Upstream {
     }
 }
 
-/// Sink a front end publishes one event per decision to.
-#[derive(Debug, Clone, Default)]
-pub enum EventTx {
-    /// Nobody is listening, so events are dropped.
-    #[default]
-    Discarded,
-    /// Events are queued, and dropped once the queue is full.
-    Queued(mpsc::Sender<EventView>),
+/// Number of events one subscriber may fall behind by before its events are dropped.
+pub const SUBSCRIBER_CAPACITY: usize = 256;
+
+/// One reader of the decision stream, and how many events it has missed.
+#[derive(Debug)]
+struct Subscriber {
+    events: mpsc::Sender<EventView>,
+    dropped: u64,
 }
 
-impl EventTx {
-    /// Publishes one decision event without ever waiting for its reader.
-    pub fn publish(&self, event: EventView) {
-        match self {
-            Self::Discarded => {}
-            Self::Queued(queue) => {
-                let _queued = queue.try_send(event);
+/// Whether a subscriber is still listening once an event has been offered to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// The subscriber is still there, whether it took the event or lost it.
+    Kept,
+    /// The subscriber is gone and is dropped from the fan-out.
+    Gone,
+}
+
+impl Subscriber {
+    fn offer(&mut self, event: &EventView) -> Delivery {
+        let offered = match self.dropped {
+            0 => event.clone(),
+            dropped => reporting(event.clone(), dropped),
+        };
+        let Err(refused) = self.events.try_send(offered) else {
+            self.dropped = 0;
+            return Delivery::Kept;
+        };
+        match refused {
+            mpsc::error::TrySendError::Full(_offered) => {
+                self.dropped = self.dropped.saturating_add(1);
+                Delivery::Kept
             }
+            mpsc::error::TrySendError::Closed(_offered) => Delivery::Gone,
         }
+    }
+}
+
+fn reporting(event: EventView, dropped: u64) -> EventView {
+    let EventView {
+        host,
+        port,
+        decision,
+        rule_index,
+        class,
+        upstream,
+        duration_ms,
+        error,
+    } = event;
+    let error = match error {
+        Some(error) => format!("dropped {dropped}: {error}"),
+        None => format!("dropped {dropped}"),
+    };
+    EventView {
+        host,
+        port,
+        decision,
+        rule_index,
+        class,
+        upstream,
+        duration_ms,
+        error: Some(error),
+    }
+}
+
+/// Fan-out a front end publishes one event per decision to.
+///
+/// Publishing never waits: a subscriber that reads too slowly loses events and is told how many on
+/// the next one that reaches it, so one `nhop tail` can never hold up a connection.
+#[derive(Debug, Clone, Default)]
+pub struct EventTx(Arc<Mutex<Vec<Subscriber>>>);
+
+impl EventTx {
+    /// Adds a subscriber and returns the queue its events arrive on.
+    ///
+    /// Dropping the queue unsubscribes: the subscriber is removed at the next publish.
+    pub fn subscribe(&self) -> mpsc::Receiver<EventView> {
+        let (events, queue) = mpsc::channel(SUBSCRIBER_CAPACITY);
+        let Self(subscribers) = self;
+        subscribers
+            .lock()
+            .unwrap()
+            .push(Subscriber { events, dropped: 0 });
+        queue
+    }
+
+    /// Publishes one decision event without ever waiting for a reader.
+    pub fn publish(&self, event: &EventView) {
+        let Self(subscribers) = self;
+        let mut subscribers = subscribers.lock().unwrap();
+        subscribers.retain_mut(|subscriber| match subscriber.offer(event) {
+            Delivery::Kept => true,
+            Delivery::Gone => false,
+        });
+    }
+
+    /// Returns how many subscribers the stream is fanned out to.
+    pub fn subscribers(&self) -> usize {
+        let Self(subscribers) = self;
+        let subscribers = subscribers.lock().unwrap();
+        subscribers.len()
     }
 }
 
@@ -165,6 +248,7 @@ pub struct Routed {
     decision: Decision,
     upstream: HealthState,
     started: Instant,
+    events: EventTx,
 }
 
 impl Routed {
@@ -176,10 +260,14 @@ impl Routed {
             decision,
             upstream: ctx.health.state(),
             started: Instant::now(),
+            events: ctx.events.clone(),
         }
     }
 
     /// Emits the single event this connection produces, once it has ended.
+    ///
+    /// The same event goes to the log and to every subscriber, and neither ever makes this
+    /// connection wait.
     pub fn ended(self, failure: Option<&io::Error>) {
         let Self {
             host,
@@ -187,8 +275,9 @@ impl Routed {
             decision,
             upstream,
             started,
+            events,
         } = self;
-        logging::decision(&EventView {
+        let event = EventView {
             host,
             port,
             decision: decision.kind(),
@@ -197,7 +286,9 @@ impl Routed {
             upstream,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             error: failure.map(io::Error::to_string),
-        });
+        };
+        logging::decision(&event);
+        events.publish(&event);
     }
 }
 
@@ -282,20 +373,89 @@ mod tests {
     }
 
     #[test]
-    fn a_discarded_event_reaches_nobody() {
-        EventTx::default().publish(event());
+    fn an_event_published_to_nobody_reaches_nobody() {
+        EventTx::default().publish(&event());
     }
 
     #[tokio::test]
-    async fn a_queued_event_reaches_its_reader_and_a_full_queue_drops() {
-        let (queue, mut events) = mpsc::channel(1);
-        let sink = EventTx::Queued(queue);
+    async fn one_event_reaches_every_subscriber() {
+        let events = EventTx::default();
+        let mut first = events.subscribe();
+        let mut second = events.subscribe();
+        assert_eq!(events.subscribers(), 2);
 
-        sink.publish(event());
-        sink.publish(event());
+        events.publish(&event());
 
-        assert_eq!(events.recv().await, Some(event()));
-        assert!(events.try_recv().is_err());
+        assert_eq!(first.recv().await, Some(event()));
+        assert_eq!(second.recv().await, Some(event()));
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_hung_up_is_removed_at_the_next_publish() {
+        let events = EventTx::default();
+        let queue = events.subscribe();
+        drop(queue);
+        assert_eq!(events.subscribers(), 1);
+
+        events.publish(&event());
+
+        assert_eq!(events.subscribers(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_never_waits_for_a_subscriber_that_stopped_reading() {
+        let events = EventTx::default();
+        let mut queue = events.subscribe();
+        for _filled in 0..SUBSCRIBER_CAPACITY {
+            events.publish(&event());
+        }
+
+        let ctx = ConnCtx {
+            rules: Arc::new(Ruleset::default()),
+            health: HealthHandle::default(),
+            upstream: NO_UPSTREAM,
+            events: events.clone(),
+        };
+        let host = Host("api.example.com".to_owned());
+        let routed = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
+        routed.ended(None);
+
+        assert_eq!(events.subscribers(), 1);
+        assert_eq!(drained(&mut queue).len(), SUBSCRIBER_CAPACITY);
+        events.publish(&event());
+        let reported = queue.try_recv().unwrap();
+        assert_eq!(reported.error, Some("dropped 1".to_owned()));
+
+        events.publish(&event());
+        assert_eq!(queue.try_recv().unwrap().error, None);
+    }
+
+    #[tokio::test]
+    async fn a_drop_report_keeps_the_failure_the_event_it_rides_on_carried() {
+        let events = EventTx::default();
+        let mut queue = events.subscribe();
+        for _filled in 0..SUBSCRIBER_CAPACITY + 2 {
+            events.publish(&event());
+        }
+        drained(&mut queue);
+
+        let mut failed = event();
+        failed.error = Some("reset by peer".to_owned());
+        events.publish(&failed);
+
+        let reported = queue.try_recv().unwrap();
+        assert_eq!(reported.error, Some("dropped 2: reset by peer".to_owned()));
+    }
+
+    fn drained(queue: &mut mpsc::Receiver<EventView>) -> Vec<EventView> {
+        let mut drained = Vec::new();
+        for _read in 0..SUBSCRIBER_CAPACITY {
+            let Ok(event) = queue.try_recv() else {
+                break;
+            };
+            drained.push(event);
+        }
+        drained
     }
 
     fn event() -> EventView {

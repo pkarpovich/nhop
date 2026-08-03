@@ -769,15 +769,46 @@ daemon error any more.
 - Create: `nhop/src/cli/tail.rs`
 - Modify: `nhop/src/daemon/ipc_server.rs`, `nhop/src/proxy/mod.rs`
 
-- [ ] `Command::Subscribe` switches that connection to stream mode - the only multi-response command
-- [ ] each subscriber gets a bounded `mpsc::channel(256)`; publish with `try_send`; on `Full`
+- [x] `Command::Subscribe` switches that connection to stream mode - the only multi-response command
+- [x] each subscriber gets a bounded `mpsc::channel(256)`; publish with `try_send`; on `Full`
       increment a per-subscriber `dropped` counter and emit an `EventView` with `error` set to
       `"dropped <n>"` when the queue drains; a subscriber whose write fails is removed
-- [ ] the front ends publish via `ctx.events` on every decision; a slow subscriber must never make a
+- [x] the front ends publish via `ctx.events` on every decision; a slow subscriber must never make a
       connection handler await
-- [ ] write tests for subscribe and unsubscribe, and a test filling the queue with a non-reading
+- [x] write tests for subscribe and unsubscribe, and a test filling the queue with a non-reading
       subscriber that asserts the handler does not block and the drop count is reported
-- [ ] run `mise run check` - must pass before task 13
+- [x] run `mise run check` - must pass before task 13
+
+➕ `EventTx` is now the fan-out itself: Task 6's `Discarded`/`Queued` pair collapses into a list of
+subscribers behind a `std::sync::Mutex`, so `subscribe()` is the single way in and "nobody is
+listening" is the same code path as a hundred readers. `publish` clones, `try_send`s and drops the
+subscribers whose queue is closed - it contains no `await` at all, which makes "a slow subscriber
+never makes a connection handler await" a property of the signature rather than of timing.
+
+➕ The drop report rides the next event that reaches the subscriber instead of being an event of its
+own: nothing is retained about what was lost, so a standalone report would have to invent a host and
+a port. An event that carried its own failure keeps it - `dropped 2: reset by peer`.
+
+➕ `Command::Subscribe` never reaches the state task. `ipc_server` intercepts it on the connection it
+arrived on and holds that connection in `stream_events`, which selects on the subscriber queue and
+on a read of the client half: a client that hangs up is noticed at once and unsubscribes, while one
+that merely stops reading is noticed at the next publish. The state task keeps an explicit arm
+answering `ErrKind::Internal` and naming where the command is served, so the match still lists every
+variant. Task 3's `unserved()` is gone with it - the daemon now serves every command.
+
+➕ `cli/tail.rs` keeps the whole `UnixStream` inside its `BufReader` rather than splitting it:
+half-closing the write side is how a client says it is gone, so the writer must outlive the stream.
+`client::connect` became public so `tail` reuses the same "no daemon is listening" mapping `ask`
+uses. `Decisions::next` returns a `Response` rather than an `EventView`, so `follow` hands anything
+that is not an event to the existing `render` and exits by the same table - a daemon error ends the
+stream with its own code instead of being swallowed.
+
+➕ Beyond the listed files: `daemon/state.rs` publishes the fan-out through `Live::events()`,
+`cli/mod.rs` declares the module and dispatches `tail`, and `cli/client.rs` exports `connect`.
+`nhop/tests/tail_stream.rs` added: a front end only publishes through a real connection, so nothing
+under `src/` can prove `ctx.events` is where the decision goes. It runs `cli::run` and the traffic
+concurrently in one task - `&mut dyn Write` is not `Send`, so the CLI future cannot be spawned - and
+reads the printed documents out of a shared buffer.
 
 ### Task 13: `nhop proxy on|off`
 

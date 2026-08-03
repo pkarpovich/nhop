@@ -50,7 +50,12 @@ pub async fn ask(socket_file: &Path, command: &Command) -> Result<Response, Unre
     serde_json::from_str(&answer).map_err(Unreachable::Malformed)
 }
 
-async fn connect(socket_file: &Path) -> Result<UnixStream, Unreachable> {
+/// Opens the IPC socket, naming an absent daemon rather than the errno behind it.
+///
+/// # Errors
+///
+/// Returns [`Unreachable`] when nothing is listening on the socket or it cannot be connected.
+pub async fn connect(socket_file: &Path) -> Result<UnixStream, Unreachable> {
     let failure = match UnixStream::connect(socket_file).await {
         Ok(stream) => return Ok(stream),
         Err(failure) => failure,

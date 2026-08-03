@@ -4,11 +4,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use nhop_ipc::{Command, ErrKind, Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
 use crate::daemon::state::StateHandle;
+use crate::proxy::EventTx;
 
 const SOCKET_MODE: u32 = 0o600;
 
@@ -57,15 +59,51 @@ async fn converse(stream: UnixStream, state: StateHandle) -> io::Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Command>(line) {
+            Ok(Command::Subscribe) => {
+                let events = state.live().events().clone();
+                return stream_events(reader, writer, events).await;
+            }
             Ok(command) => state.call(command).await,
             Err(failure) => Response::Err {
                 kind: ErrKind::InvalidArgs,
                 message: failure.to_string(),
             },
         };
-        let mut wire = serde_json::to_vec(&response).map_err(io::Error::other)?;
-        wire.push(b'\n');
-        writer.write_all(&wire).await?;
-        writer.flush().await?;
+        write_line(&mut writer, &response).await?;
     }
+}
+
+/// Streams every decision to one subscriber until either side hangs up.
+///
+/// This is the only command answered with more than one line, and the only place a connection
+/// outlives its command.
+async fn stream_events(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    events: EventTx,
+) -> io::Result<()> {
+    let mut queue = events.subscribe();
+    let mut ignored = [0u8; 64];
+    loop {
+        tokio::select! {
+            published = queue.recv() => {
+                let Some(event) = published else {
+                    return Ok(());
+                };
+                write_line(&mut writer, &Response::Event(event)).await?;
+            }
+            read = reader.read(&mut ignored) => {
+                if read? == 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn write_line(writer: &mut OwnedWriteHalf, response: &Response) -> io::Result<()> {
+    let mut wire = serde_json::to_vec(response).map_err(io::Error::other)?;
+    wire.push(b'\n');
+    writer.write_all(&wire).await?;
+    writer.flush().await
 }

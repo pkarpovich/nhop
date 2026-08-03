@@ -419,12 +419,19 @@ async fn await_stop_signal() -> io::Result<()> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::time::Duration;
 
-    use nhop_ipc::{Command, ErrKind, Response, StatusView};
+    use nhop_ipc::{
+        Command, DecisionKind, ErrKind, EventView, HealthState, Host, Port, Response, StatusView,
+    };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
+    use crate::proxy::EventTx;
+
     use super::*;
+
+    const PATIENCE: usize = 200;
 
     fn paths_in(home: &tempfile::TempDir) -> Paths {
         Paths::from_home(home.path())
@@ -557,6 +564,94 @@ mod tests {
             panic!("the first line must answer status: {first:?}");
         };
         assert_eq!(second, Response::Rules(Vec::new()));
+
+        daemon.shutdown().await;
+    }
+
+    fn event() -> EventView {
+        EventView {
+            host: Host("api.example.com".to_owned()),
+            port: Port(443),
+            decision: DecisionKind::Direct,
+            rule_index: None,
+            class: None,
+            upstream: HealthState::Down,
+            duration_ms: 3,
+            error: None,
+        }
+    }
+
+    async fn await_subscribers(events: &EventTx, wanted: usize) {
+        for _attempt in 0..PATIENCE {
+            if events.subscribers() == wanted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the daemon never held {wanted} subscribers");
+    }
+
+    async fn await_unsubscribed(events: &EventTx) {
+        for _attempt in 0..PATIENCE {
+            events.publish(&event());
+            if events.subscribers() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the subscriber that hung up was never removed");
+    }
+
+    #[tokio::test]
+    async fn a_subscribed_connection_is_answered_with_one_line_per_decision() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths_in(&home);
+        let daemon = start_ephemeral(&paths);
+        let events = daemon.state().live().events().clone();
+
+        let stream = UnixStream::connect(daemon.socket_file()).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(b"{\"cmd\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(reader);
+        await_subscribers(&events, 1).await;
+
+        events.publish(&event());
+        events.publish(&event());
+
+        for _published in 0..2 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let answer: Response = serde_json::from_str(&line).unwrap();
+            let Response::Event(published) = answer else {
+                panic!("a subscribed connection must be answered with events: {answer:?}");
+            };
+            assert_eq!(published, event());
+        }
+
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_hangs_up_is_dropped_by_the_daemon() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths_in(&home);
+        let daemon = start_ephemeral(&paths);
+        let events = daemon.state().live().events().clone();
+        let stream = UnixStream::connect(daemon.socket_file()).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(b"{\"cmd\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        await_subscribers(&events, 1).await;
+
+        drop(reader);
+        drop(writer);
+
+        await_unsubscribed(&events).await;
 
         daemon.shutdown().await;
     }
