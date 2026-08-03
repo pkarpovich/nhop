@@ -909,16 +909,45 @@ are added here under the exact headings it requires.
 **Files:**
 - Create: `nhop/tests/acceptance.rs`
 
-- [ ] create exactly four `#[tokio::test]` cases named `require_reaches_upstream`,
+- [x] create exactly four `#[tokio::test]` cases named `require_reaches_upstream`,
       `prefer_reaches_upstream`, `prefer_falls_back_direct_when_upstream_closed`,
       `require_fails_when_upstream_closed`, using the Task 6 harness
-- [ ] each case also asserts that `Command::Test` returns the same `DecisionView` variant and
+- [x] each case also asserts that `Command::Test` returns the same `DecisionView` variant and
       `rule_index` that the real connection then exercised (upstream stub vs direct stub)
-- [ ] assert both listeners remain bound after `Off` and that a client on the SOCKS port then gets a
+- [x] assert both listeners remain bound after `Off` and that a client on the SOCKS port then gets a
       direct connection rather than a refusal
-- [ ] assert `doctor --json` emits the seven named checks
-- [ ] `cargo test --test acceptance` passes 4/4
-- [ ] run the full suite: `mise run check`
+- [x] assert `doctor --json` emits the seven named checks
+- [x] `cargo test --test acceptance` passes 4/4
+- [x] run the full suite: `mise run check`
+
+➕ "the decision the real connection exercised" is read off the decision stream, not inferred from
+which stub was reached: every case subscribes to `Live::events()` before it drives traffic and
+asserts the published `EventView` carries the same `decision`, `rule_index` and `class` as
+`Command::Test` answered. That is the same pairing for all four cases, including the one where the
+two stubs disagree - `prefer_falls_back_direct_when_upstream_closed` is answered `upstream` by
+`test` *and* routed as `upstream` by the connection, and still lands on the direct stub, because the
+fallback belongs to the dialer and not to the ruleset (Task 10 settled that `test` never consults
+the health verdict). The stub that was reached is asserted beside it, so the divergence is pinned
+rather than papered over.
+
+➕ All four cases use one rule shape - `port <ephemeral port of the origin stub>` - and one client
+shape, an IPv4 `CONNECT` on the SOCKS5 front end. Only the class and the state of the upstream
+differ between them, which is what makes "upstream stub vs direct stub" an exact comparison; the
+domain-name path through a real upstream is already pinned by Task 8's `upstream_dialer.rs`.
+
+➕ The two upstream-reachable cases set the verdict with `live().health().set(Up)` rather than
+waiting for a probe: `daemon::start_on` wires the production `PROBE_INTERVAL` of 5 s and a daemon
+starts Down, so waiting would add five seconds per case to prove what Task 8's
+`the_verdict_flips_up_once_the_upstream_answers_a_probe` already proves. The two upstream-closed
+cases leave the verdict at its Down default, which is the state they are about.
+
+➕ The `Off` and `doctor --json` assertions live inside two of the four cases rather than in cases of
+their own, because this task fixes the file at four tests. `Off` is asserted by
+`require_fails_when_upstream_closed`, where clearing the rules turns the refusal into a direct
+connection on the same port - the one place both halves of "the daemon must keep listening when
+rules are cleared" are visible at once. `doctor --json` is asserted by `require_reaches_upstream`,
+the only case with a live upstream, so `upstream_reachable` passes there rather than being reported
+as a routine failure.
 
 ### Task 16: [Final] Documentation
 
