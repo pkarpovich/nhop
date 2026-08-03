@@ -10,10 +10,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fs2::FileExt;
 use nhop_ipc::{Command, Paths};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -31,6 +32,9 @@ pub const DEFAULT_LISTEN: Listen = Listen {
     http: DEFAULT_HTTP_LISTEN,
     socks: DEFAULT_SOCKS_LISTEN,
 };
+
+/// How long a listener waits after a failed accept, so a lasting failure cannot spin its task.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Identifier of a process on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,13 +266,28 @@ fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::from_std(listener)
 }
 
+/// Returns the next client, outliving the failures one accept can end with.
+///
+/// A front end that stopped at the first failure would leave its port bound with nothing serving
+/// it, so `status` and `doctor` would keep reporting a front end that answers no one. A reset
+/// between SYN and accept, or a moment with no free descriptor, is transient: the failure is
+/// logged and the loop waits before accepting again, so a lasting one cannot spin the task either.
+async fn next_client(listener: &TcpListener) -> TcpStream {
+    loop {
+        let failure = match listener.accept().await {
+            Ok((stream, _peer)) => return stream,
+            Err(failure) => failure,
+        };
+        tracing::warn!(error = %failure, "accepting a client failed");
+        tokio::time::sleep(ACCEPT_BACKOFF).await;
+    }
+}
+
 fn accept_http(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io::Result<Accepting> {
     let addr = listener.local_addr()?;
     let accepting = tokio::spawn(async move {
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                return;
-            };
+            let stream = next_client(&listener).await;
             let ctx = live.accepted();
             let hop = hop.clone();
             tokio::spawn(async move {
@@ -283,9 +302,7 @@ fn accept_socks(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io:
     let addr = listener.local_addr()?;
     let accepting = tokio::spawn(async move {
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                return;
-            };
+            let stream = next_client(&listener).await;
             let ctx = live.accepted();
             let hop = hop.clone();
             tokio::spawn(async move {

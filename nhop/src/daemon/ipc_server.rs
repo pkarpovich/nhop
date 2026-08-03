@@ -9,6 +9,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
+use crate::daemon::ACCEPT_BACKOFF;
 use crate::daemon::state::StateHandle;
 use crate::proxy::EventTx;
 
@@ -29,6 +30,9 @@ pub fn bind(socket_file: &Path) -> io::Result<UnixListener> {
 }
 
 /// Serves clients until the shutdown signal arrives.
+///
+/// A failed accept only costs the client that hit it: giving up would wedge the daemon, which
+/// still holds its lock and its ports while no command can reach it any more.
 pub async fn serve(listener: UnixListener, state: StateHandle, shutdown: oneshot::Receiver<()>) {
     tokio::pin!(shutdown);
     loop {
@@ -36,8 +40,15 @@ pub async fn serve(listener: UnixListener, state: StateHandle, shutdown: oneshot
             _ = &mut shutdown => return,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _address)) = accepted else {
-            return;
+        let stream = match accepted {
+            Ok((stream, _address)) => stream,
+            Err(failure) => {
+                tracing::warn!(error = %failure, "accepting a command failed");
+                tokio::select! {
+                    _ = &mut shutdown => return,
+                    _ = tokio::time::sleep(ACCEPT_BACKOFF) => continue,
+                }
+            }
         };
         let state = state.clone();
         tokio::spawn(async move {

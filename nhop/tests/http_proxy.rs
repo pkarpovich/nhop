@@ -2,6 +2,7 @@ mod support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nhop::proxy::{ConnCtx, EventTx, NextHop, http};
 use nhop::rules::{RuleClass, RuleKind, RuleValue, Ruleset};
@@ -14,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use support::{DownHop, StubOrigin, TestDaemon, ephemeral};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+const PATIENCE: Duration = Duration::from_secs(5);
 
 fn temp_paths() -> (TempDir, Paths) {
     let home = tempfile::tempdir().unwrap();
@@ -194,6 +196,38 @@ async fn a_second_request_on_the_same_connection_is_not_forwarded() {
 
     let relayed = echoed(client, format!("{first}{second}").as_bytes()).await;
     assert_eq!(String::from_utf8(relayed).unwrap(), first);
+    assert_eq!(origin.connections(), 1);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_request_sent_after_the_answer_never_reaches_the_first_next_hop() {
+    let (_home, paths) = temp_paths();
+    let origin = StubOrigin::start().await;
+    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let first = format!(
+        "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\n\r\n",
+        origin = origin.addr()
+    );
+    let second = format!(
+        "GET http://{origin}/second HTTP/1.1\r\nHost: {origin}\r\n\r\n",
+        origin = origin.addr()
+    );
+
+    let mut client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+    client.write_all(first.as_bytes()).await.unwrap();
+    let mut answered = vec![0u8; first.len()];
+    client.read_exact(&mut answered).await.unwrap();
+    let _sent = client.write_all(second.as_bytes()).await;
+
+    assert_eq!(String::from_utf8(answered).unwrap(), first);
+    let mut after = Vec::new();
+    let reading = tokio::time::timeout(PATIENCE, client.read_to_end(&mut after)).await;
+    assert!(
+        reading.is_ok(),
+        "the front end must close the connection after one answer"
+    );
+    assert!(after.is_empty(), "{after:?}");
     assert_eq!(origin.connections(), 1);
     daemon.shutdown().await;
 }

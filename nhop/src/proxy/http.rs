@@ -2,7 +2,7 @@ use std::io;
 use std::str;
 
 use nhop_ipc::{Host, Port};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional};
 use tokio::net::TcpStream;
 
 use crate::proxy::{ConnCtx, NextHop, Routed, UpstreamDown};
@@ -50,19 +50,39 @@ struct Head {
     read: usize,
 }
 
+/// How much of the request body has still to come from the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rest {
+    /// Exactly this many bytes, after which the client has nothing more to say about this request.
+    Bytes(usize),
+    /// A body only its own framing delimits, so only the client can end it.
+    Streamed,
+}
+
+impl Rest {
+    fn limit(self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => u64::try_from(bytes).unwrap_or(u64::MAX),
+            Self::Streamed => u64::MAX,
+        }
+    }
+}
+
 /// The bytes of one request, as the next hop receives them.
 #[derive(Debug, Clone, Copy)]
 struct Forward<'a> {
     method: Method,
     head: &'a [u8],
     behind: &'a [u8],
+    rest: Rest,
 }
 
 /// Serves one connection of the HTTP front end and closes it.
 ///
-/// Exactly one request is routed per connection: the head and its body are forwarded, and whatever
-/// the client pipelined behind that body is discarded, so a pipelined request can never inherit
-/// this one's next hop. A connection that reached a decision leaves exactly one line in the log,
+/// Exactly one request is routed per connection: the head and its body are forwarded, the answer
+/// is relayed back and the connection is closed, so whatever the client sends afterwards - behind
+/// the body it pipelined, or on the connection it meant to keep alive - can never inherit this
+/// one's next hop. A connection that reached a decision leaves exactly one line in the log,
 /// whether it was relayed or refused.
 ///
 /// # Errors
@@ -87,10 +107,12 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
         port,
         body,
     } = request;
+    let behind = behind_the_head(&buffer[end..read], method, body);
     let forward = Forward {
         method,
         head,
-        behind: behind_the_head(&buffer[end..read], method, body),
+        behind,
+        rest: rest_of_body(method, body, behind),
     };
     let decision = ctx.rules.decide(&host, port);
     let routed = Routed::begun(&ctx, &host, port, decision);
@@ -112,6 +134,16 @@ fn behind_the_head(rest: &[u8], method: Method, body: Body) -> &[u8] {
     }
 }
 
+fn rest_of_body(method: Method, body: Body, behind: &[u8]) -> Rest {
+    match method {
+        Method::Connect => Rest::Streamed,
+        Method::Absolute => match body {
+            Body::Streamed => Rest::Streamed,
+            Body::Sized(len) => Rest::Bytes(len.saturating_sub(behind.len())),
+        },
+    }
+}
+
 async fn relay(
     client: &mut TcpStream,
     forward: Forward<'_>,
@@ -124,6 +156,7 @@ async fn relay(
         method,
         head,
         behind,
+        rest,
     } = forward;
     let dialled = hop.dial(host, port, decision).await;
     let mut next = match dialled {
@@ -134,15 +167,53 @@ async fn relay(
         }
     };
     match method {
-        Method::Connect => {
-            client.write_all(ESTABLISHED).await?;
-            client.flush().await?;
-        }
-        Method::Absolute => next.write_all(head).await?,
+        Method::Connect => tunnel(client, &mut next, behind).await,
+        Method::Absolute => forwarded(client, &mut next, head, behind, rest).await,
     }
+}
+
+/// Answers the tunnel request and then carries bytes both ways until either end stops.
+async fn tunnel(client: &mut TcpStream, next: &mut TcpStream, behind: &[u8]) -> io::Result<()> {
+    client.write_all(ESTABLISHED).await?;
+    client.flush().await?;
     next.write_all(behind).await?;
     next.flush().await?;
-    let _relayed = copy_bidirectional(client, &mut next).await?;
+    let _relayed = copy_bidirectional(client, next).await?;
+    Ok(())
+}
+
+/// Forwards one request and its answer, and reads no further request from the client.
+///
+/// The client is read only as far as this request's body reaches, so a request behind it is never
+/// forwarded and can never inherit this one's next hop; the next hop is then half-closed, which is
+/// what tells an origin holding the connection open that the request is over. The two directions
+/// run together, so an origin that answers before the body has arrived cannot wedge the upload.
+///
+/// A body only its own framing delimits ends where the client stops writing, so a chunked upload
+/// is the one request whose end the front end cannot see: it holds the connection until the client
+/// half-closes it.
+async fn forwarded(
+    client: &mut TcpStream,
+    next: &mut TcpStream,
+    head: &[u8],
+    behind: &[u8],
+    rest: Rest,
+) -> io::Result<()> {
+    next.write_all(head).await?;
+    next.write_all(behind).await?;
+    next.flush().await?;
+    let (client_read, mut client_write) = client.split();
+    let (mut next_read, mut next_write) = next.split();
+    let mut body = client_read.take(rest.limit());
+    let sending = async {
+        let _sent = copy(&mut body, &mut next_write).await?;
+        next_write.shutdown().await
+    };
+    let answering = async {
+        let _answered = copy(&mut next_read, &mut client_write).await?;
+        client_write.shutdown().await
+    };
+    let ((), ()) = tokio::try_join!(sending, answering)?;
     Ok(())
 }
 
@@ -468,6 +539,26 @@ mod tests {
         assert_eq!(
             behind_the_head(rest, Method::Absolute, Body::Sized(64)),
             rest
+        );
+    }
+
+    #[test]
+    fn the_client_is_read_only_as_far_as_this_requests_body_reaches() {
+        assert_eq!(
+            rest_of_body(Method::Absolute, Body::Sized(7), b"a=1&b=2"),
+            Rest::Bytes(0)
+        );
+        assert_eq!(
+            rest_of_body(Method::Absolute, Body::Sized(64), b"a=1"),
+            Rest::Bytes(61)
+        );
+        assert_eq!(
+            rest_of_body(Method::Absolute, Body::Streamed, b""),
+            Rest::Streamed
+        );
+        assert_eq!(
+            rest_of_body(Method::Connect, Body::Sized(0), b""),
+            Rest::Streamed
         );
     }
 }
