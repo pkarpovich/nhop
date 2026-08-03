@@ -224,15 +224,26 @@ async fn probe_while_down(upstream: LiveUpstream, health: HealthHandle, interval
     }
 }
 
+/// Asks the upstream to carry a connection to its own address, and reads the answer as a verdict.
+///
+/// A reply about the destination is classified exactly as a real dial classifies it: the upstream
+/// answered, so it is serving. An upstream that refuses a connection to its own address - an `ssh
+/// -D` tunnel whose remote end has nothing on that port, or a proxy whose ruleset denies loopback
+/// destinations - would otherwise never leave [`HealthState::Down`], since the probe is the only
+/// transition up.
 async fn probe(upstream: SocketAddr) -> HealthState {
     let handshake = Socks5Stream::connect(upstream, upstream);
     let Ok(reached) = tokio::time::timeout(PROBE_TIMEOUT, handshake).await else {
         return HealthState::Down;
     };
-    let Ok(_reached) = reached else {
-        return HealthState::Down;
+    let failure = match reached {
+        Ok(_reached) => return HealthState::Up,
+        Err(failure) => failed_dial(failure),
     };
-    HealthState::Up
+    match failure {
+        DialFailure::Destination(_answered) => HealthState::Up,
+        DialFailure::Upstream(_failure) => HealthState::Down,
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +444,12 @@ mod tests {
     #[tokio::test]
     async fn a_probe_against_a_closed_port_leaves_the_verdict_down() {
         assert_eq!(probe(closed_port().await).await, HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_probe_the_upstream_refuses_still_flips_the_verdict_up() {
+        let upstream = upstream_refusing_every_destination().await;
+
+        assert_eq!(probe(upstream).await, HealthState::Up);
     }
 }
