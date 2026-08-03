@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
@@ -10,8 +11,9 @@ use nhop_ipc::{
     Command, LastLoadView, LoadOutcome, Paths, Response, RuleClass, RuleKind, RuleValue, RuleView,
     UpstreamAddr,
 };
+use tokio::net::{TcpListener, TcpStream};
 
-use support::ephemeral_listen;
+use support::{ephemeral, ephemeral_listen};
 
 const NHOP: &str = env!("CARGO_BIN_EXE_nhop");
 const PATIENCE: usize = 300;
@@ -28,6 +30,15 @@ fn write_init(paths: &Paths, home: &Path, body: &str) {
     )
     .unwrap();
     fs::set_permissions(&init, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+async fn listening(state: &daemon::state::StateHandle) -> (SocketAddr, SocketAddr) {
+    let Response::Status(status) = state.call(Command::Status).await else {
+        panic!("status must answer with a status view");
+    };
+    assert!(status.http_bound);
+    assert!(status.socks_bound);
+    (status.http_listen, status.socks_listen)
 }
 
 async fn await_load(state: &daemon::state::StateHandle) -> LoadOutcome {
@@ -105,6 +116,71 @@ async fn an_init_script_declares_the_ruleset_through_the_command_line_client() {
     };
     let UpstreamAddr(upstream) = status.upstream;
     assert_eq!(upstream, "socks5://192.0.2.10:1080");
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_init_script_may_name_the_addresses_the_front_ends_already_hold() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path());
+    let daemon = daemon::start_on(&paths, ephemeral_listen()).unwrap();
+    let (http, socks) = listening(daemon.state()).await;
+    write_init(
+        &paths,
+        home.path(),
+        &format!("'{NHOP}' listen {http} {socks}\n'{NHOP}' require suffix example.com\n"),
+    );
+
+    let reloaded = daemon.state().call(Command::Reload { path: None }).await;
+
+    let Response::Status(status) = reloaded else {
+        panic!("a run naming the addresses already held must commit: {reloaded:?}");
+    };
+    assert_eq!(status.http_listen, http);
+    assert_eq!(status.socks_listen, socks);
+    assert_eq!(status.rules.require, 1);
+    assert!(TcpStream::connect(http).await.is_ok());
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_init_script_whose_listen_address_is_held_fails_on_set_listen() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::from_home(home.path());
+    let daemon = daemon::start_on(&paths, ephemeral_listen()).unwrap();
+    let (http, socks) = listening(daemon.state()).await;
+    let squatter = TcpListener::bind(ephemeral()).await.unwrap();
+    let held = squatter.local_addr().unwrap();
+    write_init(
+        &paths,
+        home.path(),
+        &format!("'{NHOP}' require suffix example.com\n'{NHOP}' listen {held} {socks}\n"),
+    );
+
+    let reloaded = daemon.state().call(Command::Reload { path: None }).await;
+
+    let Response::Err { kind: _, message } = reloaded else {
+        panic!("a run that cannot bind its address must fail: {reloaded:?}");
+    };
+    assert!(message.contains("front ends"), "{message}");
+    let Response::Status(status) = daemon.state().call(Command::Status).await else {
+        panic!("status must answer with a status view");
+    };
+    let Some(LastLoadView {
+        at: _,
+        outcome,
+        command,
+    }) = status.last_load
+    else {
+        panic!("a finished run must be recorded");
+    };
+    assert_eq!(outcome, LoadOutcome::Failed);
+    assert_eq!(command, Some("set_listen".to_owned()));
+    assert_eq!(status.http_listen, http);
+    assert_eq!(status.rules.require, 0);
+    assert!(TcpStream::connect(http).await.is_ok());
 
     daemon.shutdown().await;
 }

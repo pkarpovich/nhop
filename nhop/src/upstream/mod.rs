@@ -31,6 +31,10 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// While the verdict is [`HealthState::Down`] no connection is dialled through the upstream at
 /// all: `prefer` goes direct at once and `require` fails at once, so a powered-off upstream costs
 /// a decision rather than a connect timeout per connection.
+///
+/// Only a failure of the upstream itself flips the verdict down. An upstream that answers about a
+/// destination it could not reach has proven it is serving, so one dead destination never sends
+/// every `prefer` connection past the proxy.
 #[derive(Debug)]
 pub struct UpstreamHop {
     upstream: LiveUpstream,
@@ -93,7 +97,8 @@ impl UpstreamHop {
             HealthState::Down => Err(UpstreamDown::new(upstream, rule).into()),
             HealthState::Up => match through(host, port, upstream).await {
                 Ok(next) => Ok(next),
-                Err(_failure) => {
+                Err(DialFailure::Destination(failure)) => Err(failure),
+                Err(DialFailure::Upstream(_failure)) => {
                     self.health.set(HealthState::Down);
                     Err(UpstreamDown::new(upstream, rule).into())
                 }
@@ -111,13 +116,23 @@ impl UpstreamHop {
             HealthState::Down => direct(host, port).await,
             HealthState::Up => match through(host, port, upstream).await {
                 Ok(next) => Ok(next),
-                Err(_failure) => {
+                Err(DialFailure::Destination(_failure)) => direct(host, port).await,
+                Err(DialFailure::Upstream(_failure)) => {
                     self.health.set(HealthState::Down);
                     direct(host, port).await
                 }
             },
         }
     }
+}
+
+/// Why one dial through the upstream did not produce a connection.
+#[derive(Debug)]
+enum DialFailure {
+    /// The upstream itself could not carry the connection, so the verdict flips down.
+    Upstream(io::Error),
+    /// The upstream answered about the destination, which says nothing about its own health.
+    Destination(io::Error),
 }
 
 impl NextHop for UpstreamHop {
@@ -143,24 +158,56 @@ async fn direct(host: &Host, port: Port) -> io::Result<TcpStream> {
     TcpStream::connect((host.as_str(), port)).await
 }
 
-async fn through(host: &Host, port: Port, upstream: SocketAddr) -> io::Result<TcpStream> {
+async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStream, DialFailure> {
     let Host(host) = host;
     let Port(port) = port;
     let dialling = Socks5Stream::connect(upstream, (host.as_str(), port));
     let Ok(dialled) = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, dialling).await else {
-        return Err(io::Error::new(
+        return Err(DialFailure::Upstream(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "the upstream {upstream} did not answer within {}s",
                 UPSTREAM_CONNECT_TIMEOUT.as_secs()
             ),
-        ));
+        )));
     };
     let dialled = match dialled {
         Ok(dialled) => dialled,
-        Err(failure) => return Err(io::Error::other(failure)),
+        Err(failure) => return Err(failed_dial(failure)),
     };
     Ok(dialled.into_inner())
+}
+
+fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
+    match failure {
+        tokio_socks::Error::ConnectionNotAllowedByRuleset
+        | tokio_socks::Error::NetworkUnreachable
+        | tokio_socks::Error::HostUnreachable
+        | tokio_socks::Error::ConnectionRefused
+        | tokio_socks::Error::TtlExpired
+        | tokio_socks::Error::AddressTypeNotSupported
+        | tokio_socks::Error::InvalidTargetAddress(_) => {
+            DialFailure::Destination(io::Error::other(failure))
+        }
+        tokio_socks::Error::Io(_)
+        | tokio_socks::Error::ParseError(_)
+        | tokio_socks::Error::ProxyServerUnreachable
+        | tokio_socks::Error::InvalidResponseVersion
+        | tokio_socks::Error::NoAcceptableAuthMethods
+        | tokio_socks::Error::UnknownAuthMethod
+        | tokio_socks::Error::GeneralSocksServerFailure
+        | tokio_socks::Error::CommandNotSupported
+        | tokio_socks::Error::UnknownError
+        | tokio_socks::Error::InvalidReservedByte
+        | tokio_socks::Error::UnknownAddressType
+        | tokio_socks::Error::InvalidAuthValues(_)
+        | tokio_socks::Error::PasswordAuthFailure(_)
+        | tokio_socks::Error::AuthorizationRequired
+        | tokio_socks::Error::IdentdAuthFailure
+        | tokio_socks::Error::InvalidUserIdAuthFailure => {
+            DialFailure::Upstream(io::Error::other(failure))
+        }
+    }
 }
 
 async fn probe_while_down(upstream: LiveUpstream, health: HealthHandle, interval: Duration) {
@@ -190,11 +237,14 @@ async fn probe(upstream: SocketAddr) -> HealthState {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
 
     const PATIENT: Duration = Duration::from_secs(60);
+    const NO_AUTH: [u8; 2] = [0x05, 0x00];
+    const REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
     fn hop(upstream: SocketAddr, state: HealthState, interval: Duration) -> UpstreamHop {
         let published = LiveUpstream::default();
@@ -220,6 +270,38 @@ mod tests {
     async fn closed_port() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap()
+    }
+
+    async fn upstream_refusing_every_destination() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    let Ok(_read) = stream.read_exact(&mut greeting).await else {
+                        return;
+                    };
+                    let [_version, methods] = greeting;
+                    let mut offered = vec![0u8; usize::from(methods)];
+                    let Ok(_read) = stream.read_exact(&mut offered).await else {
+                        return;
+                    };
+                    let Ok(()) = stream.write_all(&NO_AUTH).await else {
+                        return;
+                    };
+                    let mut request = [0u8; 4];
+                    let Ok(_read) = stream.read_exact(&mut request).await else {
+                        return;
+                    };
+                    let _refused = stream.write_all(&REFUSED).await;
+                });
+            }
+        });
+        addr
     }
 
     #[tokio::test]
@@ -291,6 +373,61 @@ mod tests {
 
         assert_eq!(dialled.peer_addr().unwrap(), listener.local_addr().unwrap());
         assert_eq!(hop.health().state(), HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_cannot_be_reached_flips_the_verdict_down() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(closed_port().await, HealthState::Up, PATIENT);
+
+        let failure = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 3))
+            .await
+            .unwrap_err();
+
+        let Some(_down) = UpstreamDown::carried_by(&failure) else {
+            panic!("an unreachable upstream must be reported as down: {failure}");
+        };
+        assert_eq!(hop.health().state(), HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_destination_the_upstream_refuses_leaves_the_verdict_up() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(
+            upstream_refusing_every_destination().await,
+            HealthState::Up,
+            PATIENT,
+        );
+
+        let failure = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            UpstreamDown::carried_by(&failure).is_none(),
+            "a refused destination is not the upstream being down: {failure}"
+        );
+        assert_eq!(hop.health().state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_prefer_rule_goes_direct_when_the_upstream_refuses_the_destination() {
+        let (listener, host, port) = destination().await;
+        let hop = hop(
+            upstream_refusing_every_destination().await,
+            HealthState::Up,
+            PATIENT,
+        );
+
+        let dialled = hop
+            .dial(&host, port, upstream_decision(RuleClass::Prefer, 0))
+            .await
+            .unwrap();
+
+        assert_eq!(dialled.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert_eq!(hop.health().state(), HealthState::Up);
     }
 
     #[tokio::test]

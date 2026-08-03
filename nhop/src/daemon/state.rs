@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -7,14 +8,16 @@ use std::time::{Duration, Instant, SystemTime};
 use arc_swap::ArcSwap;
 use nhop_ipc::{
     Command, DecisionView, ErrKind, Host, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response,
-    RuleClass, RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, Timestamp, UpstreamAddr,
+    RuleClass, RuleCountsView, RuleKind, RuleValue, RuleView, Timestamp, UpstreamAddr,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::doctor;
 use crate::cli::explain;
 use crate::cli::status::{DaemonStatus, status_view};
-use crate::cli::system_proxy::{NetworkService, NoSystemProxy, SystemProxyReader};
+use crate::cli::system_proxy::{
+    NetworkService, NoSystemProxy, ProxyFailure, SystemProxy, SystemProxyReader,
+};
 use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
 use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
@@ -345,7 +348,7 @@ impl DaemonState {
 
     fn handle(&mut self, command: Command, reply: oneshot::Sender<Response>) {
         match command {
-            Command::Status => answer(reply, Response::Status(self.status())),
+            Command::Status => self.report(reply),
             Command::Rules => answer(reply, Response::Rules(self.rule_views())),
             Command::AddRule {
                 class,
@@ -371,8 +374,8 @@ impl DaemonState {
             Command::Reload { path } => self.reload(path, reply),
             Command::On => self.reload(None, reply),
             Command::Off => {
-                self.live.rules().publish(Ruleset::default());
-                answer(reply, Response::Ok);
+                let response = self.turn_off();
+                answer(reply, response);
             }
             Command::Test { host, port } => {
                 answer(reply, Response::Decision(self.decision(&host, port)));
@@ -380,6 +383,26 @@ impl DaemonState {
             Command::Doctor => self.doctor(reply),
             Command::Subscribe => answer(reply, streamed()),
         }
+    }
+
+    fn turn_off(&mut self) -> Response {
+        let Some(id) = self.in_flight() else {
+            self.live.rules().publish(Ruleset::default());
+            return Response::Ok;
+        };
+        in_progress(format!("init run {id} is in progress"))
+    }
+
+    fn staged(&mut self, apply: impl FnOnce(&mut Staging) -> Response) -> Response {
+        let Some(InFlight {
+            id: _,
+            staged,
+            reply: _,
+        }) = &mut self.load
+        else {
+            return vanished();
+        };
+        apply(staged)
     }
 
     fn add_rule(
@@ -391,19 +414,12 @@ impl DaemonState {
     ) -> Response {
         match self.target(load) {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => match &mut self.load {
-                Some(InFlight {
-                    id: _,
-                    staged,
-                    reply: _,
-                }) => {
-                    let Err(failure) = staged.push_rule(class, kind, value) else {
-                        return Response::Ok;
-                    };
-                    invalid(&failure)
-                }
-                None => vanished(),
-            },
+            Target::Staged => self.staged(|staged| {
+                let Err(failure) = staged.push_rule(class, kind, value) else {
+                    return Response::Ok;
+                };
+                invalid(&failure)
+            }),
             Target::Live => {
                 let mut rules = self.live.rules().snapshot().as_ref().clone();
                 let Err(failure) = rules.push(class, kind, value) else {
@@ -418,17 +434,10 @@ impl DaemonState {
     fn clear_rules(&mut self, load: Option<LoadId>) -> Response {
         match self.target(load) {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => match &mut self.load {
-                Some(InFlight {
-                    id: _,
-                    staged,
-                    reply: _,
-                }) => {
-                    staged.clear_rules();
-                    Response::Ok
-                }
-                None => vanished(),
-            },
+            Target::Staged => self.staged(|staged| {
+                staged.clear_rules();
+                Response::Ok
+            }),
             Target::Live => {
                 self.live.rules().publish(Ruleset::default());
                 Response::Ok
@@ -447,17 +456,10 @@ impl DaemonState {
         };
         match target {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => match &mut self.load {
-                Some(InFlight {
-                    id: _,
-                    staged,
-                    reply: _,
-                }) => {
-                    staged.set_upstream(upstream);
-                    Response::Ok
-                }
-                None => vanished(),
-            },
+            Target::Staged => self.staged(|staged| {
+                staged.set_upstream(upstream);
+                Response::Ok
+            }),
             Target::Live => {
                 self.adopt_upstream(Some(upstream));
                 Response::Ok
@@ -468,17 +470,10 @@ impl DaemonState {
     fn set_listen(&mut self, listen: Listen, load: Option<LoadId>) -> Response {
         match self.target(load) {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => match &mut self.load {
-                Some(InFlight {
-                    id: _,
-                    staged,
-                    reply: _,
-                }) => {
-                    staged.set_listen(listen);
-                    Response::Ok
-                }
-                None => vanished(),
-            },
+            Target::Staged => self.staged(|staged| {
+                staged.set_listen(listen);
+                Response::Ok
+            }),
             Target::Live => {
                 let Err(failure) = self.rebind(listen) else {
                     return Response::Ok;
@@ -597,7 +592,7 @@ impl DaemonState {
             command,
         });
         let Some(message) = message else {
-            answer(reply, Response::Status(self.status()));
+            self.report(reply);
             return;
         };
         answer(
@@ -707,40 +702,61 @@ impl DaemonState {
         let mut findings = vec![
             doctor::daemon_reachable(&self.paths.socket_file()),
             doctor::ports_bound(self.listen(), self.bind_state()),
-            doctor::system_proxy(self.proxy.read(&self.service), self.listen(), &self.service),
             doctor::init_file(&self.paths.init_file()),
             doctor::last_load(self.last_load.as_ref()),
             doctor::log_writable(&self.paths.log_file()),
         ];
+        let listen = self.listen();
+        let service = self.service.clone();
+        let reading = self.reading_proxy();
         let written = self.upstream.clone();
         let upstream = self.live.upstream().snapshot();
         let health = self.live.health().verdict();
         tokio::spawn(async move {
+            findings.push(doctor::system_proxy(reading.await, listen, &service));
             findings.push(doctor::upstream_reachable(&written, upstream, health).await);
             answer(reply, Response::Doctor(doctor::report(&findings)));
         });
     }
 
-    fn status(&self) -> StatusView {
+    fn report(&self, reply: oneshot::Sender<Response>) {
+        let status = self.daemon_status();
+        let reading = self.reading_proxy();
+        tokio::spawn(async move {
+            let proxy = reading.await.unwrap_or_default();
+            answer(reply, Response::Status(status_view(&status, &proxy)));
+        });
+    }
+
+    /// Reads the system proxy off the state task, which every other command is queued behind.
+    fn reading_proxy(&self) -> impl Future<Output = Result<SystemProxy, ProxyFailure>> + use<> {
+        let proxy = self.proxy.clone();
+        let service = self.service.clone();
+        let reading = tokio::task::spawn_blocking(move || proxy.read(&service));
+        async move {
+            match reading.await {
+                Ok(read) => read,
+                Err(failure) => Err(ProxyFailure::NotRun(io::Error::other(failure))),
+            }
+        }
+    }
+
+    fn daemon_status(&self) -> DaemonStatus {
         let rules = self.live.rules().snapshot();
-        let proxy = self.proxy.read(&self.service).unwrap_or_default();
-        status_view(
-            &DaemonStatus {
-                uptime_secs: self.started.elapsed().as_secs(),
-                listen: self.listen(),
-                bound: self.bind_state(),
-                upstream: self.upstream.clone(),
-                health: self.live.health().verdict(),
-                init_path: self.init_path.clone(),
-                last_load: self.last_load.clone(),
-                rules: RuleCountsView {
-                    require: counted(rules.count(RuleClass::Require)),
-                    prefer: counted(rules.count(RuleClass::Prefer)),
-                    never: counted(rules.count(RuleClass::Never)),
-                },
+        DaemonStatus {
+            uptime_secs: self.started.elapsed().as_secs(),
+            listen: self.listen(),
+            bound: self.bind_state(),
+            upstream: self.upstream.clone(),
+            health: self.live.health().verdict(),
+            init_path: self.init_path.clone(),
+            last_load: self.last_load.clone(),
+            rules: RuleCountsView {
+                require: counted(rules.count(RuleClass::Require)),
+                prefer: counted(rules.count(RuleClass::Prefer)),
+                never: counted(rules.count(RuleClass::Never)),
             },
-            &proxy,
-        )
+        }
     }
 
     fn rule_views(&self) -> Vec<RuleView> {
@@ -818,14 +834,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use nhop_ipc::{DecisionKind, HealthState, RuleKind, RuleValue, SystemProxyView};
+    use nhop_ipc::{DecisionKind, HealthState, RuleKind, RuleValue, StatusView, SystemProxyView};
 
-    use crate::cli::system_proxy::{ProxyEndpoint, ProxyFailure, SystemProxy};
+    use crate::cli::system_proxy::ProxyEndpoint;
     use crate::rules::{Decision, RuleId};
 
     use super::*;
 
-    const PATIENCE: usize = 200;
+    const PATIENCE: usize = 600;
 
     fn ruleset(rules: &[(RuleClass, RuleKind, &str)]) -> Ruleset {
         let mut ruleset = Ruleset::default();
@@ -1049,6 +1065,7 @@ mod tests {
             },
             Command::Reload { path: None },
             Command::On,
+            Command::Off,
         ];
         for command in refusals {
             let answer = state.call(command.clone()).await;
@@ -1125,6 +1142,49 @@ mod tests {
         assert_eq!(command, None);
         assert_eq!(status.rules.prefer, 1);
         drop(home);
+    }
+
+    #[tokio::test]
+    async fn a_run_rejected_on_its_upstream_is_recorded_against_that_command() {
+        let (home, paths) = temp_paths();
+        write_handshake_script(&paths, home.path(), 0);
+        let state = spawn(&paths, StateConfig::default());
+        let reloading = tokio::spawn({
+            let state = state.clone();
+            async move { state.call(Command::Reload { path: None }).await }
+        });
+
+        let id = await_load_id(home.path()).await;
+        let refused = state
+            .call(Command::SetUpstream {
+                addr: UpstreamAddr("192.0.2.10".to_owned()),
+                load: Some(id),
+            })
+            .await;
+        release(home.path());
+
+        let Response::Err { kind, message: _ } = refused else {
+            panic!("an unreadable upstream must be rejected: {refused:?}");
+        };
+        assert_eq!(kind, ErrKind::InvalidArgs);
+        let answer = reloading.await.unwrap();
+        let Response::Err { kind, message } = answer else {
+            panic!("a rejected command must fail the run: {answer:?}");
+        };
+        assert_eq!(kind, ErrKind::Internal);
+        assert!(message.contains("set_upstream"), "{message}");
+        let status = status_of(&state).await;
+        assert_eq!(status.upstream, UpstreamAddr(String::new()));
+        let Some(LastLoadView {
+            at: _,
+            outcome,
+            command,
+        }) = status.last_load
+        else {
+            panic!("a finished run must be recorded");
+        };
+        assert_eq!(outcome, LoadOutcome::Failed);
+        assert_eq!(command, Some("set_upstream".to_owned()));
     }
 
     #[tokio::test]

@@ -25,19 +25,45 @@ enum Method {
     Absolute,
 }
 
+/// How much of what arrived behind the head belongs to the request the head opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    /// A `Content-Length` body of this many bytes; anything past it is a later request.
+    Sized(usize),
+    /// A body only its own framing delimits, so everything already read belongs to it.
+    Streamed,
+}
+
 /// The single request one client connection carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Request {
     method: Method,
     host: Host,
     port: Port,
+    body: Body,
+}
+
+/// What one read of the client left in the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Head {
+    end: usize,
+    read: usize,
+}
+
+/// The bytes of one request, as the next hop receives them.
+#[derive(Debug, Clone, Copy)]
+struct Forward<'a> {
+    method: Method,
+    head: &'a [u8],
+    behind: &'a [u8],
 }
 
 /// Serves one connection of the HTTP front end and closes it.
 ///
-/// Exactly one request is routed per connection: whatever the client pipelined behind the head is
-/// discarded, so a later request can never inherit this one's next hop. A connection that reached
-/// a decision leaves exactly one line in the log, whether it was relayed or refused.
+/// Exactly one request is routed per connection: the head and its body are forwarded, and whatever
+/// the client pipelined behind that body is discarded, so a pipelined request can never inherit
+/// this one's next hop. A connection that reached a decision leaves exactly one line in the log,
+/// whether it was relayed or refused.
 ///
 /// # Errors
 ///
@@ -48,30 +74,57 @@ struct Request {
 /// [`io::Error`]: std::io::Error
 pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io::Result<()> {
     let mut buffer = [0u8; HEAD_LIMIT];
-    let Some(len) = read_head(&mut client, &mut buffer).await? else {
+    let Some(Head { end, read }) = read_head(&mut client, &mut buffer).await? else {
         return Ok(());
     };
-    let head = &buffer[..len];
+    let head = &buffer[..end];
     let Some(request) = parse_head(head) else {
         return respond(&mut client, BAD_REQUEST, "nhop: malformed request").await;
     };
-    let Request { method, host, port } = request;
+    let Request {
+        method,
+        host,
+        port,
+        body,
+    } = request;
+    let forward = Forward {
+        method,
+        head,
+        behind: behind_the_head(&buffer[end..read], method, body),
+    };
     let decision = ctx.rules.decide(&host, port);
     let routed = Routed::begun(&ctx, &host, port, decision);
-    let served = relay(&mut client, head, method, &host, port, decision, hop).await;
+    let served = relay(&mut client, forward, &host, port, decision, hop).await;
     routed.ended(served.as_ref().err());
     served
 }
 
+fn behind_the_head(rest: &[u8], method: Method, body: Body) -> &[u8] {
+    match method {
+        Method::Connect => rest,
+        Method::Absolute => match body {
+            Body::Streamed => rest,
+            Body::Sized(len) => {
+                let len = len.min(rest.len());
+                &rest[..len]
+            }
+        },
+    }
+}
+
 async fn relay(
     client: &mut TcpStream,
-    head: &[u8],
-    method: Method,
+    forward: Forward<'_>,
     host: &Host,
     port: Port,
     decision: Decision,
     hop: &dyn NextHop,
 ) -> io::Result<()> {
+    let Forward {
+        method,
+        head,
+        behind,
+    } = forward;
     let dialled = hop.dial(host, port, decision).await;
     let mut next = match dialled {
         Ok(next) => next,
@@ -85,11 +138,10 @@ async fn relay(
             client.write_all(ESTABLISHED).await?;
             client.flush().await?;
         }
-        Method::Absolute => {
-            next.write_all(head).await?;
-            next.flush().await?;
-        }
+        Method::Absolute => next.write_all(head).await?,
     }
+    next.write_all(behind).await?;
+    next.flush().await?;
     let _relayed = copy_bidirectional(client, &mut next).await?;
     Ok(())
 }
@@ -97,28 +149,27 @@ async fn relay(
 async fn read_head(
     client: &mut TcpStream,
     buffer: &mut [u8; HEAD_LIMIT],
-) -> io::Result<Option<usize>> {
-    let mut len = 0;
+) -> io::Result<Option<Head>> {
+    let mut read = 0;
     loop {
-        if len == buffer.len() {
+        if read == buffer.len() {
             return Ok(None);
         }
-        let read = client.read(&mut buffer[len..]).await?;
-        if read == 0 {
+        let taken = client.read(&mut buffer[read..]).await?;
+        if taken == 0 {
             return Ok(None);
         }
-        let scanned = len.saturating_sub(3);
-        len += read;
-        let Some(end) = head_end(&buffer[..len], scanned) else {
+        read += taken;
+        let Some(end) = head_end(&buffer[..read]) else {
             continue;
         };
-        return Ok(Some(end));
+        return Ok(Some(Head { end, read }));
     }
 }
 
-fn head_end(buffer: &[u8], from: usize) -> Option<usize> {
+fn head_end(buffer: &[u8]) -> Option<usize> {
     let last = buffer.len().checked_sub(4)?;
-    for index in from..=last {
+    for index in 0..=last {
         if &buffer[index..index + 4] == b"\r\n\r\n" {
             return Some(index + 4);
         }
@@ -147,6 +198,7 @@ fn parse_head(head: &[u8]) -> Option<Request> {
             method: Method::Connect,
             host,
             port,
+            body: Body::Streamed,
         });
     }
     let authority = match absolute_authority(target) {
@@ -158,7 +210,21 @@ fn parse_head(head: &[u8]) -> Option<Request> {
         method: Method::Absolute,
         host,
         port,
+        body: body_of(headers),
     })
+}
+
+fn body_of(headers: &str) -> Body {
+    if header(headers, "transfer-encoding").is_some() {
+        return Body::Streamed;
+    }
+    let Some(len) = header(headers, "content-length") else {
+        return Body::Sized(0);
+    };
+    let Ok(len) = len.parse::<usize>() else {
+        return Body::Sized(0);
+    };
+    Body::Sized(len)
 }
 
 fn absolute_authority(target: &str) -> Option<&str> {
@@ -242,10 +308,19 @@ mod tests {
     }
 
     fn request(method: Method, host: &str, port: u16) -> Option<Request> {
+        let body = match method {
+            Method::Connect => Body::Streamed,
+            Method::Absolute => Body::Sized(0),
+        };
+        carrying(method, host, port, body)
+    }
+
+    fn carrying(method: Method, host: &str, port: u16, body: Body) -> Option<Request> {
         Some(Request {
             method,
             host: Host(host.to_owned()),
             port: Port(port),
+            body,
         })
     }
 
@@ -334,21 +409,65 @@ mod tests {
     #[test]
     fn the_head_ends_at_the_first_blank_line() {
         let head = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody";
-        assert_eq!(head_end(head, 0), Some(head.len() - 4));
+        assert_eq!(head_end(head), Some(head.len() - 4));
     }
 
     #[test]
     fn a_head_that_has_not_ended_is_not_found() {
-        assert_eq!(head_end(b"GET / HTTP/1.1\r\n", 0), None);
-        assert_eq!(head_end(b"\r\n\r", 0), None);
-        assert_eq!(head_end(b"", 0), None);
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\n"), None);
+        assert_eq!(head_end(b"\r\n\r"), None);
+        assert_eq!(head_end(b""), None);
     }
 
     #[test]
-    fn the_scan_resumes_across_a_split_terminator() {
+    fn a_terminator_split_across_two_reads_is_still_found() {
         let head = b"GET / HTTP/1.1\r\n\r\n";
         let boundary = head.len() - 2;
-        assert_eq!(head_end(&head[..boundary], 0), None);
-        assert_eq!(head_end(head, boundary.saturating_sub(3)), Some(head.len()));
+        assert_eq!(head_end(&head[..boundary]), None);
+        assert_eq!(head_end(head), Some(head.len()));
+    }
+
+    #[test]
+    fn a_content_length_says_how_much_of_the_rest_is_the_body() {
+        assert_eq!(
+            parse("POST http://example.com/submit HTTP/1.1\r\nContent-Length: 9\r\n\r\n"),
+            carrying(Method::Absolute, "example.com", 80, Body::Sized(9))
+        );
+        assert_eq!(
+            parse("POST http://example.com/submit HTTP/1.1\r\ncontent-length: none\r\n\r\n"),
+            carrying(Method::Absolute, "example.com", 80, Body::Sized(0))
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_is_read_until_the_client_stops() {
+        assert_eq!(
+            parse("POST http://example.com/submit HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            carrying(Method::Absolute, "example.com", 80, Body::Streamed)
+        );
+    }
+
+    #[test]
+    fn only_the_body_of_this_request_is_forwarded_behind_its_head() {
+        let rest = b"a=1&b=2GET http://example.com/next HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            behind_the_head(rest, Method::Absolute, Body::Sized(7)),
+            b"a=1&b=2"
+        );
+        assert_eq!(behind_the_head(rest, Method::Absolute, Body::Sized(0)), b"");
+        assert_eq!(
+            behind_the_head(rest, Method::Absolute, Body::Streamed),
+            rest
+        );
+        assert_eq!(behind_the_head(rest, Method::Connect, Body::Sized(0)), rest);
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_content_length_is_forwarded_whole() {
+        let rest = b"a=1";
+        assert_eq!(
+            behind_the_head(rest, Method::Absolute, Body::Sized(64)),
+            rest
+        );
     }
 }

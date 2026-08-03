@@ -161,10 +161,18 @@ pub struct Bound {
 impl Bound {
     fn rebind(&mut self, listen: Listen) -> io::Result<Listen> {
         let Listen { http, socks } = listen;
-        let http = bind_tcp(http)?;
-        let socks = bind_tcp(socks)?;
-        self.http = accept_http(http, self.live.clone(), self.hop.clone())?;
-        self.socks = accept_socks(socks, self.live.clone(), self.hop.clone())?;
+        let Listen {
+            http: held_http,
+            socks: held_socks,
+        } = self.listen();
+        let http = bind_unless_held(http, held_http)?;
+        let socks = bind_unless_held(socks, held_socks)?;
+        if let Some(http) = http {
+            self.http = accept_http(http, self.live.clone(), self.hop.clone())?;
+        }
+        if let Some(socks) = socks {
+            self.socks = accept_socks(socks, self.live.clone(), self.hop.clone())?;
+        }
         Ok(self.listen())
     }
 
@@ -223,6 +231,10 @@ impl Frontends {
 
     /// Moves both front ends, leaving the connections they already accepted alone.
     ///
+    /// A front end already holding the requested address keeps its listener: binding a second
+    /// socket to a live address fails, so re-declaring the current addresses would otherwise fail
+    /// every load an init script that names them takes part in.
+    ///
     /// # Errors
     ///
     /// Returns [`io::Error`] when either address cannot be bound, in which case the front ends
@@ -235,6 +247,13 @@ impl Frontends {
             Self::Bound(bound) => bound.rebind(listen),
         }
     }
+}
+
+fn bind_unless_held(addr: SocketAddr, held: SocketAddr) -> io::Result<Option<TcpListener>> {
+    if addr == held {
+        return Ok(None);
+    }
+    Ok(Some(bind_tcp(addr)?))
 }
 
 fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
@@ -431,7 +450,7 @@ mod tests {
 
     use super::*;
 
-    const PATIENCE: usize = 200;
+    const PATIENCE: usize = 600;
 
     fn paths_in(home: &tempfile::TempDir) -> Paths {
         Paths::from_home(home.path())

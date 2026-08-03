@@ -12,8 +12,9 @@ presence; everything is driven from the CLI.
   talking to it over a unix socket
 - config is an executable script at `~/.config/nhop/init` that calls the CLI,
   so it can be fish, loops and all
-- two rule classes: `require` (must go through the upstream, error if it is down)
-  and `prefer` (try the upstream, fall back to a direct connection)
+- three rule classes: `require` (must go through the upstream, error if it is
+  down), `prefer` (try the upstream, fall back to a direct connection) and
+  `never` (always direct, matched before every other rule)
 - listens for HTTP CONNECT and SOCKS5 on the ports the previous setup used, so
   clients pinned to them need no reconfiguration
 
@@ -22,8 +23,9 @@ presence; everything is driven from the CLI.
 `nhop start` is the daemon. Everything else connects to its socket, sends one
 command and exits. The rule verbs and `upstream`, `listen`, `on`, `off` and
 `reload` mutate the ruleset; `status`, `rules`, `test`, `logs`, `tail` and
-`doctor` read. Every read command takes `--json` and then prints one JSON
-document on stdout and nothing else.
+`doctor` read. Each of those six takes `--json` and then prints one JSON
+document on stdout and nothing else. `nhop proxy status` is the exception: it
+reads macOS rather than the daemon and prints three fixed lines.
 
 | Command | What it does |
 |---|---|
@@ -46,6 +48,16 @@ document on stdout and nothing else.
 
 Exit codes: 0 success, 2 nothing there (no socket, no daemon, unknown thing), 3
 upstream down, 4 malformed arguments, 1 everything else.
+
+`nhop doctor` aggregates its own code from the checks - `daemon_reachable`,
+`ports_bound`, `system_proxy`, `upstream_reachable`, `init_file`, `last_load`,
+`log_writable` - rather than following that table: 0 when all seven pass, 3 when
+`upstream_reachable` is the only failure, 1 otherwise. With no daemon answering
+it still prints all seven, the unmade ones failed, and exits 1.
+
+`--service` belongs to `nhop proxy` alone. The daemon always reads the `Wi-Fi`
+service, so on a machine set up on another service `nhop status` reports the
+system proxy as off and the `system_proxy` check of `nhop doctor` keeps failing.
 
 ## Rule classes
 
@@ -77,6 +89,18 @@ The four kinds:
 Precedence: `never` rules first, then the rest in declaration order, first match
 wins, no match is direct.
 
+## Limits
+
+The router carries TCP and nothing else. SOCKS5 `BIND` and `UDP ASSOCIATE` are
+refused with reply `0x07`, so QUIC and every other UDP flow leaves the machine
+without ever being routed; there is no DNS server and no TUN interception, so
+only clients that use the system proxy or dial the two ports are covered at all.
+
+The HTTP front end serves one request per connection: a `CONNECT` tunnel, or one
+absolute-form plain-HTTP request with its body. Anything the client pipelines
+behind that body is discarded rather than sent to the first request's next hop.
+A request head over 8 KiB closes the connection without an answer.
+
 ## Init file
 
 `~/.config/nhop/init` is the profile. The daemon runs it as a program at start
@@ -86,13 +110,14 @@ running `nhop` binary prepended to `PATH`, so a plain `nhop` inside it reaches
 the daemon whose run it belongs to.
 
 Loads are atomic. The daemon stamps each run with an id, passes it to the script
-in the environment, and the CLI hands it back on every mutating command, so those
+as `NHOP_LOAD_ID`, and the CLI hands it back on every mutating command, so those
 commands accumulate in a staging ruleset instead of touching live traffic. The
 staged set goes live only when the script exits zero; a failed command, a
 non-zero exit or a run exceeding 30 seconds leaves the previous ruleset serving
 traffic and records which command failed in `nhop status`. A half-applied rule
 set on a router means traffic silently taking the wrong path, which is why there
-is no incremental mode.
+is no incremental mode. Anything the script spawns has to inherit that variable:
+a command reaching the daemon without it while a run is in flight is refused.
 
 A missing init file is not an error. Until the first load commits the ruleset is
 empty and every connection is direct - `nhop status` says so.
@@ -106,14 +131,18 @@ empty and every connection is direct - `nhop status` says so.
 | `~/.config/nhop/init` | executable rule script, run at daemon start and on `reload` |
 | `~/.local/state/nhop/nhop.sock` | IPC socket, mode 0600 |
 | `~/.local/state/nhop/nhop.pid` | single-instance guard, held under an advisory `flock` |
-| `~/.local/state/nhop/nhop.log` | JSON-lines log, daily rotation, 7 files kept |
+| `~/.local/state/nhop/nhop.log.<date>` | JSON-lines log, one file per day, 7 kept; `nhop logs` reads them all |
+| `~/.local/state/nhop/launchd.{out,err}.log` | what launchd caught of stdout and stderr, startup failures only |
 
 The socket deliberately does not live in `/tmp`: a world-writable socket would
 let any local process rewrite this machine's traffic routing.
 
 ## Install
 
-Everything below is one-time setup. Commands are written for fish.
+Everything below is one-time setup. Commands are written for fish. Building
+needs the pinned toolchain (`mise install`, Rust 1.97) and a `Developer ID
+Application` identity in the login keychain; `mise run check` is the full gate -
+`cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test`.
 
 **1. Build and sign.** macOS denies local-subnet access to binaries that are not
 properly signed and reports the denial as `No route to host`, so a Developer ID
@@ -162,7 +191,7 @@ It sets `RunAtLoad` and `KeepAlive`, so launchd starts the daemon at login and
 restarts it when it dies, and points stdout and stderr at
 `~/.local/state/nhop/launchd.out.log` and `launchd.err.log`. Those two catch
 startup failures only; the daemon's own JSON log is
-`~/.local/state/nhop/nhop.log`, read with `nhop logs`. `PATH` is set in the
+`~/.local/state/nhop/nhop.log.<date>`, read with `nhop logs`. `PATH` is set in the
 plist because launchd's default does not include Homebrew and
 `#!/usr/bin/env fish` has to resolve.
 
@@ -195,9 +224,8 @@ nhop status
 
 ## Uninstall
 
-The order matters. `sudo nhop proxy off` goes **first**, while the daemon is
-still running: it needs the daemon to answer, and removing the agent first
-leaves macOS pointing every app at ports nothing listens on.
+The order matters. `sudo nhop proxy off` goes **first**: removing the agent
+before it leaves macOS pointing every app at ports nothing listens on.
 
 ```
 sudo nhop proxy off

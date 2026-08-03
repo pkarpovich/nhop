@@ -266,8 +266,9 @@ impl Routed {
 
     /// Emits the single event this connection produces, once it has ended.
     ///
-    /// The same event goes to the log and to every subscriber, and neither ever makes this
-    /// connection wait.
+    /// The same event goes to the log and to every subscriber. The fan-out never waits for a
+    /// reader: a subscriber that cannot keep up loses events instead. The log line is appended on
+    /// this task, after the connection is over, so it delays nothing the client is waiting for.
     pub fn ended(self, failure: Option<&io::Error>) {
         let Self {
             host,

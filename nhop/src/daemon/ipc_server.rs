@@ -13,6 +13,7 @@ use crate::daemon::state::StateHandle;
 use crate::proxy::EventTx;
 
 const SOCKET_MODE: u32 = 0o600;
+const LINE_LIMIT: u64 = 64 * 1024;
 
 /// Binds the IPC socket and restricts it to its owner before anyone can connect.
 ///
@@ -51,7 +52,12 @@ async fn converse(stream: UnixStream, state: StateHandle) -> io::Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let read = (&mut reader).take(LINE_LIMIT).read_line(&mut line).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        if read == usize::try_from(LINE_LIMIT).unwrap_or(usize::MAX) && !line.ends_with('\n') {
+            write_line(&mut writer, &oversized()).await?;
             return Ok(());
         }
         let line = line.trim();
@@ -101,9 +107,55 @@ async fn stream_events(
     }
 }
 
+fn oversized() -> Response {
+    Response::Err {
+        kind: ErrKind::InvalidArgs,
+        message: format!("a command must be one line of at most {LINE_LIMIT} bytes"),
+    }
+}
+
 async fn write_line(writer: &mut OwnedWriteHalf, response: &Response) -> io::Result<()> {
     let mut wire = serde_json::to_vec(response).map_err(io::Error::other)?;
     wire.push(b'\n');
     writer.write_all(&wire).await?;
     writer.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use nhop_ipc::Paths;
+
+    use crate::daemon::state::{self, StateConfig};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_command_line_over_the_cap_is_refused_instead_of_buffered() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(home.path());
+        let state = state::spawn(&paths, StateConfig::default());
+        let (client, server) = UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _served = converse(server, state).await;
+        });
+        let (reader, mut writer) = client.into_split();
+        let flooding = tokio::spawn(async move {
+            let flood = vec![b'x'; usize::try_from(LINE_LIMIT).unwrap() * 2];
+            let _written = writer.write_all(&flood).await;
+        });
+
+        let mut answered = String::new();
+        BufReader::new(reader)
+            .read_line(&mut answered)
+            .await
+            .unwrap();
+
+        let refusal: Response = serde_json::from_str(answered.trim()).unwrap();
+        let Response::Err { kind, message } = refusal else {
+            panic!("a line past the cap must be refused: {refusal:?}");
+        };
+        assert_eq!(kind, ErrKind::InvalidArgs);
+        assert!(message.contains("one line"), "{message}");
+        flooding.abort();
+    }
 }

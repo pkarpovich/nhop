@@ -10,7 +10,6 @@ rust-version = "1.97"
 [workspace.dependencies]
 nhop-ipc = { path = "nhop-ipc" }
 
-anyhow = "1"
 arc-swap = "1"
 argh = "0.1"
 dirs = "6"

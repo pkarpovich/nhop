@@ -24,6 +24,40 @@ pub fn ephemeral() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
+/// Buffer a test reads while the command it was handed to keeps writing.
+#[derive(Debug, Clone, Default)]
+pub struct Shared(Arc<Mutex<Vec<u8>>>);
+
+impl Shared {
+    /// Returns everything written so far.
+    pub fn text(&self) -> String {
+        let Self(written) = self;
+        let written = written.lock().unwrap();
+        String::from_utf8(written.clone()).unwrap()
+    }
+
+    /// Returns the complete lines written so far.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for line in self.text().lines() {
+            lines.push(line.to_owned());
+        }
+        lines
+    }
+}
+
+impl io::Write for Shared {
+    fn write(&mut self, written: &[u8]) -> io::Result<usize> {
+        let Self(buffer) = self;
+        buffer.lock().unwrap().extend_from_slice(written);
+        Ok(written.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Returns front-end addresses the kernel picks free ports for.
 pub fn ephemeral_listen() -> Listen {
     Listen {

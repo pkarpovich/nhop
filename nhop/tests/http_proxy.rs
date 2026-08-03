@@ -117,6 +117,66 @@ async fn an_absolute_form_request_is_forwarded_verbatim() {
 }
 
 #[tokio::test]
+async fn a_request_body_arriving_with_its_head_reaches_the_origin() {
+    let (_home, paths) = temp_paths();
+    let origin = StubOrigin::start().await;
+    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let request = format!(
+        "POST http://{origin}/submit HTTP/1.1\r\nHost: {origin}\r\nContent-Length: 7\r\n\r\na=1&b=2",
+        origin = origin.addr()
+    );
+
+    let client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+
+    let relayed = echoed(client, request.as_bytes()).await;
+    assert_eq!(String::from_utf8(relayed).unwrap(), request);
+    assert_eq!(origin.connections(), 1);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_body_is_forwarded_but_a_request_pipelined_behind_it_is_not() {
+    let (_home, paths) = temp_paths();
+    let origin = StubOrigin::start().await;
+    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let first = format!(
+        "POST http://{origin}/first HTTP/1.1\r\nContent-Length: 3\r\nHost: {origin}\r\n\r\na=1",
+        origin = origin.addr()
+    );
+    let second = format!(
+        "GET http://{origin}/second HTTP/1.1\r\nHost: {origin}\r\n\r\n",
+        origin = origin.addr()
+    );
+
+    let client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+
+    let relayed = echoed(client, format!("{first}{second}").as_bytes()).await;
+    assert_eq!(String::from_utf8(relayed).unwrap(), first);
+    assert_eq!(origin.connections(), 1);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn payload_sent_ahead_of_the_tunnel_answer_still_reaches_the_destination() {
+    let (_home, paths) = temp_paths();
+    let origin = StubOrigin::start().await;
+    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let request = format!(
+        "CONNECT {origin} HTTP/1.1\r\nHost: {origin}\r\n\r\nearly",
+        origin = origin.addr()
+    );
+
+    let mut client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut established = [0u8; ESTABLISHED.len()];
+    client.read_exact(&mut established).await.unwrap();
+
+    assert_eq!(&established, ESTABLISHED);
+    assert_eq!(echoed(client, b" late").await, b"early late");
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_second_request_on_the_same_connection_is_not_forwarded() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
@@ -231,6 +291,28 @@ async fn moving_the_front_ends_keeps_an_open_connection_alive() {
     let moved_client = establish(now_http, origin.addr()).await;
     assert_eq!(echoed(moved_client, b"pong").await, b"pong");
     assert_eq!(origin.connections(), 2);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn moving_the_front_ends_to_the_addresses_they_hold_keeps_them_serving() {
+    let (_home, paths) = temp_paths();
+    let origin = StubOrigin::start().await;
+    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let (http, socks) = status_of(&daemon).await;
+
+    let moved = daemon
+        .call(Command::SetListen {
+            http,
+            socks,
+            load: None,
+        })
+        .await;
+
+    assert_eq!(moved, Response::Ok);
+    assert_eq!(status_of(&daemon).await, (http, socks));
+    let client = establish(http, origin.addr()).await;
+    assert_eq!(echoed(client, b"ping").await, b"ping");
     daemon.shutdown().await;
 }
 

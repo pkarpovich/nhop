@@ -16,7 +16,7 @@ pub const DEFAULT_SERVICE: &str = "Wi-Fi";
 /// front end, while this list keeps traffic from being sent to one at all.
 pub const BYPASS: [&str; 4] = ["localhost", "127.0.0.1", "*.local", "169.254/16"];
 
-const NETWORKSETUP: &str = "networksetup";
+const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 const BYPASS_FLAG: &str = "-setproxybypassdomains";
 const OFF: &str = "off";
 
@@ -178,6 +178,10 @@ pub fn disabling(service: &NetworkService) -> Vec<Invocation> {
 }
 
 /// Runs the invocations in order, stopping at the first one macOS refuses.
+///
+/// `networksetup` is named by its absolute path: these writes run under `sudo`, which keeps the
+/// invoking user's `PATH` on macOS, so a bare name would let any directory on that `PATH` decide
+/// what runs as root.
 ///
 /// # Errors
 ///

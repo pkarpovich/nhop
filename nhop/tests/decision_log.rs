@@ -89,16 +89,6 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
 
     let decisions = await_decisions(&paths, 2).await;
     assert_eq!(decisions.len(), 2, "{decisions:?}");
-    let expected = EventView {
-        host: Host(origin.addr().ip().to_string()),
-        port: Port(origin.addr().port()),
-        decision: DecisionKind::Direct,
-        rule_index: None,
-        class: None,
-        upstream: HealthState::Down,
-        duration_ms: 0,
-        error: None,
-    };
     for LoggedDecision { at: _, event } in decisions {
         let EventView {
             host,
@@ -107,16 +97,17 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
             rule_index,
             class,
             upstream,
-            duration_ms: _,
+            duration_ms,
             error,
         } = event;
-        assert_eq!(host, expected.host);
-        assert_eq!(port, expected.port);
-        assert_eq!(decision, expected.decision);
-        assert_eq!(rule_index, expected.rule_index);
-        assert_eq!(class, expected.class);
-        assert_eq!(upstream, expected.upstream);
-        assert_eq!(error, expected.error);
+        assert_eq!(host, Host(origin.addr().ip().to_string()));
+        assert_eq!(port, Port(origin.addr().port()));
+        assert_eq!(decision, DecisionKind::Direct);
+        assert_eq!(rule_index, None);
+        assert_eq!(class, None);
+        assert_eq!(upstream, HealthState::Down);
+        assert!(duration_ms < 60_000, "{duration_ms}");
+        assert_eq!(error, None);
     }
     assert_eq!(origin.connections(), 2);
 

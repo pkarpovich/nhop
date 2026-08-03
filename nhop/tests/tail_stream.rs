@@ -1,42 +1,16 @@
 mod support;
 
-use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nhop_ipc::{DecisionKind, EventView, Host, Paths, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use support::{StubOrigin, TestDaemon, ephemeral};
+use support::{Shared, StubOrigin, TestDaemon, ephemeral};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const PATIENCE: usize = 200;
-
-/// Buffer the test reads while the command it was handed to keeps writing.
-#[derive(Debug, Clone, Default)]
-struct Shared(Arc<Mutex<Vec<u8>>>);
-
-impl Shared {
-    fn text(&self) -> String {
-        let Self(written) = self;
-        let written = written.lock().unwrap();
-        String::from_utf8(written.clone()).unwrap()
-    }
-}
-
-impl Write for Shared {
-    fn write(&mut self, written: &[u8]) -> io::Result<usize> {
-        let Self(buffer) = self;
-        buffer.lock().unwrap().extend_from_slice(written);
-        Ok(written.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 async fn tunnelled(front: SocketAddr, destination: SocketAddr, payload: &[u8]) {
     let mut client = TcpStream::connect(front).await.unwrap();
@@ -64,11 +38,7 @@ async fn await_subscriber(daemon: &TestDaemon) {
 
 async fn await_lines(out: &Shared, wanted: usize) -> Vec<String> {
     for _attempt in 0..PATIENCE {
-        let printed = out.text();
-        let mut lines = Vec::new();
-        for line in printed.lines() {
-            lines.push(line.to_owned());
-        }
+        let lines = out.lines();
         if lines.len() >= wanted {
             return lines;
         }
