@@ -180,7 +180,8 @@ async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStr
 
 fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
     match failure {
-        tokio_socks::Error::ConnectionNotAllowedByRuleset
+        tokio_socks::Error::GeneralSocksServerFailure
+        | tokio_socks::Error::ConnectionNotAllowedByRuleset
         | tokio_socks::Error::NetworkUnreachable
         | tokio_socks::Error::HostUnreachable
         | tokio_socks::Error::ConnectionRefused
@@ -195,7 +196,6 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
         | tokio_socks::Error::InvalidResponseVersion
         | tokio_socks::Error::NoAcceptableAuthMethods
         | tokio_socks::Error::UnknownAuthMethod
-        | tokio_socks::Error::GeneralSocksServerFailure
         | tokio_socks::Error::CommandNotSupported
         | tokio_socks::Error::UnknownError
         | tokio_socks::Error::InvalidReservedByte
@@ -256,6 +256,7 @@ mod tests {
     const PATIENT: Duration = Duration::from_secs(60);
     const NO_AUTH: [u8; 2] = [0x05, 0x00];
     const REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    const GENERAL_FAILURE: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
     fn hop(upstream: SocketAddr, state: HealthState, interval: Duration) -> UpstreamHop {
         let published = LiveUpstream::default();
@@ -283,7 +284,7 @@ mod tests {
         listener.local_addr().unwrap()
     }
 
-    async fn upstream_refusing_every_destination() -> SocketAddr {
+    async fn upstream_answering(reply: [u8; 10]) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -308,7 +309,7 @@ mod tests {
                     let Ok(_read) = stream.read_exact(&mut request).await else {
                         return;
                     };
-                    let _refused = stream.write_all(&REFUSED).await;
+                    let _answered = stream.write_all(&reply).await;
                 });
             }
         });
@@ -405,11 +406,7 @@ mod tests {
     #[tokio::test]
     async fn a_destination_the_upstream_refuses_leaves_the_verdict_up() {
         let (_listener, host, port) = destination().await;
-        let hop = hop(
-            upstream_refusing_every_destination().await,
-            HealthState::Up,
-            PATIENT,
-        );
+        let hop = hop(upstream_answering(REFUSED).await, HealthState::Up, PATIENT);
 
         let failure = hop
             .dial(&host, port, upstream_decision(RuleClass::Require, 1))
@@ -426,11 +423,7 @@ mod tests {
     #[tokio::test]
     async fn a_prefer_rule_goes_direct_when_the_upstream_refuses_the_destination() {
         let (listener, host, port) = destination().await;
-        let hop = hop(
-            upstream_refusing_every_destination().await,
-            HealthState::Up,
-            PATIENT,
-        );
+        let hop = hop(upstream_answering(REFUSED).await, HealthState::Up, PATIENT);
 
         let dialled = hop
             .dial(&host, port, upstream_decision(RuleClass::Prefer, 0))
@@ -448,8 +441,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_probe_the_upstream_refuses_still_flips_the_verdict_up() {
-        let upstream = upstream_refusing_every_destination().await;
+        let upstream = upstream_answering(REFUSED).await;
 
         assert_eq!(probe(upstream).await, HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_general_failure_reply_leaves_the_verdict_up() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(
+            upstream_answering(GENERAL_FAILURE).await,
+            HealthState::Up,
+            PATIENT,
+        );
+
+        let failure = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            UpstreamDown::carried_by(&failure).is_none(),
+            "an upstream that answered 0x01 is still serving: {failure}"
+        );
+        assert_eq!(hop.health().state(), HealthState::Up);
     }
 }

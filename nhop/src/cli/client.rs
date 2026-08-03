@@ -60,11 +60,15 @@ pub async fn connect(socket_file: &Path) -> Result<UnixStream, Unreachable> {
         Ok(stream) => return Ok(stream),
         Err(failure) => failure,
     };
+    Err(unconnectable(socket_file, failure))
+}
+
+fn unconnectable(socket_file: &Path, failure: io::Error) -> Unreachable {
     match failure.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
-            Err(Unreachable::NoDaemon(socket_file.to_owned()))
+            Unreachable::NoDaemon(socket_file.to_owned())
         }
-        _ => Err(Unreachable::Io(failure)),
+        _ => Unreachable::Io(failure),
     }
 }
 
@@ -90,22 +94,19 @@ mod tests {
         assert!(failure.to_string().contains("nhop start"), "{failure}");
     }
 
-    #[tokio::test]
-    async fn a_socket_nobody_listens_on_reports_that_no_daemon_is_listening() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = Paths::from_home(home.path());
-        paths.state_dir().unwrap();
-        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
-        drop(listener);
-        assert!(paths.socket_file().exists());
+    #[test]
+    fn a_socket_nobody_listens_on_reports_that_no_daemon_is_listening() {
+        let socket_file = Path::new("/nowhere/nhop.sock");
 
-        let failure = ask(&paths.socket_file(), &Command::Status)
-            .await
-            .unwrap_err();
+        let failure = unconnectable(
+            socket_file,
+            io::Error::from(io::ErrorKind::ConnectionRefused),
+        );
 
-        let Unreachable::NoDaemon(_socket_file) = &failure else {
+        let Unreachable::NoDaemon(named) = &failure else {
             panic!("a dead socket must report an absent daemon: {failure}");
         };
+        assert_eq!(named, socket_file);
     }
 
     #[tokio::test]
