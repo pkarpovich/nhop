@@ -348,23 +348,35 @@ failed gate; the lib target also gives Tasks 6 and 15 a way to reach the daemon 
 - Create: `nhop/src/daemon/mod.rs`, `nhop/src/daemon/ipc_server.rs`, `nhop/src/daemon/state.rs`
 - Modify: `nhop/src/main.rs`
 
-- [ ] **state ownership, one model only**: all mutation and query commands go to a single actor
+- [x] **state ownership, one model only**: all mutation and query commands go to a single actor
       task via `mpsc::Sender<(Command, oneshot::Sender<Response>)>` (capacity 64, `send().await`
       for backpressure). The connection hot path never uses that channel: the live ruleset is
       published as `ArcSwap<Ruleset>` and each accepted connection loads **one snapshot** and uses
       it for its whole life - a swap therefore does not affect connections already accepted
-- [ ] single-instance guard: open the pid file `O_CREAT|O_RDWR` and take an exclusive advisory
+- [x] single-instance guard: open the pid file `O_CREAT|O_RDWR` and take an exclusive advisory
       `flock` (`fs2`). Lock acquired = no live owner: unlink a stale socket, write the current pid.
       Lock refused = print the owning pid and exit **1**. The lock is held for the process lifetime
-- [ ] bind the unix socket, `chmod` it to 0600 before the accept loop starts, remove it and the pid
+- [x] bind the unix socket, `chmod` it to 0600 before the accept loop starts, remove it and the pid
       file on clean shutdown; handle SIGINT/SIGTERM
-- [ ] accept loop reads one `Command` per line, forwards it to the actor, writes one `Response` line
-- [ ] write tests that start a daemon on a temp `Paths`, send `Command::Status` and assert
+- [x] accept loop reads one `Command` per line, forwards it to the actor, writes one `Response` line
+- [x] write tests that start a daemon on a temp `Paths`, send `Command::Status` and assert
       `Response::Status` with `rules.require == 0`, `init_path == null` and both listeners reported
-- [ ] write tests for the guard: stale pid file with no live owner starts; a held lock refuses with
+- [x] write tests for the guard: stale pid file with no live owner starts; a held lock refuses with
       exit code 1
-- [ ] write a test asserting a ruleset swap does not change the decision of an already-open connection
-- [ ] run `mise run check` - must pass before task 4
+- [x] write a test asserting a ruleset swap does not change the decision of an already-open connection
+- [x] run `mise run check` - must pass before task 4
+
+➕ `LiveRules` wraps the `ArcSwap<Ruleset>` and is the single publication point: the state task and
+every connection hold the same handle, `snapshot()` is the per-connection read and `publish()` is
+the swap Task 5 commits a staged ruleset through. `Status` derives its rule counts from that same
+snapshot, so there is no second copy to drift.
+
+➕ Only `Status` and `Rules` are served here; every other variant answers `ErrKind::Internal` with
+"does not serve this command yet" until its owning task lands. The match lists all variants
+explicitly, so adding a handler is a compiler-guided edit.
+
+➕ Both listeners report `bound: false` until Task 6 spawns the front ends - nothing binds
+7890/7891 yet. `main.rs` dispatches `start` by hand pending the `argh` tree in Task 4.
 
 ### Task 4: CLI client and subcommand plumbing
 
