@@ -5,10 +5,20 @@ use std::str::FromStr;
 
 use nhop_ipc::SystemProxyView;
 
+use crate::proxy::Listen;
+
 /// Network service the system proxy is applied to on the target machine.
 pub const DEFAULT_SERVICE: &str = "Wi-Fi";
 
+/// Hosts and networks macOS must reach without going through the router.
+///
+/// This is not the daemon's `never` class: those rules apply to traffic that already reached a
+/// front end, while this list keeps traffic from being sent to one at all.
+pub const BYPASS: [&str; 4] = ["localhost", "127.0.0.1", "*.local", "169.254/16"];
+
 const NETWORKSETUP: &str = "networksetup";
+const BYPASS_FLAG: &str = "-setproxybypassdomains";
+const OFF: &str = "off";
 
 const ENABLED_FIELD: &str = "Enabled";
 const SERVER_FIELD: &str = "Server";
@@ -68,6 +78,125 @@ impl ProxyKind {
             Self::Socks => "-getsocksfirewallproxy",
         }
     }
+
+    /// Returns the `networksetup` flag that points this setting at an address and turns it on.
+    pub fn write_flag(self) -> &'static str {
+        match self {
+            Self::Http => "-setwebproxy",
+            Self::Https => "-setsecurewebproxy",
+            Self::Socks => "-setsocksfirewallproxy",
+        }
+    }
+
+    /// Returns the `networksetup` flag that turns this setting on or off without moving it.
+    pub fn state_flag(self) -> &'static str {
+        match self {
+            Self::Http => "-setwebproxystate",
+            Self::Https => "-setsecurewebproxystate",
+            Self::Socks => "-setsocksfirewallproxystate",
+        }
+    }
+}
+
+/// Whether this process may change settings macOS keeps for the whole machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    /// Running as root, so `networksetup` accepts a write.
+    Root,
+    /// Running as somebody else, so a write would be refused.
+    Unprivileged,
+}
+
+impl Privilege {
+    /// Returns the privilege the running process holds.
+    pub fn current() -> Self {
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            return Self::Root;
+        }
+        Self::Unprivileged
+    }
+}
+
+/// One `networksetup` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    /// Flag naming what `networksetup` is asked to change.
+    pub flag: &'static str,
+    /// Arguments following the flag, the network service first.
+    pub arguments: Vec<String>,
+}
+
+impl Invocation {
+    /// Returns the whole command line, as `networksetup` is run with it.
+    pub fn argv(&self) -> Vec<String> {
+        let Self { flag, arguments } = self;
+        let mut argv = vec![(*flag).to_owned()];
+        for argument in arguments {
+            argv.push(argument.clone());
+        }
+        argv
+    }
+}
+
+fn invocation(flag: &'static str, service: &NetworkService, rest: Vec<String>) -> Invocation {
+    let NetworkService(service) = service;
+    let mut arguments = vec![service.clone()];
+    for argument in rest {
+        arguments.push(argument);
+    }
+    Invocation { flag, arguments }
+}
+
+/// Returns the invocations that point a service at the front ends and set the bypass list.
+pub fn enabling(listen: Listen, service: &NetworkService) -> Vec<Invocation> {
+    let Listen { http, socks } = listen;
+    let mut invocations = Vec::new();
+    for (kind, addr) in [
+        (ProxyKind::Http, http),
+        (ProxyKind::Https, http),
+        (ProxyKind::Socks, socks),
+    ] {
+        let rest = vec![addr.ip().to_string(), addr.port().to_string()];
+        invocations.push(invocation(kind.write_flag(), service, rest));
+    }
+    let mut bypass = Vec::new();
+    for host in BYPASS {
+        bypass.push(host.to_owned());
+    }
+    invocations.push(invocation(BYPASS_FLAG, service, bypass));
+    invocations
+}
+
+/// Returns the invocations that turn all three settings of a service off.
+pub fn disabling(service: &NetworkService) -> Vec<Invocation> {
+    let mut invocations = Vec::new();
+    for kind in [ProxyKind::Http, ProxyKind::Https, ProxyKind::Socks] {
+        invocations.push(invocation(kind.state_flag(), service, vec![OFF.to_owned()]));
+    }
+    invocations
+}
+
+/// Runs the invocations in order, stopping at the first one macOS refuses.
+///
+/// # Errors
+///
+/// Returns [`ProxyFailure`] when `networksetup` cannot be run or exits non-zero.
+pub fn apply(invocations: &[Invocation]) -> Result<(), ProxyFailure> {
+    for Invocation { flag, arguments } in invocations {
+        let Output {
+            status,
+            stdout: _,
+            stderr: _,
+        } = Command::new(NETWORKSETUP)
+            .arg(flag)
+            .args(arguments)
+            .output()?;
+        if !status.success() {
+            return Err(ProxyFailure::Refused { flag, status });
+        }
+    }
+    Ok(())
 }
 
 /// Address of one configured proxy.
@@ -271,6 +400,107 @@ mod tests {
         assert_eq!(ProxyKind::Http.read_flag(), "-getwebproxy");
         assert_eq!(ProxyKind::Https.read_flag(), "-getsecurewebproxy");
         assert_eq!(ProxyKind::Socks.read_flag(), "-getsocksfirewallproxy");
+
+        assert_eq!(ProxyKind::Http.write_flag(), "-setwebproxy");
+        assert_eq!(ProxyKind::Https.write_flag(), "-setsecurewebproxy");
+        assert_eq!(ProxyKind::Socks.write_flag(), "-setsocksfirewallproxy");
+
+        assert_eq!(ProxyKind::Http.state_flag(), "-setwebproxystate");
+        assert_eq!(ProxyKind::Https.state_flag(), "-setsecurewebproxystate");
+        assert_eq!(ProxyKind::Socks.state_flag(), "-setsocksfirewallproxystate");
+    }
+
+    fn listen() -> Listen {
+        Listen {
+            http: "127.0.0.1:7890".parse().unwrap(),
+            socks: "127.0.0.1:7891".parse().unwrap(),
+        }
+    }
+
+    fn argv(invocations: &[Invocation]) -> Vec<Vec<String>> {
+        let mut rendered = Vec::new();
+        for invocation in invocations {
+            rendered.push(invocation.argv());
+        }
+        rendered
+    }
+
+    #[test]
+    fn turning_the_proxy_on_points_all_three_settings_at_the_front_ends() {
+        let argv = argv(&enabling(listen(), &NetworkService::default()));
+
+        assert_eq!(argv.len(), 4, "{argv:?}");
+        assert_eq!(argv[0], ["-setwebproxy", "Wi-Fi", "127.0.0.1", "7890"]);
+        assert_eq!(
+            argv[1],
+            ["-setsecurewebproxy", "Wi-Fi", "127.0.0.1", "7890"]
+        );
+        assert_eq!(
+            argv[2],
+            ["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "7891"]
+        );
+    }
+
+    #[test]
+    fn turning_the_proxy_on_sets_the_bypass_list_to_the_constant() {
+        assert_eq!(BYPASS, ["localhost", "127.0.0.1", "*.local", "169.254/16"]);
+
+        let argv = argv(&enabling(listen(), &NetworkService::default()));
+
+        assert_eq!(
+            argv[3],
+            [
+                "-setproxybypassdomains",
+                "Wi-Fi",
+                "localhost",
+                "127.0.0.1",
+                "*.local",
+                "169.254/16"
+            ]
+        );
+    }
+
+    #[test]
+    fn turning_the_proxy_off_disables_all_three_settings() {
+        let argv = argv(&disabling(&NetworkService::default()));
+
+        assert_eq!(argv.len(), 3, "{argv:?}");
+        assert_eq!(argv[0], ["-setwebproxystate", "Wi-Fi", "off"]);
+        assert_eq!(argv[1], ["-setsecurewebproxystate", "Wi-Fi", "off"]);
+        assert_eq!(argv[2], ["-setsocksfirewallproxystate", "Wi-Fi", "off"]);
+    }
+
+    #[test]
+    fn a_service_whose_name_carries_a_space_stays_one_argument() {
+        let service = "Thunderbolt Ethernet".parse::<NetworkService>().unwrap();
+
+        let on = argv(&enabling(listen(), &service));
+        let off = argv(&disabling(&service));
+
+        assert_eq!(
+            on[0],
+            ["-setwebproxy", "Thunderbolt Ethernet", "127.0.0.1", "7890"]
+        );
+        assert_eq!(
+            off[2],
+            ["-setsocksfirewallproxystate", "Thunderbolt Ethernet", "off"]
+        );
+    }
+
+    #[test]
+    fn front_ends_on_other_addresses_are_written_as_a_host_and_a_port() {
+        let listen = Listen {
+            http: "192.168.1.5:18080".parse().unwrap(),
+            socks: "192.168.1.5:18081".parse().unwrap(),
+        };
+
+        let argv = argv(&enabling(listen, &NetworkService::default()));
+
+        assert_eq!(argv[0], ["-setwebproxy", "Wi-Fi", "192.168.1.5", "18080"]);
+        assert_eq!(
+            argv[2],
+            ["-setsocksfirewallproxy", "Wi-Fi", "192.168.1.5", "18081"]
+        );
     }
 
     #[test]

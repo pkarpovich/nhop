@@ -815,17 +815,41 @@ reads the printed documents out of a shared buffer.
 **Files:**
 - Modify: `nhop/src/cli/system_proxy.rs`
 
-- [ ] `proxy on` sets HTTP and HTTPS proxies for the service to the HTTP listen address and the
+- [x] `proxy on` sets HTTP and HTTPS proxies for the service to the HTTP listen address and the
       SOCKS proxy to the SOCKS listen address, then sets the bypass list to the named constant in
       Technical Details
-- [ ] `proxy off` disables all three for that service
-- [ ] both refuse to run without effective root and print the exact `sudo` invocation instead of
+- [x] `proxy off` disables all three for that service
+- [x] both refuse to run without effective root and print the exact `sudo` invocation instead of
       prompting
-- [ ] the service name is a parameter defaulting to `Wi-Fi`
-- [ ] reuse the reader from Task 10 for `proxy status`; do not add a second parser
-- [ ] write tests asserting the generated argv for `on` and `off`, including the bypass argv matching
+- [x] the service name is a parameter defaulting to `Wi-Fi`
+- [x] reuse the reader from Task 10 for `proxy status`; do not add a second parser
+- [x] write tests asserting the generated argv for `on` and `off`, including the bypass argv matching
       the constant verbatim
-- [ ] run `mise run check` - must pass before task 14
+- [x] run `mise run check` - must pass before task 14
+
+➕ The write path is a pure pair of builders - `enabling(listen, service)` and `disabling(service)`
+returning `Vec<Invocation>`, where `Invocation { flag, arguments }` renders its own argv - plus one
+`apply` that runs them in order and stops at the first refusal. That is what lets the tests assert
+the argv verbatim without `networksetup` existing. `ProxyKind` now spells `write_flag` and
+`state_flag` beside `read_flag`, so the three settings are still named in exactly one place: `on`
+uses `-setwebproxy`/`-setsecurewebproxy`/`-setsocksfirewallproxy`, which turn a setting on as they
+move it, and `off` the matching `-set*state ... off`.
+
+➕ `proxy on` asks the running daemon for its `status` and points macOS at the addresses it reports
+rather than at the 7890/7891 defaults: `nhop listen` can move the front ends, and Task 11's
+`system_proxy` check compares the settings against those same addresses. With no daemon listening it
+exits 2 by the transport row of the exit table. `sudo` keeps `HOME` on macOS, so root reaches the
+operator's socket rather than root's own state directory.
+
+➕ `Privilege::current()` reads the effective uid through `libc::geteuid` - std exposes no euid - so
+`libc` joins the workspace dependencies. Both writes check it before asking the daemon anything,
+which is also what keeps `cargo test` from touching the machine's real settings: the refusal test
+returns early when it happens to run as root.
+
+➕ Beyond the listed file: `cli/mod.rs` dispatches `proxy` and loses `unserved` - `proxy` was the
+last verb answering "not implemented yet", so the CLI now serves every subcommand it declares.
+`proxy status` renders the Task 10 reader's answer as three lines and takes no `--json`, because
+Task 4 fixed that verb's flags to `--service`.
 
 ### Task 14: Packaging - LaunchAgent, signing, install and uninstall
 

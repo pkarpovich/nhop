@@ -22,7 +22,9 @@ use nhop_ipc::{
 use serde::Serialize;
 
 use crate::cli::client::Unreachable;
-use crate::cli::system_proxy::NetworkService;
+use crate::cli::system_proxy::{
+    Invocation, NetworkService, Networksetup, Privilege, SystemProxyReader,
+};
 use crate::daemon::{self, StartFailure};
 use crate::logging::{self, LoggedDecision, Window};
 
@@ -449,10 +451,9 @@ async fn dispatch(
             tail::follow(&paths.socket_file(), Output::of(json), out, err).await
         }
         Subcommand::Doctor(Doctor { json }) => diagnose(paths, Output::of(json), out, err).await,
-        Subcommand::Proxy(Proxy {
-            action: _,
-            service: _,
-        }) => unserved("proxy", err),
+        Subcommand::Proxy(Proxy { action, service }) => {
+            proxy(paths, action, &service, out, err).await
+        }
     }
 }
 
@@ -477,9 +478,131 @@ fn load_of(id: &str) -> Option<LoadId> {
     Some(id)
 }
 
-fn unserved(name: &str, err: &mut dyn Write) -> Exit {
-    let _ = writeln!(err, "nhop: {name} is not implemented yet");
+async fn proxy(
+    paths: &Paths,
+    action: ProxyAction,
+    service: &NetworkService,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    match action {
+        ProxyAction::Status => read_proxy(service, out, err),
+        ProxyAction::On => {
+            let Privilege::Root = Privilege::current() else {
+                return needs_root(action, service, err);
+            };
+            let listen = match listen_of(paths, err).await {
+                Ok(listen) => listen,
+                Err(exit) => return exit,
+            };
+            write_proxy(&system_proxy::enabling(listen, service), service, err)
+        }
+        ProxyAction::Off => {
+            let Privilege::Root = Privilege::current() else {
+                return needs_root(action, service, err);
+            };
+            write_proxy(&system_proxy::disabling(service), service, err)
+        }
+    }
+}
+
+fn action_name(action: ProxyAction) -> &'static str {
+    match action {
+        ProxyAction::On => "on",
+        ProxyAction::Off => "off",
+        ProxyAction::Status => "status",
+    }
+}
+
+fn needs_root(action: ProxyAction, service: &NetworkService, err: &mut dyn Write) -> Exit {
+    let _ = writeln!(
+        err,
+        "nhop: changing the system proxy needs root, run: sudo {BINARY} proxy {} --service '{service}'",
+        action_name(action)
+    );
     Exit::Failed
+}
+
+async fn listen_of(paths: &Paths, err: &mut dyn Write) -> Result<crate::proxy::Listen, Exit> {
+    let answered = client::ask(&paths.socket_file(), &Command::Status).await;
+    let response = match answered {
+        Ok(response) => response,
+        Err(failure) => {
+            let _ = writeln!(err, "nhop: {failure}");
+            return Err(Exit::of_unreachable(&failure));
+        }
+    };
+    match response {
+        Response::Status(status) => {
+            let StatusView {
+                uptime_secs: _,
+                http_listen,
+                http_bound: _,
+                socks_listen,
+                socks_bound: _,
+                upstream: _,
+                health: _,
+                health_changed_at: _,
+                init_path: _,
+                last_load: _,
+                rules: _,
+                system_proxy: _,
+            } = status;
+            Ok(crate::proxy::Listen {
+                http: http_listen,
+                socks: socks_listen,
+            })
+        }
+        Response::Err { kind, message } => {
+            let _ = writeln!(err, "nhop: {message}");
+            Err(Exit::of_err(kind))
+        }
+        Response::Ok
+        | Response::Rules(_)
+        | Response::Decision(_)
+        | Response::Doctor(_)
+        | Response::Event(_) => {
+            let _ = writeln!(
+                err,
+                "nhop: the daemon answered something other than a status, so its listen addresses are unknown"
+            );
+            Err(Exit::Failed)
+        }
+    }
+}
+
+fn write_proxy(invocations: &[Invocation], service: &NetworkService, err: &mut dyn Write) -> Exit {
+    let Err(failure) = system_proxy::apply(invocations) else {
+        return Exit::Success;
+    };
+    let _ = writeln!(
+        err,
+        "nhop: cannot change the settings of {service}: {failure}"
+    );
+    Exit::Failed
+}
+
+fn read_proxy(service: &NetworkService, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
+    match Networksetup.read(service) {
+        Ok(proxy) => {
+            render_proxy(&proxy.view(), out);
+            Exit::Success
+        }
+        Err(failure) => {
+            let _ = writeln!(
+                err,
+                "nhop: cannot read the settings of {service}: {failure}"
+            );
+            Exit::Failed
+        }
+    }
+}
+
+fn render_proxy(proxy: &SystemProxyView, out: &mut dyn Write) {
+    let SystemProxyView { http, https, socks } = proxy;
+    let _ = writeln!(out, "http   {}", proxy_name(http));
+    let _ = writeln!(out, "https  {}", proxy_name(https));
+    let _ = writeln!(out, "socks  {}", proxy_name(socks));
 }
 
 async fn start(paths: &Paths, err: &mut dyn Write) -> Exit {
@@ -1398,13 +1521,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_verbs_of_later_tasks_report_themselves_as_unimplemented() {
+    async fn proxy_on_and_off_without_root_print_the_sudo_invocation() {
+        let Privilege::Unprivileged = Privilege::current() else {
+            return;
+        };
         let (_home, paths) = temp_paths();
 
         let (exit, out, err) = invoke(&paths, &["proxy", "on"]).await;
         assert_eq!(exit, Exit::Failed);
+        assert_eq!(exit.code(), 1);
         assert!(out.is_empty(), "{out}");
-        assert!(err.contains("proxy"), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(
+            err.contains("sudo nhop proxy on --service 'Wi-Fi'"),
+            "{err}"
+        );
+
+        let (exit, out, err) = invoke(&paths, &["proxy", "off", "--service", "Ethernet"]).await;
+        assert_eq!(exit, Exit::Failed);
+        assert!(out.is_empty(), "{out}");
+        assert!(
+            err.contains("sudo nhop proxy off --service 'Ethernet'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_settings_render_one_line_each_with_the_disabled_ones_named() {
+        let mut out = Vec::new();
+        render_proxy(
+            &SystemProxyView {
+                http: Some("127.0.0.1:7890".to_owned()),
+                https: Some("127.0.0.1:7890".to_owned()),
+                socks: None,
+            },
+            &mut out,
+        );
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "http   127.0.0.1:7890\nhttps  127.0.0.1:7890\nsocks  off\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_status_reads_the_settings_without_asking_for_root() {
+        let (_home, paths) = temp_paths();
+
+        let (exit, out, err) = invoke(&paths, &["proxy", "status"]).await;
+
+        let Exit::Success = exit else {
+            assert!(err.contains("networksetup"), "{err}");
+            assert!(out.is_empty(), "{out}");
+            return;
+        };
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 3, "{out}");
+        assert!(out.starts_with("http   "), "{out}");
     }
 
     #[tokio::test]
