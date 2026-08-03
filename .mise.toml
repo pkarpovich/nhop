@@ -1,0 +1,22 @@
+[tools]
+rust = "1.97"
+
+[tasks.build]
+description = "Build release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test"
+
+[tasks.lint]
+description = "Clippy with warnings denied"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.fmt]
+description = "Format sources"
+run = "cargo fmt --all"
+
+[tasks.check]
+description = "fmt check + clippy + tests"
+run = ["cargo fmt --all -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
