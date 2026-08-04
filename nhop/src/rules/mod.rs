@@ -10,9 +10,6 @@ pub use ruleset::{Rule, Ruleset};
 pub struct RuleId(pub usize);
 
 /// Where a destination is routed.
-///
-/// [`Decision::Direct`] and [`Decision::Never`] both dial the destination, and differ only in how
-/// they are reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     /// Dialled directly because no rule matched.

@@ -49,7 +49,6 @@ pub enum Exit {
 }
 
 impl Exit {
-    /// Returns the number handed to the operating system.
     pub fn code(self) -> u8 {
         match self {
             Self::Success => 0,
@@ -106,7 +105,6 @@ struct Destination {
     port: Port,
 }
 
-/// Rejection of a destination that is not a `host:port` pair.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("expected host:port, got {0:?}")]
 struct InvalidDestination(String);

@@ -137,10 +137,6 @@ pub enum Matcher {
 
 impl Matcher {
     /// Reads a rule value according to its kind.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidRule`] when the value cannot be read as the given kind.
     pub fn parse(kind: RuleKind, value: &RuleValue) -> Result<Self, InvalidRule> {
         match kind {
             RuleKind::Suffix => Ok(Self::Suffix(Suffix::parse(value)?)),

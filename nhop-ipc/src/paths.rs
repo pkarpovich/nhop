@@ -27,10 +27,6 @@ impl Paths {
     }
 
     /// Derives both directories from the current user's home directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HomeNotFound`] when the home directory cannot be determined.
     pub fn from_env() -> Result<Self, HomeNotFound> {
         let Some(home) = dirs::home_dir() else {
             return Err(HomeNotFound);
@@ -44,12 +40,6 @@ impl Paths {
     }
 
     /// Returns the state directory, creating it with mode 0700 when it is missing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`io::Error`] when the directory cannot be created.
-    ///
-    /// [`io::Error`]: std::io::Error
     pub fn state_dir(&self) -> io::Result<&Path> {
         DirBuilder::new()
             .recursive(true)

@@ -59,11 +59,10 @@ impl Reply {
 /// What the client asked for, or why it cannot be served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Requested {
-    /// A tunnel to this destination, as the client spelled it.
+    /// A tunnel to this destination.
     Connect {
-        /// Destination the client named, never resolved here.
+        /// As the client spelled it, never resolved here.
         host: Host,
-        /// Destination port.
         port: Port,
     },
     /// Nothing to dial, only a code to answer with.
@@ -75,14 +74,9 @@ enum Requested {
 /// A domain-type request travels to the next hop as the name the client wrote: internal names
 /// resolve only inside the upstream's network, so resolving here would route them nowhere.
 ///
-/// A connection that reached a decision leaves exactly one line in the log, whether it was relayed
-/// or refused.
-///
 /// # Errors
 ///
-/// Returns [`io::Error`] when the client or the next hop fails while the request is read, the
-/// reply is written or the relay is running. A refused dial is such a failure, reported after the
-/// client has been answered.
+/// Returns [`io::Error`] when the client or the next hop fails while the request is served.
 ///
 /// [`io::Error`]: std::io::Error
 pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io::Result<()> {

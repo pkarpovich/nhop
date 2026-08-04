@@ -9,8 +9,7 @@ use crate::view::{CheckView, DecisionView, EventView, RuleView, StatusView};
 
 /// Environment variable the daemon tags an init-script run with.
 ///
-/// The script inherits it and the command-line client forwards it as the `load` field of every
-/// mutating command, which is what makes a run atomic.
+/// The script inherits it; the client sends it back as each command's `load`, making a run atomic.
 pub const LOAD_ID_ENV: &str = "NHOP_LOAD_ID";
 
 /// Identifier of a single init-script run, grouping the commands it stages.

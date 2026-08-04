@@ -8,16 +8,12 @@ use tokio::net::UnixStream;
 /// Reason the client got no answer out of the daemon.
 #[derive(Debug, thiserror::Error)]
 pub enum Unreachable {
-    /// Nothing is listening on the IPC socket.
     #[error("no daemon is listening on {}, run `nhop start`", .0.display())]
     NoDaemon(PathBuf),
-    /// The daemon dropped the connection before answering.
     #[error("the daemon closed the connection without answering")]
     Closed,
-    /// The conversation failed while the command was in flight.
     #[error("cannot talk to the daemon: {0}")]
     Io(io::Error),
-    /// The answer was not a response this client understands.
     #[error("the daemon answered with a line this client cannot read: {0}")]
     Malformed(serde_json::Error),
 }

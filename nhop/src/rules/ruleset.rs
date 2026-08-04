@@ -45,8 +45,7 @@ impl Ruleset {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidRule`] when the value cannot be read as the given kind, leaving the
-    /// ruleset untouched.
+    /// Returns [`InvalidRule`] and leaves the ruleset untouched.
     pub fn push(
         &mut self,
         class: RuleClass,
@@ -82,8 +81,7 @@ impl Ruleset {
 
     /// Returns where a destination is routed.
     ///
-    /// `never` rules are consulted first, then every other rule in declaration order; the first
-    /// match wins and an unmatched destination is dialled directly.
+    /// `never` rules are consulted first, then the rest in declaration order; first match wins.
     pub fn decide(&self, host: &Host, port: Port) -> Decision {
         let host = NormalizedHost::new(host);
         for rule in &self.rules {

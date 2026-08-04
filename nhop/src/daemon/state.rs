@@ -876,7 +876,6 @@ mod tests {
         fs::set_permissions(&init, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Writes an init script that reports its load id and then waits to be released.
     fn write_handshake_script(paths: &Paths, home: &Path, exit: i32) {
         let reported = home.join("load");
         let release = home.join("release");
@@ -1563,7 +1562,6 @@ mod tests {
         );
     }
 
-    /// Reader that reports a configured proxy for the service the operator uses, and nothing else.
     #[derive(Debug)]
     struct WifiProxy;
 
@@ -1581,7 +1579,6 @@ mod tests {
         }
     }
 
-    /// Reader that cannot reach macOS at all.
     #[derive(Debug)]
     struct UnreadableProxy;
 

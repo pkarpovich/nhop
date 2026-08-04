@@ -19,7 +19,6 @@ use tokio::task::JoinHandle;
 const NO_AUTH: [u8; 2] = [0x05, 0x00];
 const GRANTED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
-/// Returns an address the kernel picks a free port for.
 pub fn ephemeral() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
@@ -29,14 +28,12 @@ pub fn ephemeral() -> SocketAddr {
 pub struct Shared(Arc<Mutex<Vec<u8>>>);
 
 impl Shared {
-    /// Returns everything written so far.
     pub fn text(&self) -> String {
         let Self(written) = self;
         let written = written.lock().unwrap();
         String::from_utf8(written.clone()).unwrap()
     }
 
-    /// Returns the complete lines written so far.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for line in self.text().lines() {
@@ -58,7 +55,6 @@ impl io::Write for Shared {
     }
 }
 
-/// Returns front-end addresses the kernel picks free ports for.
 pub fn ephemeral_listen() -> Listen {
     Listen {
         http: ephemeral(),
@@ -66,7 +62,6 @@ pub fn ephemeral_listen() -> Listen {
     }
 }
 
-/// Task that stops accepting once the handle owning it is dropped.
 #[derive(Debug)]
 struct Serving(JoinHandle<()>);
 
@@ -86,7 +81,6 @@ pub struct StubOrigin {
 }
 
 impl StubOrigin {
-    /// Starts the origin on an ephemeral port.
     pub async fn start() -> Self {
         let listener = TcpListener::bind(ephemeral()).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -112,12 +106,10 @@ impl StubOrigin {
         }
     }
 
-    /// Returns the address the origin listens on.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// Returns how many connections the origin has accepted.
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
@@ -130,7 +122,6 @@ pub struct SocksRequest {
     pub atyp: u8,
     /// Destination as the client spelled it.
     pub host: String,
-    /// Destination port.
     pub port: u16,
 }
 
@@ -143,7 +134,6 @@ pub struct StubSocks5 {
 }
 
 impl StubSocks5 {
-    /// Starts the upstream on an ephemeral port.
     pub async fn start() -> Self {
         let listener = TcpListener::bind(ephemeral()).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -169,12 +159,11 @@ impl StubSocks5 {
         }
     }
 
-    /// Returns the address the upstream listens on.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// Returns what the upstream has been asked to connect to, in arrival order.
+    /// Returns what the upstream was asked to connect to, in arrival order.
     pub fn requests(&self) -> Vec<SocksRequest> {
         self.requests.lock().unwrap().clone()
     }
@@ -237,7 +226,6 @@ pub struct StubHop {
 }
 
 impl StubHop {
-    /// Points the next hop at an address.
     pub fn new(target: SocketAddr) -> Self {
         Self {
             target,
@@ -273,7 +261,6 @@ pub struct DownHop {
 }
 
 impl DownHop {
-    /// Names the upstream the refusals report.
     pub fn new(upstream: SocketAddr) -> Self {
         Self { upstream }
     }
@@ -301,7 +288,6 @@ pub struct TestDaemon {
 }
 
 impl TestDaemon {
-    /// Starts a daemon whose front ends and IPC socket live under `paths`.
     pub async fn start(paths: &Paths, upstream: SocketAddr) -> Self {
         let daemon = daemon::start_on(paths, ephemeral_listen()).unwrap();
         let answer = daemon
@@ -320,32 +306,26 @@ impl TestDaemon {
         }
     }
 
-    /// Returns the address of the HTTP front end.
     pub fn http_addr(&self) -> SocketAddr {
         self.http
     }
 
-    /// Returns the address of the SOCKS5 front end.
     pub fn socks_addr(&self) -> SocketAddr {
         self.socks
     }
 
-    /// Returns the path clients send commands to.
     pub fn ipc_path(&self) -> &Path {
         self.daemon.socket_file()
     }
 
-    /// Returns the handle every command travels through.
     pub fn state(&self) -> &nhop::daemon::state::StateHandle {
         self.daemon.state()
     }
 
-    /// Sends one command to the daemon and returns its answer.
     pub async fn call(&self, command: Command) -> Response {
         self.daemon.state().call(command).await
     }
 
-    /// Stops the daemon and removes its socket.
     pub async fn shutdown(self) {
         let Self {
             daemon,

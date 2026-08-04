@@ -100,11 +100,11 @@ pub struct LastLoadView {
 /// Number of live rules per class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleCountsView {
-    /// Rules that must traverse the upstream.
+    /// Rules with class [`RuleClass::Require`].
     pub require: u32,
-    /// Rules that try the upstream and fall back to direct.
+    /// Rules with class [`RuleClass::Prefer`].
     pub prefer: u32,
-    /// Rules that always dial directly.
+    /// Rules with class [`RuleClass::Never`].
     pub never: u32,
 }
 
@@ -142,9 +142,9 @@ pub struct StatusView {
     pub init_path: Option<PathBuf>,
     /// Result of the most recent run, absent until one finishes.
     pub last_load: Option<LastLoadView>,
-    /// Number of live rules per class.
+    /// Live rule counts.
     pub rules: RuleCountsView,
-    /// Proxy settings macOS reports for the configured network service.
+    /// Proxy settings macOS reports.
     pub system_proxy: SystemProxyView,
 }
 

@@ -9,10 +9,8 @@ use crate::cli::client::{self, Unreachable};
 
 use super::{Exit, Output, render};
 
-/// Prints one line per routing decision until the daemon stops publishing.
-///
-/// The stream ends when the daemon closes the connection, which is what a `nhop start` shutting
-/// down does; until then this never returns.
+/// Prints one line per routing decision until the daemon closes the connection, which a shutting
+/// down `nhop start` does; until then this never returns.
 pub async fn follow(
     socket_file: &Path,
     output: Output,
@@ -55,8 +53,7 @@ impl Decisions {
     ///
     /// # Errors
     ///
-    /// Returns [`Unreachable`] when the connection fails or the daemon writes a line this client
-    /// cannot read.
+    /// Returns [`Unreachable`] when the connection fails or a line cannot be read.
     pub async fn next(&mut self) -> Result<Option<Response>, Unreachable> {
         loop {
             self.line.clear();
@@ -80,7 +77,7 @@ impl Decisions {
 
 /// Switches one connection to the stream of decisions and returns it.
 ///
-/// The write half is kept open for the life of the stream: closing it tells the daemon this
+/// The write half stays open for the life of the stream: closing it tells the daemon the
 /// subscriber is gone.
 ///
 /// # Errors
@@ -127,7 +124,6 @@ mod tests {
         (home, paths)
     }
 
-    /// Serves one connection, writing the lines it was given and then hanging up.
     fn write_lines(socket_file: &Path, lines: Vec<String>) {
         let listener = UnixListener::bind(socket_file).unwrap();
         tokio::spawn(async move {

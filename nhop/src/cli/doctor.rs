@@ -86,16 +86,13 @@ impl Outcome {
 /// What one check observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
-    /// Check the observation belongs to.
     pub check: Check,
-    /// Whether the check passed.
     pub outcome: Outcome,
     /// What it observed, and the remedy when it failed.
     pub detail: String,
 }
 
 impl Finding {
-    /// Records a check that found nothing to fix.
     pub fn passed(check: Check, detail: String) -> Self {
         Self {
             check,
@@ -104,7 +101,6 @@ impl Finding {
         }
     }
 
-    /// Records a check that found something to fix.
     pub fn failed(check: Check, detail: String) -> Self {
         Self {
             check,
@@ -114,10 +110,8 @@ impl Finding {
     }
 }
 
-/// Renders the seven checks in their fixed order, whatever order they were observed in.
-///
-/// A check nothing observed is reported as failed, which is what the CLI prints when the daemon
-/// never answered and only the first check could be made.
+/// Renders the seven checks in their fixed order, whatever order they were observed in; a check
+/// nothing observed is reported as failed.
 pub fn report(findings: &[Finding]) -> Vec<CheckView> {
     let mut views = Vec::with_capacity(CHECKS.len());
     for check in CHECKS {
@@ -153,10 +147,8 @@ fn view(check: Check, findings: &[Finding]) -> CheckView {
     }
 }
 
-/// Returns the code `doctor` exits with once every check has been made.
-///
-/// An upstream that cannot be reached is the one routine failure - the operator powers the VM off
-/// - so it is the one that exits 3 rather than 1.
+/// Returns the code `doctor` exits with once every check has been made: an unreachable upstream is
+/// the one routine failure - the operator powers the VM off - so it alone exits 3 rather than 1.
 pub fn exit_of(checks: &[CheckView]) -> Exit {
     let mut failed = 0;
     let mut beyond_the_upstream = 0;

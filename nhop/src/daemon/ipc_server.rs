@@ -31,8 +31,8 @@ pub fn bind(socket_file: &Path) -> io::Result<UnixListener> {
 
 /// Serves clients until the shutdown signal arrives.
 ///
-/// A failed accept only costs the client that hit it: giving up would wedge the daemon, which
-/// still holds its lock and its ports while no command can reach it any more.
+/// Giving up on a failed accept would wedge the daemon: it still holds its lock and its ports
+/// while no command can reach it any more.
 pub async fn serve(listener: UnixListener, state: StateHandle, shutdown: oneshot::Receiver<()>) {
     tokio::pin!(shutdown);
     loop {

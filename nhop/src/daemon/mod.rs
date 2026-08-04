@@ -68,7 +68,6 @@ impl fmt::Display for LockOwner {
 /// Reason the daemon refused to start.
 #[derive(Debug, thiserror::Error)]
 pub enum StartFailure {
-    /// Another daemon holds the single-instance lock.
     #[error("another nhop daemon is already running ({0})")]
     AlreadyRunning(LockOwner),
     /// The state directory, the pid file or the socket could not be prepared.
@@ -236,13 +235,12 @@ impl Frontends {
     /// Moves both front ends, leaving the connections they already accepted alone.
     ///
     /// A front end already holding the requested address keeps its listener: binding a second
-    /// socket to a live address fails, so re-declaring the current addresses would otherwise fail
-    /// every load an init script that names them takes part in.
+    /// socket to a live address fails, so an init script that re-declares the current addresses
+    /// would otherwise fail every load it takes part in.
     ///
     /// # Errors
     ///
-    /// Returns [`io::Error`] when either address cannot be bound, in which case the front ends
-    /// keep the addresses they already hold.
+    /// Returns [`io::Error`] when either address cannot be bound, leaving the addresses held.
     ///
     /// [`io::Error`]: std::io::Error
     pub fn rebind(&mut self, listen: Listen) -> io::Result<Listen> {
@@ -268,10 +266,9 @@ fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
 
 /// Returns the next client, outliving the failures one accept can end with.
 ///
-/// A front end that stopped at the first failure would leave its port bound with nothing serving
-/// it, so `status` and `doctor` would keep reporting a front end that answers no one. A reset
-/// between SYN and accept, or a moment with no free descriptor, is transient: the failure is
-/// logged and the loop waits before accepting again, so a lasting one cannot spin the task either.
+/// Stopping at the first failure would leave the port bound with nothing serving it, while
+/// `status` and `doctor` keep reporting a front end that answers no one. A reset between SYN and
+/// accept, or a moment with no free descriptor, is transient.
 async fn next_client(listener: &TcpListener) -> TcpStream {
     loop {
         let failure = match listener.accept().await {

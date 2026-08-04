@@ -7,13 +7,11 @@ use nhop_ipc::SystemProxyView;
 
 use crate::proxy::Listen;
 
-/// Network service the system proxy is applied to on the target machine.
+/// Network service `--service` defaults to.
 pub const DEFAULT_SERVICE: &str = "Wi-Fi";
 
-/// Hosts and networks macOS must reach without going through the router.
-///
-/// This is not the daemon's `never` class: those rules apply to traffic that already reached a
-/// front end, while this list keeps traffic from being sent to one at all.
+/// Hosts and networks macOS must reach without going through the router: not the daemon's `never`
+/// class, which applies to traffic that already reached a front end.
 pub const BYPASS: [&str; 4] = ["localhost", "127.0.0.1", "*.local", "169.254/16"];
 
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
@@ -42,7 +40,6 @@ impl fmt::Display for NetworkService {
     }
 }
 
-/// Rejection of a service name macOS cannot be asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("network service must not be empty")]
 pub struct EmptyService;
@@ -61,11 +58,8 @@ impl FromStr for NetworkService {
 /// One of the three proxy settings macOS keeps per network service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyKind {
-    /// Proxy plain HTTP traffic is sent to.
     Http,
-    /// Proxy HTTPS traffic is sent to.
     Https,
-    /// Proxy SOCKS traffic is sent to.
     Socks,
 }
 
@@ -108,7 +102,6 @@ pub enum Privilege {
 }
 
 impl Privilege {
-    /// Returns the privilege the running process holds.
     pub fn current() -> Self {
         let euid = unsafe { libc::geteuid() };
         if euid == 0 {
@@ -121,7 +114,6 @@ impl Privilege {
 /// One `networksetup` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
-    /// Flag naming what `networksetup` is asked to change.
     pub flag: &'static str,
     /// Arguments following the flag, the network service first.
     pub arguments: Vec<String>,
@@ -179,9 +171,8 @@ pub fn disabling(service: &NetworkService) -> Vec<Invocation> {
 
 /// Runs the invocations in order, stopping at the first one macOS refuses.
 ///
-/// `networksetup` is named by its absolute path: these writes run under `sudo`, which keeps the
-/// invoking user's `PATH` on macOS, so a bare name would let any directory on that `PATH` decide
-/// what runs as root.
+/// `networksetup` is named by absolute path because `sudo` keeps the invoking user's `PATH` on
+/// macOS, so a bare name would let any directory on it decide what runs as root.
 ///
 /// # Errors
 ///
@@ -227,14 +218,11 @@ impl fmt::Display for ProxyEndpoint {
     }
 }
 
-/// Proxy settings macOS reports for one network service.
+/// Proxy settings macOS reports for one network service, each absent when the setting is off.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemProxy {
-    /// Configured HTTP proxy, absent when the setting is off.
     pub http: Option<ProxyEndpoint>,
-    /// Configured HTTPS proxy, absent when the setting is off.
     pub https: Option<ProxyEndpoint>,
-    /// Configured SOCKS proxy, absent when the setting is off.
     pub socks: Option<ProxyEndpoint>,
 }
 
@@ -255,21 +243,16 @@ fn named(endpoint: &Option<ProxyEndpoint>) -> Option<String> {
     Some(endpoint.to_string())
 }
 
-/// Reason the system proxy settings could not be read.
+/// Reason a `networksetup` call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyFailure {
-    /// `networksetup` could not be run at all.
     #[error("cannot run networksetup: {0}")]
     NotRun(#[from] io::Error),
-    /// `networksetup` ran and refused the question.
     #[error("networksetup {flag} exited with {status}")]
     Refused {
-        /// Flag `networksetup` was asked with.
         flag: &'static str,
-        /// Status it exited with.
         status: ExitStatus,
     },
-    /// `networksetup` answered with bytes that are not text.
     #[error("networksetup {0} answered with something that is not utf-8")]
     Unreadable(&'static str),
 }
@@ -298,10 +281,8 @@ impl SystemProxyReader for Networksetup {
     }
 }
 
-/// Reader that reports every setting off without asking macOS.
-///
-/// This is what a daemon on a machine without `networksetup` reads, and what tests read so that a
-/// status never depends on the proxy settings of the machine running them.
+/// Reader that reports every setting off without asking macOS: what a machine without
+/// `networksetup` reads, and what keeps a status independent of the machine a test runs on.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSystemProxy;
 
@@ -328,9 +309,8 @@ fn report(kind: ProxyKind, service: &NetworkService) -> Result<String, ProxyFail
     Ok(reported)
 }
 
-/// Reads one `networksetup` proxy report.
-///
-/// Returns [`None`] when the setting is off or names no address that can be dialled.
+/// Reads one `networksetup` proxy report, field by field: [`None`] when the setting is off or
+/// names no address that can be dialled.
 pub fn parse(reported: &str) -> Option<ProxyEndpoint> {
     let mut enabled = false;
     let mut host = "";

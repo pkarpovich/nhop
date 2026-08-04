@@ -1,8 +1,7 @@
 //! Wire contract shared by the `nhop` daemon and its command-line client.
 //!
 //! The daemon speaks newline-delimited JSON over a unix socket: one [`Command`] per line in, one
-//! [`Response`] per line out. [`Command::Subscribe`] is the sole exception and switches the
-//! connection to a stream of [`Response::Event`] lines.
+//! [`Response`] per line out, except [`Command::Subscribe`], which streams [`Response::Event`].
 
 #![warn(missing_docs)]
 

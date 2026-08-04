@@ -6,11 +6,11 @@ use crate::rules::{InvalidRule, Ruleset};
 /// Command an init run was rejected on, named as it appears on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedCommand {
-    /// `add_rule` - the value could not be read as its kind.
+    /// The value could not be read as its kind.
     AddRule,
-    /// `set_upstream` - the address could not be read.
+    /// The address could not be read.
     SetUpstream,
-    /// `set_listen` - the front ends could not be moved to the address.
+    /// The front ends could not be moved to the address.
     SetListen,
 }
 

@@ -28,13 +28,9 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Next hop that sends `require` and `prefer` traffic through the SOCKS5 upstream.
 ///
-/// While the verdict is [`HealthState::Down`] no connection is dialled through the upstream at
-/// all: `prefer` goes direct at once and `require` fails at once, so a powered-off upstream costs
-/// a decision rather than a connect timeout per connection.
-///
-/// Only a failure of the upstream itself flips the verdict down. An upstream that answers about a
-/// destination it could not reach has proven it is serving, so one dead destination never sends
-/// every `prefer` connection past the proxy.
+/// While the verdict is [`HealthState::Down`] nothing is dialled through the upstream: `prefer`
+/// goes direct at once and `require` fails at once, so a powered-off upstream costs a decision
+/// rather than a connect timeout per connection.
 #[derive(Debug)]
 pub struct UpstreamHop {
     upstream: LiveUpstream,
@@ -180,16 +176,14 @@ async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStr
 
 /// Splits a dial failure by whether the upstream answered at all.
 ///
-/// Any SOCKS5 reply proves the upstream is alive and speaking the protocol, however it judged the
-/// destination - so a refusal it sent belongs to the destination, not to its own health. Only a
-/// failure to obtain a well-formed reply means the upstream itself is gone.
+/// Any SOCKS5 reply proves the upstream is alive, however it judged the destination, so a refusal
+/// it sent belongs to the destination. Only a failure to obtain a well-formed reply means the
+/// upstream itself is gone.
 ///
 /// `UnknownAuthMethod` sits on the answered side despite its name: tokio-socks raises it both for
 /// an auth method it cannot use and, on the reply path, for any status byte outside the 0x00..=0x08
 /// the RFC assigns. Real proxies do emit those - 3proxy answers 0x09 to a CONNECT aimed at its own
-/// listening address, which is exactly what the health probe asks for. Reading that as a dead
-/// upstream pinned the verdict to down while the proxy was serving traffic, and every `require`
-/// rule failed with it.
+/// listening address, which is exactly what the health probe asks for.
 fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
     match failure {
         tokio_socks::Error::GeneralSocksServerFailure
@@ -238,11 +232,9 @@ async fn probe_while_down(upstream: LiveUpstream, health: HealthHandle, interval
 
 /// Asks the upstream to carry a connection to its own address, and reads the answer as a verdict.
 ///
-/// A reply about the destination is classified exactly as a real dial classifies it: the upstream
-/// answered, so it is serving. An upstream that refuses a connection to its own address - an `ssh
-/// -D` tunnel whose remote end has nothing on that port, or a proxy whose ruleset denies loopback
-/// destinations - would otherwise never leave [`HealthState::Down`], since the probe is the only
-/// transition up.
+/// A reply about the destination counts as serving, and the probe is the only transition up: an
+/// upstream that refuses its own address - an `ssh -D` tunnel with nothing on that port, a ruleset
+/// denying loopback destinations - would otherwise never leave [`HealthState::Down`].
 async fn probe(upstream: SocketAddr) -> HealthState {
     let handshake = Socks5Stream::connect(upstream, upstream);
     let Ok(reached) = tokio::time::timeout(PROBE_TIMEOUT, handshake).await else {

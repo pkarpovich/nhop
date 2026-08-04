@@ -1,3 +1,8 @@
+//! The two front ends, and the contract both `serve` functions share.
+//!
+//! Each routes one connection with a [`ConnCtx`] and dials through a [`NextHop`], leaves exactly
+//! one log line once a decision is reached, and answers the client before returning a failure -
+//! a refused dial included.
 pub mod http;
 pub mod socks5;
 
@@ -20,16 +25,14 @@ use crate::upstream::HealthHandle;
 /// Addresses the two front ends listen on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listen {
-    /// Address the HTTP front end binds.
     pub http: SocketAddr,
-    /// Address the SOCKS5 front end binds.
     pub socks: SocketAddr,
 }
 
 /// Address published while no init script has named an upstream.
 ///
-/// Port zero cannot be dialled, so a router without an upstream refuses `require` traffic at once
-/// instead of waiting out a connect timeout.
+/// Port zero cannot be dialled, so `require` traffic is refused at once instead of waiting out a
+/// connect timeout.
 pub const NO_UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 const SOCKS5_SCHEME: &str = "socks5://";
@@ -47,10 +50,9 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    /// Reads the `socks5://<ip>:<port>` form an init script writes.
+    /// Reads the `socks5://<ip>:<port>` form an init script writes, scheme optional.
     ///
-    /// The scheme is optional, and the host must be an IP literal because the upstream is dialled
-    /// without a resolver.
+    /// The host must be an IP literal: the upstream is dialled without a resolver.
     ///
     /// # Errors
     ///
@@ -68,12 +70,10 @@ impl Upstream {
         Ok(Self { written, socket })
     }
 
-    /// Returns the address as the operator wrote it.
     pub fn written(&self) -> &UpstreamAddr {
         &self.written
     }
 
-    /// Returns the address the dialer connects to.
     pub fn socket(&self) -> SocketAddr {
         self.socket
     }
@@ -92,9 +92,7 @@ struct Subscriber {
 /// Whether a subscriber is still listening once an event has been offered to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
-    /// The subscriber is still there, whether it took the event or lost it.
     Kept,
-    /// The subscriber is gone and is dropped from the fan-out.
     Gone,
 }
 
@@ -166,7 +164,7 @@ impl EventTx {
         queue
     }
 
-    /// Publishes one decision event without ever waiting for a reader.
+    /// Publishes one decision event.
     pub fn publish(&self, event: &EventView) {
         let Self(subscribers) = self;
         let mut subscribers = subscribers.lock().unwrap();
@@ -176,7 +174,6 @@ impl EventTx {
         });
     }
 
-    /// Returns how many subscribers the stream is fanned out to.
     pub fn subscribers(&self) -> usize {
         let Self(subscribers) = self;
         let subscribers = subscribers.lock().unwrap();
@@ -192,7 +189,6 @@ pub struct UpstreamDown {
 }
 
 impl UpstreamDown {
-    /// Names the upstream that is down and the rule that demanded it.
     pub fn new(addr: SocketAddr, rule: RuleId) -> Self {
         Self { addr, rule }
     }
@@ -227,20 +223,16 @@ impl From<UpstreamDown> for io::Error {
 /// move that connection to another next hop.
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
-    /// Ruleset the connection was accepted under.
     pub rules: Arc<Ruleset>,
-    /// Verdict on the upstream.
     pub health: HealthHandle,
-    /// Address of the SOCKS5 upstream.
     pub upstream: SocketAddr,
-    /// Sink the decision is published to.
     pub events: EventTx,
 }
 
 /// One connection, from the decision that routed it to the line it leaves in the log.
 ///
-/// The verdict is taken when the decision is made and the duration when the connection ends, so
-/// the event reports what the routing actually saw.
+/// The verdict is taken at the decision and the duration at the end, so the event reports what
+/// the routing saw.
 #[derive(Debug)]
 pub struct Routed {
     host: Host,
@@ -266,9 +258,8 @@ impl Routed {
 
     /// Emits the single event this connection produces, once it has ended.
     ///
-    /// The same event goes to the log and to every subscriber. The fan-out never waits for a
-    /// reader: a subscriber that cannot keep up loses events instead. The log line is appended on
-    /// this task, after the connection is over, so it delays nothing the client is waiting for.
+    /// The log line is appended on this task, after the connection is over, so it delays nothing
+    /// the client is waiting for.
     pub fn ended(self, failure: Option<&io::Error>) {
         let Self {
             host,

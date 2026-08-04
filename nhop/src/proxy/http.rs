@@ -28,7 +28,7 @@ enum Method {
 /// How much of what arrived behind the head belongs to the request the head opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Body {
-    /// A `Content-Length` body of this many bytes; anything past it is a later request.
+    /// A `Content-Length` body; anything past it is a later request.
     Sized(usize),
     /// A body only its own framing delimits, so everything already read belongs to it.
     Streamed,
@@ -53,9 +53,9 @@ struct Head {
 /// How much of the request body has still to come from the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rest {
-    /// Exactly this many bytes, after which the client has nothing more to say about this request.
+    /// After this many bytes the client has nothing more to say about this request.
     Bytes(usize),
-    /// A body only its own framing delimits, so only the client can end it.
+    /// Only the client can end it.
     Streamed,
 }
 
@@ -79,17 +79,13 @@ struct Forward<'a> {
 
 /// Serves one connection of the HTTP front end and closes it.
 ///
-/// Exactly one request is routed per connection: the head and its body are forwarded, the answer
-/// is relayed back and the connection is closed, so whatever the client sends afterwards - behind
+/// Exactly one request is routed per connection, so whatever the client sends afterwards - behind
 /// the body it pipelined, or on the connection it meant to keep alive - can never inherit this
-/// one's next hop. A connection that reached a decision leaves exactly one line in the log,
-/// whether it was relayed or refused.
+/// one's next hop.
 ///
 /// # Errors
 ///
-/// Returns [`io::Error`] when the client or the next hop fails while the head is read, the answer
-/// is written or the relay is running. A refused dial is such a failure, reported after the client
-/// has been answered.
+/// Returns [`io::Error`] when the client or the next hop fails while the request is served.
 ///
 /// [`io::Error`]: std::io::Error
 pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io::Result<()> {
@@ -172,7 +168,6 @@ async fn relay(
     }
 }
 
-/// Answers the tunnel request and then carries bytes both ways until either end stops.
 async fn tunnel(client: &mut TcpStream, next: &mut TcpStream, behind: &[u8]) -> io::Result<()> {
     client.write_all(ESTABLISHED).await?;
     client.flush().await?;
@@ -184,14 +179,13 @@ async fn tunnel(client: &mut TcpStream, next: &mut TcpStream, behind: &[u8]) -> 
 
 /// Forwards one request and its answer, and reads no further request from the client.
 ///
-/// The client is read only as far as this request's body reaches, so a request behind it is never
-/// forwarded and can never inherit this one's next hop; the next hop is then half-closed, which is
-/// what tells an origin holding the connection open that the request is over. The two directions
-/// run together, so an origin that answers before the body has arrived cannot wedge the upload.
+/// The client is read only as far as this request's body reaches; the next hop is then
+/// half-closed, which is what tells an origin holding the connection open that the request is
+/// over. The two directions run together, so an origin that answers before the body has arrived
+/// cannot wedge the upload.
 ///
-/// A body only its own framing delimits ends where the client stops writing, so a chunked upload
-/// is the one request whose end the front end cannot see: it holds the connection until the client
-/// half-closes it.
+/// A chunked upload is the one request whose end the front end cannot see, so it holds the
+/// connection until the client half-closes it.
 async fn forwarded(
     client: &mut TcpStream,
     next: &mut TcpStream,

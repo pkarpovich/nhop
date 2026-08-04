@@ -59,8 +59,8 @@ pub fn subscriber(paths: &Paths) -> io::Result<impl Subscriber + Send + Sync> {
 
 /// Writes the one line a routed connection leaves in the log.
 ///
-/// The line carries the fields of [`EventView`] and nothing else: no request line, no header and
-/// no credential ever reaches the log.
+/// The line carries the fields of [`EventView`] and nothing else: no request line, header or
+/// credential ever reaches the log.
 pub fn decision(event: &EventView) {
     let EventView {
         host,
@@ -148,14 +148,12 @@ pub fn read_from(file: &Path, offset: u64) -> io::Result<(Vec<String>, u64)> {
 /// Stretch of the log `--since` asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
-    /// Every line is printed.
     All,
     /// Only lines stamped at or after this instant are printed.
     Since(SystemTime),
 }
 
 impl Window {
-    /// Returns the window reaching a duration back from now.
     pub fn reaching_back(window: Duration) -> Self {
         let Some(cutoff) = SystemTime::now().checked_sub(window) else {
             return Self::All;
@@ -163,9 +161,8 @@ impl Window {
         Self::Since(cutoff)
     }
 
-    /// Returns whether a line falls inside the window.
-    ///
-    /// A line the window cannot place in time is outside every window but [`Window::All`].
+    /// Returns whether a line falls inside the window; one that cannot be placed in time falls
+    /// inside none but [`Window::All`].
     pub fn holds(&self, line: &str) -> bool {
         match self {
             Self::All => true,
@@ -182,9 +179,7 @@ impl Window {
 /// One routing decision read back out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedDecision {
-    /// When the line was written.
     pub at: Timestamp,
-    /// The decision the line records.
     pub event: EventView,
 }
 
@@ -257,7 +252,6 @@ mod tests {
 
     use super::*;
 
-    /// The log line as the contract says it must read back, and nothing besides.
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct LoggedFields {
