@@ -16,6 +16,21 @@ const BAD_REQUEST: &str = "400 Bad Request";
 const BAD_GATEWAY: &str = "502 Bad Gateway";
 const DEFAULT_PORT: Port = Port(80);
 
+/// Fields that belong to one hop and must not reach the origin (RFC 9110 7.6.1).
+///
+/// `Transfer-Encoding` is deliberately absent: the body is forwarded with its framing intact, so
+/// the origin needs the header that describes it.
+const HOP_BY_HOP: [&str; 8] = [
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
 /// What the client asked the front end to do with its connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
@@ -104,9 +119,18 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
         body,
     } = request;
     let behind = behind_the_head(&buffer[end..read], method, body);
+    let rebuilt = match method {
+        Method::Connect => Vec::new(),
+        Method::Absolute => {
+            let Some(rebuilt) = rewritten(head, &host, port) else {
+                return respond(&mut client, BAD_REQUEST, "nhop: malformed request").await;
+            };
+            rebuilt
+        }
+    };
     let forward = Forward {
         method,
-        head,
+        head: &rebuilt,
         behind,
         rest: rest_of_body(method, body, behind),
     };
@@ -179,10 +203,10 @@ async fn tunnel(client: &mut TcpStream, next: &mut TcpStream, behind: &[u8]) -> 
 
 /// Forwards one request and its answer, and reads no further request from the client.
 ///
-/// The client is read only as far as this request's body reaches; the next hop is then
-/// half-closed, which is what tells an origin holding the connection open that the request is
-/// over. The two directions run together, so an origin that answers before the body has arrived
-/// cannot wedge the upload.
+/// The client is read only as far as this request's body reaches. The answer ends when the origin
+/// closes, which the `Connection: close` added by [`rewritten`] asks it to do; half-closing the
+/// write side instead would be legal but leaves some origins silent. The two directions run
+/// together, so an origin that answers before the body has arrived cannot wedge the upload.
 ///
 /// A chunked upload is the one request whose end the front end cannot see, so it holds the
 /// connection until the client half-closes it.
@@ -201,7 +225,7 @@ async fn forwarded(
     let mut body = client_read.take(rest.limit());
     let sending = async {
         let _sent = copy(&mut body, &mut next_write).await?;
-        next_write.shutdown().await
+        next_write.flush().await
     };
     let answering = async {
         let _answered = copy(&mut next_read, &mut client_write).await?;
@@ -277,6 +301,59 @@ fn parse_head(head: &[u8]) -> Option<Request> {
         port,
         body: body_of(headers),
     })
+}
+
+/// Rebuilds an absolute-form request as the origin must receive it.
+///
+/// The target becomes origin-form and `Host` is regenerated from it, which RFC 9112 3.2.1 requires
+/// of a proxy and which forwarding the head unchanged would violate. Hop-by-hop fields are dropped
+/// and `Connection: close` is added, so the origin ends the response by closing: half-closing the
+/// write side instead is legal but silently unanswered by some origins, Apple's timestamp service
+/// among them.
+fn rewritten(head: &[u8], host: &Host, port: Port) -> Option<Vec<u8>> {
+    let Ok(head) = str::from_utf8(head) else {
+        return None;
+    };
+    let (line, headers) = head.split_once("\r\n")?;
+    let mut fields = line.split(' ');
+    let method = fields.next()?;
+    let target = fields.next()?;
+    let Host(name) = host;
+    let Port(number) = port;
+    let mut out = String::with_capacity(head.len() + 32);
+    out.push_str(method);
+    out.push(' ');
+    out.push_str(origin_form(target));
+    out.push_str(" HTTP/1.1\r\nHost: ");
+    out.push_str(name);
+    if number != 80 {
+        out.push(':');
+        out.push_str(&number.to_string());
+    }
+    out.push_str("\r\n");
+    for field in headers.split("\r\n") {
+        let Some((label, _value)) = field.split_once(':') else {
+            continue;
+        };
+        let label = label.trim().to_ascii_lowercase();
+        if label == "host" || HOP_BY_HOP.contains(&label.as_str()) {
+            continue;
+        }
+        out.push_str(field);
+        out.push_str("\r\n");
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    Some(out.into_bytes())
+}
+
+fn origin_form(target: &str) -> &str {
+    let Some(rest) = target.strip_prefix("http://") else {
+        return target;
+    };
+    let Some(slash) = rest.find('/') else {
+        return "/";
+    };
+    &rest[slash..]
 }
 
 fn body_of(headers: &str) -> Body {
@@ -554,5 +631,72 @@ mod tests {
             rest_of_body(Method::Connect, Body::Sized(0), b""),
             Rest::Streamed
         );
+    }
+
+    fn rebuilt(head: &str, host: &str, port: u16) -> String {
+        let out = rewritten(head.as_bytes(), &Host(host.to_owned()), Port(port)).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_target_becomes_origin_form() {
+        let head = "GET http://example.com/a/b?c=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(rebuilt(head, "example.com", 80).starts_with("GET /a/b?c=1 HTTP/1.1\r\n"));
+
+        let bare = "GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(rebuilt(bare, "example.com", 80).starts_with("GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn the_host_is_regenerated_from_the_target_not_forwarded() {
+        let head = "GET http://example.com/x HTTP/1.1\r\nHost: stale.example\r\n\r\n";
+        let out = rebuilt(head, "example.com", 80);
+
+        assert!(out.contains("Host: example.com\r\n"), "{out}");
+        assert!(!out.contains("stale.example"), "{out}");
+    }
+
+    #[test]
+    fn a_port_other_than_eighty_is_named_in_the_host() {
+        let head = "GET http://example.com:8080/x HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+
+        assert!(rebuilt(head, "example.com", 8080).contains("Host: example.com:8080\r\n"));
+    }
+
+    #[test]
+    fn hop_by_hop_fields_do_not_reach_the_origin() {
+        let head = "GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\
+                    Proxy-Connection: Keep-Alive\r\nKeep-Alive: timeout=5\r\n\
+                    Proxy-Authorization: Basic zzz\r\nTE: trailers\r\nUpgrade: h2c\r\n\
+                    Accept: */*\r\n\r\n";
+        let out = rebuilt(head, "example.com", 80).to_ascii_lowercase();
+
+        for dropped in [
+            "proxy-connection",
+            "keep-alive",
+            "proxy-authorization",
+            "te:",
+            "upgrade",
+        ] {
+            assert!(!out.contains(dropped), "{dropped} survived: {out}");
+        }
+        assert!(out.contains("accept: */*"), "{out}");
+    }
+
+    #[test]
+    fn the_body_framing_header_survives() {
+        let head = "POST http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+
+        assert!(rebuilt(head, "example.com", 80).contains("Transfer-Encoding: chunked\r\n"));
+    }
+
+    #[test]
+    fn the_origin_is_asked_to_close_so_the_answer_ends_without_a_half_close() {
+        let head = "GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let out = rebuilt(head, "example.com", 80);
+
+        assert!(out.contains("Connection: close\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\n"), "{out}");
     }
 }

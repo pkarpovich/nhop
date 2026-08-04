@@ -101,6 +101,14 @@ absolute-form plain-HTTP request with its body. Anything the client pipelines
 behind that body is discarded rather than sent to the first request's next hop.
 A request head over 8 KiB closes the connection without an answer.
 
+An absolute-form request is rebuilt rather than forwarded byte for byte: the
+target becomes origin-form, `Host` is regenerated from it as RFC 9112 requires
+of a proxy, hop-by-hop fields are dropped and `Connection: close` is added.
+`Transfer-Encoding` is kept, since the body travels with its framing intact.
+The origin therefore ends the answer by closing, rather than the proxy
+half-closing its write side - legal, but silently unanswered by some origins,
+Apple's timestamp service among them.
+
 ## Init file
 
 `~/.config/nhop/init` is the profile. The daemon runs it as a program at start

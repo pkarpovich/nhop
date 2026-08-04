@@ -115,6 +115,90 @@ impl StubOrigin {
     }
 }
 
+/// HTTP origin that answers one request per connection and records what it was sent.
+///
+/// Never waits for the client to half-close, which is what a proxy forwarding `Connection: close`
+/// relies on; [`StubOrigin`] echoes until EOF and is for tunnels.
+#[derive(Debug)]
+pub struct StubHttpOrigin {
+    addr: SocketAddr,
+    received: Arc<Mutex<Vec<String>>>,
+    serving: Serving,
+}
+
+impl StubHttpOrigin {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind(ephemeral()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let serving = Serving(tokio::spawn({
+            let received = received.clone();
+            async move {
+                loop {
+                    let Ok((stream, _peer)) = listener.accept().await else {
+                        return;
+                    };
+                    let received = received.clone();
+                    tokio::spawn(async move {
+                        let _answered = answer_once(stream, received).await;
+                    });
+                }
+            }
+        }));
+        Self {
+            addr,
+            received,
+            serving,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Returns every request the origin read, in arrival order.
+    pub fn received(&self) -> Vec<String> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+async fn answer_once(mut stream: TcpStream, received: Arc<Mutex<Vec<String>>>) -> io::Result<()> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let read = stream.read(&mut byte).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        head.push(byte[0]);
+        if head.len() > 16384 {
+            return Ok(());
+        }
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    let mut wanted = 0;
+    for field in head.split("\r\n") {
+        let Some((label, value)) = field.split_once(':') else {
+            continue;
+        };
+        if label.trim().eq_ignore_ascii_case("content-length") {
+            wanted = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; wanted];
+    if wanted > 0 {
+        stream.read_exact(&mut body).await?;
+    }
+    let mut whole = head;
+    whole.push_str(&String::from_utf8_lossy(&body));
+    received.lock().unwrap().push(whole);
+    let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {wanted}\r\n\r\n");
+    stream.write_all(answer.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
 /// What a SOCKS5 client asked the stub upstream to connect to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocksRequest {

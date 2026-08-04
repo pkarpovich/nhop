@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use support::{DownHop, StubOrigin, TestDaemon, ephemeral};
+use support::{DownHop, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -101,27 +101,46 @@ async fn a_connect_request_tunnels_to_the_destination() {
 }
 
 #[tokio::test]
-async fn an_absolute_form_request_is_forwarded_verbatim() {
+async fn an_absolute_form_request_is_rebuilt_for_the_origin() {
     let (_home, paths) = temp_paths();
-    let origin = StubOrigin::start().await;
+    let origin = StubHttpOrigin::start().await;
     let daemon = TestDaemon::start(&paths, ephemeral()).await;
     let request = format!(
-        "GET http://{origin}/index.html HTTP/1.1\r\nHost: {origin}\r\nAccept: */*\r\n\r\n",
+        "GET http://{origin}/index.html HTTP/1.1\r\nHost: stale.example\r\n\
+         Proxy-Connection: Keep-Alive\r\nAccept: */*\r\n\r\n",
         origin = origin.addr()
     );
 
     let client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+    let answer = echoed(client, request.as_bytes()).await;
 
-    let relayed = echoed(client, request.as_bytes()).await;
-    assert_eq!(String::from_utf8(relayed).unwrap(), request);
-    assert_eq!(origin.connections(), 1);
+    let [seen] = origin
+        .received()
+        .try_into()
+        .expect("one request reaches the origin");
+    assert!(seen.starts_with("GET /index.html HTTP/1.1\r\n"), "{seen}");
+    assert!(
+        seen.contains(&format!("Host: {}\r\n", origin.addr())),
+        "{seen}"
+    );
+    assert!(seen.contains("Connection: close\r\n"), "{seen}");
+    assert!(
+        !seen.to_ascii_lowercase().contains("proxy-connection"),
+        "{seen}"
+    );
+    assert!(!seen.contains("stale.example"), "{seen}");
+    assert!(seen.contains("Accept: */*\r\n"), "{seen}");
+    assert!(
+        String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200 OK"),
+        "the origin's answer reaches the client"
+    );
     daemon.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_request_body_arriving_with_its_head_reaches_the_origin() {
     let (_home, paths) = temp_paths();
-    let origin = StubOrigin::start().await;
+    let origin = StubHttpOrigin::start().await;
     let daemon = TestDaemon::start(&paths, ephemeral()).await;
     let request = format!(
         "POST http://{origin}/submit HTTP/1.1\r\nHost: {origin}\r\nContent-Length: 7\r\n\r\na=1&b=2",
@@ -129,17 +148,21 @@ async fn a_request_body_arriving_with_its_head_reaches_the_origin() {
     );
 
     let client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+    let _answer = echoed(client, request.as_bytes()).await;
 
-    let relayed = echoed(client, request.as_bytes()).await;
-    assert_eq!(String::from_utf8(relayed).unwrap(), request);
-    assert_eq!(origin.connections(), 1);
+    let [seen] = origin
+        .received()
+        .try_into()
+        .expect("one request reaches the origin");
+    assert!(seen.starts_with("POST /submit HTTP/1.1\r\n"), "{seen}");
+    assert!(seen.ends_with("\r\n\r\na=1&b=2"), "{seen}");
     daemon.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_body_is_forwarded_but_a_request_pipelined_behind_it_is_not() {
     let (_home, paths) = temp_paths();
-    let origin = StubOrigin::start().await;
+    let origin = StubHttpOrigin::start().await;
     let daemon = TestDaemon::start(&paths, ephemeral()).await;
     let first = format!(
         "POST http://{origin}/first HTTP/1.1\r\nContent-Length: 3\r\nHost: {origin}\r\n\r\na=1",
@@ -151,13 +174,17 @@ async fn a_body_is_forwarded_but_a_request_pipelined_behind_it_is_not() {
     );
 
     let client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+    let _answer = echoed(client, format!("{first}{second}").as_bytes()).await;
 
-    let relayed = echoed(client, format!("{first}{second}").as_bytes()).await;
-    assert_eq!(String::from_utf8(relayed).unwrap(), first);
-    assert_eq!(origin.connections(), 1);
+    let [seen] = origin
+        .received()
+        .try_into()
+        .expect("only the first request is forwarded");
+    assert!(seen.starts_with("POST /first HTTP/1.1\r\n"), "{seen}");
+    assert!(seen.ends_with("a=1"), "{seen}");
+    assert!(!seen.contains("/second"), "{seen}");
     daemon.shutdown().await;
 }
-
 #[tokio::test]
 async fn payload_sent_ahead_of_the_tunnel_answer_still_reaches_the_destination() {
     let (_home, paths) = temp_paths();
@@ -181,7 +208,7 @@ async fn payload_sent_ahead_of_the_tunnel_answer_still_reaches_the_destination()
 #[tokio::test]
 async fn a_second_request_on_the_same_connection_is_not_forwarded() {
     let (_home, paths) = temp_paths();
-    let origin = StubOrigin::start().await;
+    let origin = StubHttpOrigin::start().await;
     let daemon = TestDaemon::start(&paths, ephemeral()).await;
     let first = format!(
         "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\n\r\n",
@@ -193,17 +220,21 @@ async fn a_second_request_on_the_same_connection_is_not_forwarded() {
     );
 
     let client = TcpStream::connect(daemon.http_addr()).await.unwrap();
+    let _answer = echoed(client, format!("{first}{second}").as_bytes()).await;
 
-    let relayed = echoed(client, format!("{first}{second}").as_bytes()).await;
-    assert_eq!(String::from_utf8(relayed).unwrap(), first);
-    assert_eq!(origin.connections(), 1);
+    let [seen] = origin
+        .received()
+        .try_into()
+        .expect("only the first request reaches the origin");
+    assert!(seen.starts_with("GET /first HTTP/1.1\r\n"), "{seen}");
+    assert!(!seen.contains("/second"), "{seen}");
     daemon.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_request_sent_after_the_answer_never_reaches_the_first_next_hop() {
     let (_home, paths) = temp_paths();
-    let origin = StubOrigin::start().await;
+    let origin = StubHttpOrigin::start().await;
     let daemon = TestDaemon::start(&paths, ephemeral()).await;
     let first = format!(
         "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\n\r\n",
@@ -216,22 +247,25 @@ async fn a_request_sent_after_the_answer_never_reaches_the_first_next_hop() {
 
     let mut client = TcpStream::connect(daemon.http_addr()).await.unwrap();
     client.write_all(first.as_bytes()).await.unwrap();
-    let mut answered = vec![0u8; first.len()];
-    client.read_exact(&mut answered).await.unwrap();
-    let _sent = client.write_all(second.as_bytes()).await;
-
-    assert_eq!(String::from_utf8(answered).unwrap(), first);
-    let mut after = Vec::new();
-    let reading = tokio::time::timeout(PATIENCE, client.read_to_end(&mut after)).await;
+    let mut answer = Vec::new();
+    let reading = tokio::time::timeout(PATIENCE, client.read_to_end(&mut answer)).await;
     assert!(
         reading.is_ok(),
         "the front end must close the connection after one answer"
     );
-    assert!(after.is_empty(), "{after:?}");
-    assert_eq!(origin.connections(), 1);
+    let _sent = client.write_all(second.as_bytes()).await;
+
+    assert!(
+        String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200 OK"),
+        "the origin's answer reaches the client"
+    );
+    let [seen] = origin
+        .received()
+        .try_into()
+        .expect("only the first request reaches the origin");
+    assert!(seen.starts_with("GET /first HTTP/1.1\r\n"), "{seen}");
     daemon.shutdown().await;
 }
-
 #[tokio::test]
 async fn a_malformed_request_line_is_answered_with_400() {
     let (_home, paths) = temp_paths();
