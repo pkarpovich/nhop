@@ -124,6 +124,66 @@ empty and every connection is direct - `nhop status` says so.
 
 `packaging/nhop.init.example` is a commented starting point with placeholders.
 
+### A worked example
+
+Nothing below is real. It is the Scranton branch of the Dunder Mifflin Paper
+Company, working from home after the Sabre acquisition, and it exists to show
+what pushes a destination into one class rather than another.
+
+The setup: a VM on the home LAN runs the corporate VPN client and exposes a
+SOCKS5 proxy on `192.168.7.20:1080`. Everything Dunder Mifflin lives behind it.
+
+```fish
+#!/usr/bin/env fish
+
+nhop upstream socks5://192.168.7.20:1080
+
+# Home LAN and the branch printer. Matched before every other rule, so nothing
+# below can accidentally drag them into the tunnel.
+nhop never cidr 192.168.7.0/24
+nhop never suffix pyramid.local
+
+# Only reachable through the VPN, so a direct attempt cannot succeed - better a
+# clear 502 than a minute of silence.
+nhop require suffix corp.dundermifflin.com
+nhop require keyword sabre   # sabre-erp, sabre-sso, whatever it is called this quarter
+
+# Public, and routed through the VPN for policy rather than reachability. When
+# the VM is off these keep working over the ordinary connection.
+nhop prefer suffix dundermifflin.com
+nhop prefer suffix wuphf.com
+
+# The init file is a program, so the branch subnets are a loop. A cidr rule only
+# ever catches a client that already dials an IP literal - nothing here resolves
+# a hostname to an address to see whether it lands in one of these.
+for subnet in 10.15.0.0/16 10.20.0.0/16 10.30.0.0/16 10.99.0.0/16
+    nhop require cidr $subnet   # Scranton, Utica, Stamford, corporate NYC
+end
+```
+
+The split is the whole point. `warehouse.corp.dundermifflin.com` is `require`
+because it does not exist outside the VPN; `dundermifflin.com` is `prefer`
+because it is a public website that merely ought to be reached from a corporate
+address. With the VM shut down for the weekend the first fails immediately and
+the second still loads, and no rule had to be edited to get there.
+
+Check any of it without opening a connection. Rules are numbered from zero in
+declaration order:
+
+```
+$ nhop test warehouse.corp.dundermifflin.com:443
+upstream via rule 2 (require) to socks5://192.168.7.20:1080
+
+$ nhop test pyramid.local:9100
+never via rule 1 (never) to pyramid.local:9100
+
+$ nhop test 10.15.4.9:445
+upstream via rule 6 (require) to socks5://192.168.7.20:1080
+
+$ nhop test example.net:443
+direct via no rule to example.net:443
+```
+
 ## Filesystem contract
 
 | Path | Purpose |
@@ -182,9 +242,9 @@ load commits, the ruleset is empty and every connection is direct.
 directory has to go, because launchd expands neither `~` nor `$HOME`:
 
 ```
-sed "s|{{HOME}}|$HOME|g" packaging/com.pavel-karpovich.nhop.plist \
-    > ~/Library/LaunchAgents/com.pavel-karpovich.nhop.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pavel-karpovich.nhop.plist
+sed "s|{{HOME}}|$HOME|g" packaging/dev.pkarpovich.nhop.plist \
+    > ~/Library/LaunchAgents/dev.pkarpovich.nhop.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.pkarpovich.nhop.plist
 ```
 
 It sets `RunAtLoad` and `KeepAlive`, so launchd starts the daemon at login and
@@ -229,14 +289,110 @@ before it leaves macOS pointing every app at ports nothing listens on.
 
 ```
 sudo nhop proxy off
-launchctl bootout gui/$(id -u)/com.pavel-karpovich.nhop
-rm ~/Library/LaunchAgents/com.pavel-karpovich.nhop.plist
+launchctl bootout gui/$(id -u)/dev.pkarpovich.nhop
+rm ~/Library/LaunchAgents/dev.pkarpovich.nhop.plist
 rm ~/.local/bin/nhop
 rm -r ~/.config/nhop ~/.local/state/nhop
 ```
 
 Confirm with `nhop proxy status` before removing the binary - all three settings
 must read `off`.
+
+## Agent-friendly by design
+
+A router that decides where every connection goes is only as good as your ability
+to ask it what it did. Everything it reports is machine-readable, so a coding
+agent asked to work out why something is slow or unreachable can do it without
+guessing:
+
+- **`--json` on every read command** - `status`, `rules`, `test`, `logs`, `tail`,
+  `doctor`. With the flag they print one JSON document on stdout and nothing
+  else, so no output has to be scraped out of prose that changes wording later.
+- **Exit codes carry meaning** - 0 success, 2 nothing there, 3 upstream down, 4
+  malformed arguments, 1 everything else. A script can branch without reading a
+  message.
+- **The log is JSON lines**, one object per routing decision, so `jq` answers
+  questions the tool has no command for.
+- **No interactive prompts anywhere.** Every command either acts or fails with a
+  message. Nothing waits on a human.
+
+### Is it my proxy?
+
+`nhop doctor` runs seven checks and exits non-zero if any fails. It is the first
+thing to run and usually the last:
+
+```
+$ nhop doctor
+ok    daemon_reachable  the daemon answered on ~/.local/state/nhop/nhop.sock
+ok    ports_bound       http on 127.0.0.1:7890, socks5 on 127.0.0.1:7891
+ok    system_proxy      Wi-Fi sends http and https to 127.0.0.1:7890 and socks to 127.0.0.1:7891
+ok    upstream_reachable  socks5://… answered, the verdict is up
+```
+
+It knows one macOS trap by name: a denied Local Network permission surfaces as
+`No route to host`, not as a permission error, so the `upstream_reachable` check
+says so and names the remedy rather than reporting a routing fault.
+
+### Why did this host go there?
+
+`nhop test` answers without opening a connection, so it is safe to run against
+production hostnames:
+
+```
+$ nhop test warehouse.internal.example:443 --json
+{"decision":"upstream","rule_index":5,"class":"require","next_hop":"socks5://…"}
+```
+
+`rule_index` is the position in `nhop rules`, so the answer points at the exact
+line of the init file that decided it. A destination that matches nothing comes
+back as `direct` with a null rule.
+
+### What actually happened to that request?
+
+`nhop tail` follows decisions live; `nhop logs --since 15m` reads back. With
+`--json` both feed `jq`. Which upstream hosts are slow:
+
+```
+nhop logs --since 1h --json |
+  jq -rs '[.[] | select(.fields.decision=="upstream")]
+          | group_by(.fields.host)
+          | map({host: .[0].fields.host, worst: (map(.fields.duration_ms) | max)})
+          | sort_by(-.worst) | .[:5][] | "\(.host)  \(.worst)ms"'
+```
+
+Only the connections that failed, with the reason:
+
+```
+nhop logs --since 1h --json |
+  jq -r 'select(.fields.error) | "\(.fields.host):\(.fields.port)  \(.fields.error)"'
+```
+
+Every decision event carries `host`, `port`, `decision`, `rule_index`, `class`,
+`upstream` (the health verdict at the time), `duration_ms` and `error`. Hostnames
+and ports only - no request bodies, headers or credentials are ever logged.
+
+### Did my rule change land?
+
+`nhop reload` re-runs the init script and either commits the whole new ruleset or
+keeps the old one. `nhop status` then reports the outcome:
+
+```
+$ nhop status --json | jq '{last_load, rules}'
+{"last_load":{"at":"…","outcome":"ok","command":null},"rules":{"require":9,"prefer":20,"never":5}}
+```
+
+An `outcome` of `failed` carries the command that broke in `command`, and the
+previous ruleset is still the one serving traffic.
+
+### Health gate in a script
+
+```fish
+if nhop doctor >/dev/null
+    echo "routing is healthy"
+else if test $status -eq 3
+    echo "the upstream is down - require rules will fail, prefer rules go direct"
+end
+```
 
 ## Three constraints behind the design
 
