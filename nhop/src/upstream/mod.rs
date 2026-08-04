@@ -178,6 +178,18 @@ async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStr
     Ok(dialled.into_inner())
 }
 
+/// Splits a dial failure by whether the upstream answered at all.
+///
+/// Any SOCKS5 reply proves the upstream is alive and speaking the protocol, however it judged the
+/// destination - so a refusal it sent belongs to the destination, not to its own health. Only a
+/// failure to obtain a well-formed reply means the upstream itself is gone.
+///
+/// `UnknownAuthMethod` sits on the answered side despite its name: tokio-socks raises it both for
+/// an auth method it cannot use and, on the reply path, for any status byte outside the 0x00..=0x08
+/// the RFC assigns. Real proxies do emit those - 3proxy answers 0x09 to a CONNECT aimed at its own
+/// listening address, which is exactly what the health probe asks for. Reading that as a dead
+/// upstream pinned the verdict to down while the proxy was serving traffic, and every `require`
+/// rule failed with it.
 fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
     match failure {
         tokio_socks::Error::GeneralSocksServerFailure
@@ -187,6 +199,8 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
         | tokio_socks::Error::ConnectionRefused
         | tokio_socks::Error::TtlExpired
         | tokio_socks::Error::AddressTypeNotSupported
+        | tokio_socks::Error::CommandNotSupported
+        | tokio_socks::Error::UnknownAuthMethod
         | tokio_socks::Error::InvalidTargetAddress(_) => {
             DialFailure::Destination(io::Error::other(failure))
         }
@@ -195,8 +209,6 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
         | tokio_socks::Error::ProxyServerUnreachable
         | tokio_socks::Error::InvalidResponseVersion
         | tokio_socks::Error::NoAcceptableAuthMethods
-        | tokio_socks::Error::UnknownAuthMethod
-        | tokio_socks::Error::CommandNotSupported
         | tokio_socks::Error::UnknownError
         | tokio_socks::Error::InvalidReservedByte
         | tokio_socks::Error::UnknownAddressType
@@ -257,6 +269,7 @@ mod tests {
     const NO_AUTH: [u8; 2] = [0x05, 0x00];
     const REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const GENERAL_FAILURE: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    const OFF_RFC: [u8; 10] = [0x05, 0x09, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
     fn hop(upstream: SocketAddr, state: HealthState, interval: Duration) -> UpstreamHop {
         let published = LiveUpstream::default();
@@ -444,6 +457,30 @@ mod tests {
         let upstream = upstream_answering(REFUSED).await;
 
         assert_eq!(probe(upstream).await, HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_probe_answered_off_the_rfc_still_flips_the_verdict_up() {
+        let upstream = upstream_answering(OFF_RFC).await;
+
+        assert_eq!(probe(upstream).await, HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_reply_off_the_rfc_leaves_the_verdict_up() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(upstream_answering(OFF_RFC).await, HealthState::Up, PATIENT);
+
+        let failure = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            UpstreamDown::carried_by(&failure).is_none(),
+            "an upstream that answered at all is still serving: {failure}"
+        );
+        assert_eq!(hop.health().state(), HealthState::Up);
     }
 
     #[tokio::test]
