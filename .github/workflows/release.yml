@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must never change: macOS ties the Local Network permission to the signing
+  # identity plus this identifier. A different value makes every upgrade look
+  # like a new program, the grant is lost, and the daemon starts reporting the
+  # upstream as unreachable with "No route to host".
+  BUNDLE_ID: dev.pkarpovich.nhop
+  # Apple Silicon only. Intel macOS is out of support, and the runner is arm64,
+  # so this is the native target and nothing is cross-compiled.
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag that disagrees with Cargo.toml would ship a binary whose version
+      # nobody can trace back, and the formula would carry the wrong number.
+      - name: Tag matches the crate version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(mise exec -- cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$tag" != "$crate" ]; then
+            echo "tag $tag does not match Cargo.toml $crate" >&2
+            exit 1
+          fi
+
+      - run: mise run check
+
+      - run: mise exec -- cargo build --release --target "$TARGET"
+
+      - uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      # Hardened runtime and a timestamp, matching scripts/build-signed.sh, so a
+      # binary from CI and one built locally carry the same identity.
+      - name: Sign
+        env:
+          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          identity=$(security find-identity -v -p codesigning |
+            grep "Developer ID Application" | grep "($TEAM_ID)" |
+            head -n 1 | awk '{print $2}')
+          if [ -z "$identity" ]; then
+            echo "no Developer ID Application identity for team $TEAM_ID" >&2
+            exit 1
+          fi
+          binary="target/$TARGET/release/nhop"
+          codesign --force --timestamp --options runtime \
+            --identifier "$BUNDLE_ID" --sign "$identity" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/nhop-$TARGET.tar.gz" -C "target/$TARGET/release" nhop
+          cd dist && shasum -a 256 *.tar.gz > checksums.txt && cat checksums.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
+
+  formula:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Read the version and the checksum
+        id: facts
+        run: |
+          {
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "sha=$(shasum -a 256 "dist/nhop-$TARGET.tar.gz" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: pkarpovich/homebrew-apps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Write the formula
+        env:
+          VERSION: ${{ steps.facts.outputs.version }}
+          SHA: ${{ steps.facts.outputs.sha }}
+        run: |
+          cat > tap/Formula/nhop.rb <<EOF
+          class Nhop < Formula
+            desc "Rule-based local proxy router for macOS"
+            homepage "https://github.com/pkarpovich/nhop"
+            version "${VERSION}"
+            license "MIT"
+
+            depends_on arch: :arm64
+            depends_on :macos
+
+            url "https://github.com/pkarpovich/nhop/releases/download/v${VERSION}/nhop-${TARGET}.tar.gz"
+            sha256 "${SHA}"
+
+            def install
+              bin.install "nhop"
+            end
+
+            # Homebrew writes and loads the LaunchAgent itself, so the program path
+            # is always the installed one and there is no placeholder to substitute.
+            service do
+              run [opt_bin/"nhop", "start"]
+              keep_alive true
+              log_path var/"log/nhop.log"
+              error_log_path var/"log/nhop.err.log"
+            end
+
+            def caveats
+              <<~CAVEATS
+                Start the daemon and point macOS at it:
+
+                  brew services start nhop
+                  sudo nhop proxy on
+
+                macOS asks for Local Network access the first time the daemon dials
+                the upstream. Until it is granted the upstream reads as unreachable
+                with "No route to host" - nhop doctor says so and names the remedy.
+
+                Rules live in ~/.config/nhop/init. Without that file every connection
+                is direct.
+
+                If you already load a hand-written dev.pkarpovich.nhop.plist,
+                remove it first: two daemons cannot both bind 7890.
+              CAVEATS
+            end
+
+            test do
+              assert_match "rule-based local proxy router", shell_output("#{bin}/nhop --help")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.facts.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/nhop.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "nhop ${VERSION}"
+          git push

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IDENTIFIER="com.pavel-karpovich.nhop"
+IDENTIFIER="dev.pkarpovich.nhop"
 
 if [ $# -ne 1 ]; then
 	echo "usage: ${0##*/} <team-id>" >&2

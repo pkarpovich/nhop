@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.pavel-karpovich.nhop</string>
+	<string>dev.pkarpovich.nhop</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{{HOME}}/.local/bin/nhop</string>

@@ -4,7 +4,7 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
-const LABEL: &str = "com.pavel-karpovich.nhop";
+const LABEL: &str = "dev.pkarpovich.nhop";
 const HOME_TOKEN: &str = "{{HOME}}";
 
 fn plist_file() -> PathBuf {

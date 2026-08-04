@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # macOS only: the daemon binds unix sockets, reads networksetup output and
+    # ships a LaunchAgent, so there is nothing to gain from a Linux runner.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The toolchain comes from .mise.toml, so CI and a developer machine can
+      # never drift onto different Rust versions.
+      - uses: jdx/mise-action@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # fmt --check, clippy -D warnings and the test suite, the same gate that
+      # guards every task locally.
+      - run: mise run check
