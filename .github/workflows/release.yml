@@ -145,6 +145,10 @@ jobs:
             # is always the installed one and there is no placeholder to substitute.
             service do
               run [opt_bin/"nhop", "start"]
+              # Homebrew's generated plist carries no PATH, so the daemon would
+              # inherit launchd's minimal one and an init script whose shebang
+              # resolves an interpreter through env would fail to start.
+              environment_variables PATH: std_service_path_env
               keep_alive true
               log_path var/"log/nhop.log"
               error_log_path var/"log/nhop.err.log"
