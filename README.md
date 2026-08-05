@@ -132,6 +132,11 @@ empty and every connection is direct - `nhop status` says so.
 
 `packaging/nhop.init.example` is a commented starting point with placeholders.
 
+The daemon runs the script with whatever `PATH` its launcher gave it. Under
+`brew services` that is Homebrew's own service path, which covers interpreters
+installed by brew; a hand-written LaunchAgent has to set `PATH` itself, or the
+script needs an absolute shebang.
+
 ### A worked example
 
 Nothing below is real. It is the Scranton branch of the Dunder Mifflin Paper
