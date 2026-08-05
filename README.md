@@ -1,5 +1,8 @@
 # nhop
 
+[![CI](https://github.com/pkarpovich/nhop/actions/workflows/ci.yml/badge.svg)](https://github.com/pkarpovich/nhop/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Rule-based local proxy router for macOS.
 
 Decides, per connection, what the next hop is: a corporate SOCKS5 proxy or the
@@ -212,10 +215,30 @@ let any local process rewrite this machine's traffic routing.
 
 ## Install
 
-Everything below is one-time setup. Commands are written for fish. Building
-needs the pinned toolchain (`mise install`, Rust 1.97) and a `Developer ID
-Application` identity in the login keychain; `mise run check` is the full gate -
-`cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test`.
+Two ways to get the daemon onto the machine: Homebrew, which is the normal one,
+or a build from source. Both then need the same one-time configuration below -
+the init file, the system proxy and the Local Network grant. Commands are
+written for fish.
+
+### Homebrew
+
+```
+brew install pkarpovich/apps/nhop
+brew services start nhop
+```
+
+The formula installs the signed binary and writes and loads its own launch
+agent, so the daemon starts at login and is restarted when it dies. That agent
+runs with Homebrew's service `PATH`, which is what lets a `#!/usr/bin/env fish`
+shebang in the init file resolve. Its stdout and stderr go to
+`$(brew --prefix)/var/log/nhop.log` and `nhop.err.log`.
+
+### From source
+
+Building needs the pinned toolchain (`mise install`, Rust 1.97) and a `Developer
+ID Application` identity in the login keychain; `mise run check` is the full
+gate - `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
+`cargo test`. Cutting a release is `docs/releasing.md`.
 
 **1. Build and sign.** macOS denies local-subnet access to binaries that are not
 properly signed and reports the denial as `No route to host`, so a Developer ID
@@ -237,21 +260,7 @@ mkdir -p ~/.local/bin ~/.config/nhop ~/.local/state/nhop
 install -m 755 target/release/nhop ~/.local/bin/nhop
 ```
 
-**3. Write the init file.** It is the profile: the rule set is whatever this
-script declares, and it is re-run on `nhop reload`.
-
-```
-cp packaging/nhop.init.example ~/.config/nhop/init
-$EDITOR ~/.config/nhop/init
-chmod +x ~/.config/nhop/init
-```
-
-The example ships with placeholders and its own first line is a notice rather
-than a shebang - replace every line marked `# replace` and delete that first
-line so the shebang leads. A missing init file is not an error; until the first
-load commits, the ruleset is empty and every connection is direct.
-
-**4. Load the LaunchAgent.** The plist carries `{{HOME}}` where an absolute home
+**3. Load the LaunchAgent.** The plist carries `{{HOME}}` where an absolute home
 directory has to go, because launchd expands neither `~` nor `$HOME`:
 
 ```
@@ -268,7 +277,28 @@ startup failures only; the daemon's own JSON log is
 plist because launchd's default does not include Homebrew and
 `#!/usr/bin/env fish` has to resolve.
 
-**5. Point macOS at the daemon, once.** The daemon never touches the system
+### Configure
+
+Both install paths end here.
+
+**1. Write the init file.** It is the profile: the rule set is whatever this
+script declares, and it is re-run on `nhop reload`.
+
+```
+mkdir -p ~/.config/nhop
+curl -fsSL https://raw.githubusercontent.com/pkarpovich/nhop/main/packaging/nhop.init.example \
+    -o ~/.config/nhop/init
+$EDITOR ~/.config/nhop/init
+chmod +x ~/.config/nhop/init
+```
+
+From a checkout, `cp packaging/nhop.init.example ~/.config/nhop/init` says the
+same thing. The example ships with placeholders and its own first line is a
+notice rather than a shebang - replace every line marked `# replace` and delete
+that first line so the shebang leads. A missing init file is not an error; until
+the first load commits, the ruleset is empty and every connection is direct.
+
+**2. Point macOS at the daemon, once.** The daemon never touches the system
 proxy itself:
 
 ```
@@ -282,13 +312,13 @@ and SOCKS proxies of the Wi-Fi service to them, plus the bypass list
 invocation instead of prompting. `sudo` keeps `HOME` on macOS, so root reaches
 the operator's socket rather than root's own state directory.
 
-**6. Grant Local Network access on first run.** macOS should prompt the first
+**3. Grant Local Network access on first run.** macOS should prompt the first
 time the daemon dials the upstream. If it does not, enable `nhop` by hand under
 System Settings -> Privacy & Security -> Local Network. A denial surfaces as
 `No route to host` rather than as a permission error, which is what `nhop
 doctor` reports as a probable Local Network denial.
 
-**7. Check the result.**
+**4. Check the result.**
 
 ```
 nhop doctor
@@ -299,6 +329,17 @@ nhop status
 
 The order matters. `sudo nhop proxy off` goes **first**: removing the agent
 before it leaves macOS pointing every app at ports nothing listens on.
+
+Installed with Homebrew:
+
+```
+sudo nhop proxy off
+brew services stop nhop
+brew uninstall nhop
+rm -r ~/.config/nhop ~/.local/state/nhop
+```
+
+Installed from source:
 
 ```
 sudo nhop proxy off

@@ -62,7 +62,8 @@ The whole tree obeys these; a change that breaks one reads as foreign.
 - every entry point takes `Paths`, so no test touches `$HOME` or any process
   global; use `Paths::from_home(tempdir)`
 - integration tests share `nhop/tests/support/mod.rs` (`StubSocks5`,
-  `StubOrigin`, `TestDaemon`, `StubHop`, `DownHop`) instead of new stubs
+  `StubOrigin`, `StubHttpOrigin`, `TestDaemon`, `StubHop`, `DownHop`) instead of
+  new stubs
 - bind port 0 everywhere - nothing in the suite may touch 7890/7891
 - the logging subscriber is scoped with `tracing::subscriber::with_default`,
   since several daemons run in one test process
@@ -70,3 +71,9 @@ The whole tree obeys these; a change that breaks one reads as foreign.
 ## Plans
 
 `docs/plans/`, and completed ones move to `docs/plans/completed/`.
+
+## Releasing
+
+`docs/releasing.md`. A release is an annotated `v*` tag on `main`; CI builds,
+signs, publishes and rewrites the Homebrew formula. The tag has to agree with
+the workspace version, so the bump belongs in the pull request being released.
