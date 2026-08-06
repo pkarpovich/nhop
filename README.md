@@ -425,6 +425,14 @@ Every decision event carries `host`, `port`, `decision`, `rule_index`, `class`,
 `upstream` (the health verdict at the time), `duration_ms` and `error`. Hostnames
 and ports only - no request bodies, headers or credentials are ever logged.
 
+The first line of a run is not a decision but the open-file limit the daemon
+raised itself to, as `open_files_soft` and `open_files_hard`. It is there because
+running out of descriptors does not look like running out of descriptors: a
+router spends two per connection, and once the table is full `getaddrinfo` has
+none left either, so every destination starts failing to resolve. An `error` of
+`Too many open files` or a burst of `failed to lookup address information` in the
+log means the limit, not the network.
+
 ### Did my rule change land?
 
 `nhop reload` re-runs the init script and either commits the whole new ruleset or
