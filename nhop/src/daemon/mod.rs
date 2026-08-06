@@ -1,5 +1,6 @@
 mod init_script;
 mod ipc_server;
+mod open_files;
 mod staging;
 pub mod state;
 
@@ -424,15 +425,16 @@ pub fn start_on(paths: &Paths, listen: Listen) -> Result<Daemon, StartFailure> {
 
 /// Runs the daemon until SIGINT or SIGTERM arrives.
 ///
-/// This is the one entry point that installs the log: [`start`] and [`start_on`] leave the log of
-/// the process alone, so a test can run several daemons at once.
+/// This is the one entry point that installs the log and raises the open-file limit: [`start`] and
+/// [`start_on`] leave the process alone, so a test can run several daemons at once.
 ///
 /// # Errors
 ///
 /// Returns [`StartFailure`] when the log cannot be opened, the daemon cannot start or the signal
-/// handlers cannot be installed.
+/// handlers cannot be installed. A limit that cannot be raised is logged and served under.
 pub async fn run(paths: &Paths) -> Result<(), StartFailure> {
     logging::start(paths)?;
+    open_files::raise_and_report();
     let daemon = start(paths)?;
     await_stop_signal().await?;
     daemon.shutdown().await;

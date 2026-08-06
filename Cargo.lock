@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "nhop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "argh",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "nhop-ipc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "humantime",
