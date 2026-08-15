@@ -222,24 +222,42 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 - Modify: `Cargo.toml` (workspace deps), `nhop/Cargo.toml`
 - Modify: `nhop/src/upstream/mod.rs`
 
-- [ ] add `socket2` with the `all` feature to the workspace and crate manifests
-- [ ] add the three keepalive constants and `keep_alive(&TcpStream)` with a doc
+- [x] add `socket2` with the `all` feature to the workspace and crate manifests
+- [x] add the three keepalive constants and `keep_alive(&TcpStream)` with a doc
       comment carrying the why: NAT-mapping refresh for `direct()` (RFC 6202
       §5.5 band; Chrome 45s / Go 15s precedent) and bounded dead-peer detection
       for `through()`, whose socket stays on the LAN
-- [ ] apply it in `direct()` and `through()` before the stream is returned,
+- [x] apply it in `direct()` and `through()` before the stream is returned,
       warning without failing the dial when the syscall errors; leave `probe()`
       untouched (probe connections live milliseconds)
-- [ ] write a test: a stream from `direct()` against a local listener reads back
+- [x] write a test: a stream from `direct()` against a local listener reads back
       `keepalive() == true`, `tcp_keepalive_interval() == KEEPALIVE_INTERVAL`
       and `tcp_keepalive_retries() == KEEPALIVE_RETRIES` through `SockRef`
-- [ ] write a test: the same four-value read-back on the stream returned by
+      (`a_direct_socket_carries_keepalive`)
+- [x] write a test: the same four-value read-back on the stream returned by
       `through()` against the in-module SOCKS stub, proving `into_inner()` does
       not drop the options
-- [ ] cover the idle time too: assert `tcp_keepalive_time() == KEEPALIVE_IDLE`
+      (`an_upstream_socket_carries_keepalive_through_into_inner`, against a new
+      `GRANTED` reply constant)
+- [x] cover the idle time too: assert `tcp_keepalive_time() == KEEPALIVE_IDLE`
       where the getter exists on macOS; if it does not, state that in this file
       and assert the two available timers instead - do not silently skip it
-- [ ] run `mise run check` - must pass before task 2
+      - the getter **does** exist on macOS: socket2 0.6.5 gates
+        `Socket::tcp_keepalive_time` on `all(feature = "all", not(any(windows,
+        haiku, openbsd, vita)))`, so all four values are asserted
+- [x] run `mise run check` - must pass before task 2
+      - ➕ `set_tcp_keepalive` does **not** set `SO_KEEPALIVE` on unix (checked
+        against socket2 0.6.5 `sys/unix.rs`), so `keep_alive` calls
+        `set_keepalive(true)` first - without it `keepalive()` reads back false
+        and no probe is ever sent
+      - ⚠️ three pre-existing failures in this Linux dev container, unrelated to
+        this task and present on the base commit as well:
+        `cli::client::tests::a_daemon_that_hangs_up_reports_a_closed_connection`,
+        `cli::tail::tests::every_published_decision_is_printed_until_the_daemon_hangs_up`,
+        `cli::tail::tests::the_human_form_prints_one_text_line_per_decision`
+        (unix-socket hang-up surfaces as ECONNRESET rather than EOF). fmt,
+        clippy and every other target are green; 246 pass here against 244 on
+        the base commit
 
 ### Task 2: patrol prober with immediate start and two-probe hysteresis
 

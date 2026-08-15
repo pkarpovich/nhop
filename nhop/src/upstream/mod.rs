@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use nhop_ipc::{HealthState, Host, Port, RuleClass};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_socks::tcp::Socks5Stream;
@@ -25,6 +26,15 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long one probe may take before it counts as a failure.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a relay socket may sit idle before the first keepalive probe goes out.
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+
+/// How long the relay socket waits between keepalive probes once it has started sending them.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How many unanswered keepalive probes end a relay socket.
+pub const KEEPALIVE_RETRIES: u32 = 4;
 
 /// Next hop that sends `require` and `prefer` traffic through the SOCKS5 upstream.
 ///
@@ -148,10 +158,41 @@ impl NextHop for UpstreamHop {
     }
 }
 
+/// Arms TCP keepalive on an outbound relay socket.
+///
+/// The two dial sites buy different things from it, and neither is the whole story.
+///
+/// A socket from [`direct`] crosses the home NAT, which drops the mapping for an idle established
+/// connection far below RFC 5382 REQ-5's 2h4m minimum, so a tunnel nothing is written on simply
+/// dies and the next read costs a client-visible hang. The probes keep the mapping alive. Idle and
+/// interval are 15s because that is Go's dialer default, proven on this network for years, and it
+/// sits well inside the band RFC 6202 §5.5 calls safe - Chrome's own 45s sits in the same band.
+///
+/// A socket from [`through`] terminates on the LAN at the upstream and so refreshes no NAT mapping
+/// at all; the onward hop belongs to the upstream. What it buys there is bounded dead-peer
+/// detection: a powered-off upstream surfaces within `KEEPALIVE_IDLE + KEEPALIVE_RETRIES *
+/// KEEPALIVE_INTERVAL` instead of parking an fd until the kernel gives up.
+///
+/// The client half of a relay gets nothing, because loopback cannot die silently.
+fn keep_alive(stream: &TcpStream) -> io::Result<()> {
+    let socket = SockRef::from(stream);
+    socket.set_keepalive(true)?;
+    socket.set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(KEEPALIVE_IDLE)
+            .with_interval(KEEPALIVE_INTERVAL)
+            .with_retries(KEEPALIVE_RETRIES),
+    )
+}
+
 async fn direct(host: &Host, port: Port) -> io::Result<TcpStream> {
     let Host(host) = host;
     let Port(port) = port;
-    TcpStream::connect((host.as_str(), port)).await
+    let dialled = TcpStream::connect((host.as_str(), port)).await?;
+    if let Err(failure) = keep_alive(&dialled) {
+        tracing::warn!(keepalive_error = %failure, "a direct relay socket carries no tcp keepalive");
+    }
+    Ok(dialled)
 }
 
 async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStream, DialFailure> {
@@ -171,7 +212,11 @@ async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStr
         Ok(dialled) => dialled,
         Err(failure) => return Err(failed_dial(failure)),
     };
-    Ok(dialled.into_inner())
+    let dialled = dialled.into_inner();
+    if let Err(failure) = keep_alive(&dialled) {
+        tracing::warn!(keepalive_error = %failure, "an upstream relay socket carries no tcp keepalive");
+    }
+    Ok(dialled)
 }
 
 /// Splits a dial failure by whether the upstream answered at all.
@@ -259,6 +304,7 @@ mod tests {
 
     const PATIENT: Duration = Duration::from_secs(60);
     const NO_AUTH: [u8; 2] = [0x05, 0x00];
+    const GRANTED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const GENERAL_FAILURE: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const OFF_RFC: [u8; 10] = [0x05, 0x09, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
@@ -319,6 +365,36 @@ mod tests {
             }
         });
         addr
+    }
+
+    fn armed_keepalive(stream: &TcpStream) {
+        let socket = SockRef::from(stream);
+        assert!(
+            socket.keepalive().unwrap(),
+            "a relay socket must carry SO_KEEPALIVE"
+        );
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), KEEPALIVE_RETRIES);
+    }
+
+    #[tokio::test]
+    async fn a_direct_socket_carries_keepalive() {
+        let (_listener, host, port) = destination().await;
+
+        let dialled = direct(&host, port).await.unwrap();
+
+        armed_keepalive(&dialled);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_socket_carries_keepalive_through_into_inner() {
+        let (_listener, host, port) = destination().await;
+        let upstream = upstream_answering(GRANTED).await;
+
+        let dialled = through(&host, port, upstream).await.unwrap();
+
+        armed_keepalive(&dialled);
     }
 
     #[tokio::test]
