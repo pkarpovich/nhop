@@ -449,13 +449,43 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 
 ### Task 5: verify acceptance criteria
 
-- [ ] all three Overview defects addressed: keepalive options readable off both
+- [x] all three Overview defects addressed: keepalive options readable off both
       dial sites' sockets, patrol probing both states with hysteresis,
       `connect_ms` present in JSON and human output
-- [ ] wire compat verified: old log lines parse, `--json` consumers see only an
+      - defect 1: `a_direct_socket_carries_keepalive` and
+        `an_upstream_socket_carries_keepalive_through_into_inner` both read all
+        four values back through `SockRef` and pass; `probe()` is untouched
+      - defect 2: `patrol` with `advance(pending, seen, &health)` and the
+        `NO_UPSTREAM_TICK` branch, covered by 15 green tests in
+        `upstream_dialer.rs` including both hysteresis directions, the
+        mid-sequence baseline case and the cold-start pair
+      - defect 3: `EventView.connect_ms` is emitted by `logging.rs:85`, rendered
+        as ` (dial Nms)` by `cli/mod.rs:929` and sourced from `Connect` at
+        `proxy/mod.rs:304`
+- [x] wire compat verified: old log lines parse, `--json` consumers see only an
       added optional field
-- [ ] no test in the tree still asserts a retired invariant
-- [ ] full gate: `mise run check`
+      - the field is `Option<u64>` behind `#[serde(default)]`, so it is purely
+        additive; `a_line_written_before_the_dial_time_existed_still_parses`
+        (`nhop-ipc/src/view.rs:264`) and the `logging.rs` `deny_unknown_fields`
+        round-trip pin both halves
+- [x] no test in the tree still asserts a retired invariant
+      - `no_probe_is_sent_while_the_verdict_is_up`,
+        `a_down_verdict_reaches_no_upstream_at_all` and `probe_while_down` have
+        no occurrence left outside this plan file; the three request-counting
+        tests read `client_dials()`, and the two `requests()` assertions left in
+        `acceptance.rs` are against `StubHop`-shaped upstreams that see no
+        probe, and pass
+- [x] full gate: `mise run check`
+      - fmt and clippy green; `cargo test` reports 250 lib pass beside the same
+        three container failures carried since task 1, and every other target
+        green (`cargo test --tests --no-fail-fast`: acceptance 4, decision_log
+        1, http_proxy 14, init_run 4, logs_follow 2, packaging 3, socks5_proxy
+        13, tail_stream 2, upstream_dialer 15, nhop-ipc 23)
+      - the "pre-existing" claim is now measured rather than asserted: the three
+        failures reproduce identically on the base commit `3a0c788` in a
+        throwaway worktree, before a line of this branch's code exists. They are
+        this Linux container answering ECONNRESET where macOS gives EOF on a
+        unix-socket hang-up, so CI on macOS is unaffected
 
 ### Task 6: [Final] close out the plan
 
