@@ -1705,7 +1705,7 @@ mod tests {
     #[tokio::test]
     async fn logs_render_the_dial_time_of_a_line_that_carries_one() {
         let (_home, paths) = temp_paths();
-        let dialled = r#"{"timestamp":"2026-08-03T10:00:00Z","level":"INFO","fields":{"host":"api.example.com","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","connect_ms":37,"duration_ms":9},"target":"nhop::proxy"}"#;
+        let dialled = r#"{"timestamp":"2026-08-03T10:00:00Z","level":"INFO","fields":{"host":"api.example.com","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","connect_ms":37,"duration_ms":1204},"target":"nhop::proxy"}"#;
         write_log(&paths, "2026-08-03", &[dialled.to_owned()]);
 
         let (exit, out, err) = invoke(&paths, &["logs"]).await;
@@ -1715,7 +1715,7 @@ mod tests {
         assert_eq!(
             out.lines().next(),
             Some(
-                "2026-08-03T10:00:00Z  api.example.com:443  upstream via rule 2 (require)  upstream up  9ms (dial 37ms)  -"
+                "2026-08-03T10:00:00Z  api.example.com:443  upstream via rule 2 (require)  upstream up  1204ms (dial 37ms)  -"
             )
         );
     }

@@ -5,7 +5,7 @@ use nhop_ipc::{Command, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::cli::client::{self, Unreachable};
+use crate::cli::client::{self, Unreachable, read_or_hangup};
 
 use super::{Exit, Output, render};
 
@@ -57,11 +57,7 @@ impl Decisions {
     pub async fn next(&mut self) -> Result<Option<Response>, Unreachable> {
         loop {
             self.line.clear();
-            let read = self
-                .lines
-                .read_line(&mut self.line)
-                .await
-                .map_err(Unreachable::Io)?;
+            let read = read_or_hangup(self.lines.read_line(&mut self.line).await)?;
             if read == 0 {
                 return Ok(None);
             }

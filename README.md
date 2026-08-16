@@ -114,8 +114,9 @@ Apple's timestamp service among them.
 
 ## Long-lived connections
 
-Every socket the router dials outward carries TCP keepalive: 15 seconds idle, 15
-seconds between probes, 4 lost probes and the connection is declared dead. 15
+Every socket the router relays a connection over carries TCP keepalive: 15
+seconds idle, 15 seconds between probes, 4 lost probes and the connection is
+declared dead - health probes are exempt, since they live milliseconds. 15
 seconds is what Go's dialer uses and sits well inside the safe band; Chrome does
 the same at 45 for its own direct sockets. What it buys differs per hop, and
 both halves are the point:
@@ -473,8 +474,9 @@ alone, `duration_ms` the whole connection, so "slow to reach" and "held open for
 an hour" stop looking alike. `connect_ms` is absent only when nothing was
 dialled - a `require` refusal while the upstream is down - and present on a
 failed dial as well, so an attempt that cost two seconds before failing is still
-visible. Hostnames and ports only - no request bodies, headers or credentials are
-ever logged.
+visible. The plain text form of `logs` and `tail` carries it too, as a
+`(dial 37ms)` suffix on the lifetime. Hostnames and ports only - no request
+bodies, headers or credentials are ever logged.
 
 The first line of a run is not a decision but the open-file limit the daemon
 raised itself to, as `open_files_soft` and `open_files_hard`. It is there because

@@ -282,13 +282,15 @@ async fn a_vanished_upstream_reaches_down_inside_the_stated_budget() {
         EAGER,
         SNAPPY,
     );
+    let started = Instant::now();
 
-    await_state(
-        &health,
-        HealthState::Down,
-        EAGER + SNAPPY + 2 * PROBE_TIMEOUT,
-    )
-    .await;
+    await_state(&health, HealthState::Down, EAGER + SNAPPY + GRACE).await;
+
+    let waited = started.elapsed();
+    assert!(
+        waited >= SNAPPY,
+        "an upstream that refuses fast still costs two probes a confirm delay apart: {waited:?}"
+    );
 }
 
 #[tokio::test]
@@ -362,6 +364,24 @@ async fn a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes() {
         "the probe confirming a sequence banked against Up must not raise a Down verdict"
     );
     await_state(&health, HealthState::Up, DELIBERATE + GRACE).await;
+}
+
+#[tokio::test]
+async fn a_sequence_banked_against_one_upstream_is_not_closed_by_the_next() {
+    let live = published(closed_port().await);
+    let health = verdict(HealthState::Up);
+    let _hop = UpstreamHop::start(live.clone(), health.clone(), PATIENT, DELIBERATE);
+    tokio::time::sleep(SNAPPY).await;
+
+    live.publish(closed_port().await);
+
+    tokio::time::sleep(DELIBERATE + SNAPPY).await;
+    assert_eq!(
+        health.state(),
+        HealthState::Up,
+        "the first probe of a replaced upstream must not close a sequence banked against the one before it"
+    );
+    await_state(&health, HealthState::Down, DELIBERATE + GRACE).await;
 }
 
 #[tokio::test]

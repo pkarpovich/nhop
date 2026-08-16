@@ -38,6 +38,13 @@ pub const PROBE_CONFIRM_DELAY: Duration = Duration::from_secs(1);
 /// means the published address is probed as soon as it appears.
 const NO_UPSTREAM_TICK: Duration = Duration::from_millis(250);
 
+/// How long the patrol looks at [`NO_UPSTREAM_TICK`] before falling back to the interval.
+///
+/// Only cold start is worth the fast tick. A daemon configured with no upstream at all - no init
+/// file yet, or a ruleset of nothing but `never` rules - is a supported steady state, and it must
+/// not wake four times a second for the rest of its life to keep finding nothing.
+const NO_UPSTREAM_EAGER: Duration = Duration::from_secs(5);
+
 /// How long a relay socket may sit idle before the first keepalive probe goes out.
 pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 
@@ -284,17 +291,21 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
 
 /// One contradicting observation waiting for a second one to agree with it.
 ///
-/// Both ends of the sequence are recorded. The `target` is what the sequence is trying to reach,
-/// and anchoring on it rather than on "contradicts whatever the verdict is right now" is
-/// load-bearing: a contradiction banked against [`HealthState::Up`], a dial failure flipping the
-/// verdict down underneath it, and then a *successful* confirming probe would otherwise read as a
-/// second contradiction and declare the upstream alive on one good probe. The `baseline` is the
-/// verdict the sequence started from, so a verdict that moved by any other path - a real dial
-/// failure, an operator command - retires the sequence instead of counting towards it.
+/// The `target` is what the sequence is trying to reach, and anchoring on it rather than on
+/// "contradicts whatever the verdict is right now" is load-bearing: a contradiction banked against
+/// [`HealthState::Up`], a dial failure flipping the verdict down underneath it, and then a
+/// *successful* confirming probe would otherwise read as a second contradiction and declare the
+/// upstream alive on one good probe. That anchor is also what retires a sequence whose verdict
+/// moved by any other path - a real dial failure, an operator command - since an observation
+/// aiming somewhere else opens a fresh sequence instead of closing the stale one.
+///
+/// The `addr` is the upstream the observation was made against. `patrol` re-reads the published
+/// address every iteration, so without it a contradiction banked against the old upstream could be
+/// closed by the first probe of the one a reload put in its place.
 #[derive(Debug, Clone, Copy)]
 struct Pending {
     target: HealthState,
-    baseline: HealthState,
+    addr: SocketAddr,
 }
 
 /// Probes the upstream in both verdict states, moving the verdict only on two probes that agree.
@@ -318,13 +329,20 @@ async fn patrol(
     confirm_delay: Duration,
 ) {
     let mut pending = None;
+    let mut looking = Duration::ZERO;
     loop {
         let addr = upstream.snapshot();
         if addr == NO_UPSTREAM {
-            tokio::time::sleep(NO_UPSTREAM_TICK.min(interval)).await;
+            let tick = match looking < NO_UPSTREAM_EAGER {
+                true => NO_UPSTREAM_TICK.min(interval),
+                false => interval,
+            };
+            looking = looking.saturating_add(tick);
+            tokio::time::sleep(tick).await;
             continue;
         }
-        pending = advance(pending, probe(addr).await, &health);
+        looking = Duration::ZERO;
+        pending = advance(pending, probe(addr).await, addr, &health);
         let waited = match pending {
             Some(_sequence) => confirm_delay,
             None => interval,
@@ -337,7 +355,12 @@ async fn patrol(
 ///
 /// An observation agreeing with the live verdict discards whatever was pending, since the verdict
 /// it contradicted is the one in force again.
-fn advance(pending: Option<Pending>, seen: HealthState, health: &HealthHandle) -> Option<Pending> {
+fn advance(
+    pending: Option<Pending>,
+    seen: HealthState,
+    addr: SocketAddr,
+    health: &HealthHandle,
+) -> Option<Pending> {
     let settled = health.state();
     match (settled, seen) {
         (HealthState::Up, HealthState::Up) | (HealthState::Down, HealthState::Down) => return None,
@@ -345,16 +368,16 @@ fn advance(pending: Option<Pending>, seen: HealthState, health: &HealthHandle) -
     }
     let confirms = match pending {
         None => false,
-        Some(Pending { target, baseline }) => target == seen && baseline == settled,
+        Some(Pending {
+            target,
+            addr: probed,
+        }) => target == seen && probed == addr,
     };
     if confirms {
         health.set(seen);
         return None;
     }
-    Some(Pending {
-        target: seen,
-        baseline: settled,
-    })
+    Some(Pending { target: seen, addr })
 }
 
 /// Asks the upstream to carry a connection to its own address, and reads the answer as a verdict.

@@ -14,7 +14,7 @@ it is installed; this file is what a change to the code has to respect.
   - `daemon/` - `state.rs` (the actor), `staging.rs` (a load in flight),
     `init_script.rs`, `ipc_server.rs`, `mod.rs` (start, listeners, pid lock)
   - `proxy/` - `http.rs`, `socks5.rs` front ends, `mod.rs` (`ConnCtx`, `NextHop`,
-    `Routed`, the decision fan-out)
+    `Dialled`, `Connect`, `Routed`, the decision fan-out)
   - `rules/`, `upstream/`, `cli/`, `logging.rs`
 
 ## Commands
@@ -35,7 +35,7 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   reach through a value field by field
 - `let ... else` for early returns, `for` loops over iterator chains
 - newtypes over bare `String`, enums over `bool` parameters (`Output`, `Follow`,
-  `BindState`, `Privilege`, `Delivery`)
+  `BindState`, `Privilege`, `Delivery`, `Dialled`, `Connect`)
 
 ## Invariants
 
@@ -59,15 +59,25 @@ The whole tree obeys these; a change that breaks one reads as foreign.
 - **The prober patrols both verdict states with two-probe hysteresis.** `patrol`
   probes from startup on, Up and Down alike. A probe contradicting the live
   verdict only opens a pending sequence recording the state it aims at and the
-  verdict it started from; a confirming probe after `PROBE_CONFIRM_DELAY` has to
-  agree with that recorded target before the verdict moves. An agreeing probe,
-  or a verdict change arriving by any other path, discards the sequence. A real
-  dial failure still flips Down on one failure - it is evidence a user already
-  paid for, a self-generated timeout is not.
+  address it was made against; a confirming probe after `PROBE_CONFIRM_DELAY` has
+  to agree with that recorded target, against that same address, before the
+  verdict moves. An agreeing probe, a verdict change arriving by any other path,
+  or a reload pointing the daemon elsewhere discards the sequence. A real dial
+  failure still flips Down on one failure - it is evidence a user already paid
+  for, a self-generated timeout is not.
 - **Every outbound relay socket carries keepalive.** `direct()` and `through()`
   both apply `keep_alive` before handing the stream back, and a failed setsockopt
   warns rather than failing a dial that otherwise succeeded. Probe sockets are
   exempt: they live milliseconds.
+- **A dial reports whether it touched the network; nothing asks afterwards.**
+  `NextHop::dial` returns `Dialled` - `Refused` for a `require` rule turned away
+  before any socket, `Attempted` for anything that reached the network - because
+  both carry the same `UpstreamDown` surface and an instant failure times the
+  same as a refusal. The front end folds it with `Dialled::timed(elapsed)` into
+  `Connect`, which `Routed::dialled` records as `connect_ms`. Deriving the
+  distinction from the error, or from re-reading the health verdict after the
+  call, is banned: the first mislabels a two-second failing dial as "nothing
+  dialled", the second races the patrol.
 
 ## Tests
 
@@ -76,6 +86,9 @@ The whole tree obeys these; a change that breaks one reads as foreign.
 - integration tests share `nhop/tests/support/mod.rs` (`StubSocks5`,
   `StubOrigin`, `StubHttpOrigin`, `TestDaemon`, `StubHop`, `DownHop`) instead of
   new stubs
+- `StubSocks5::requests()` records patrol probes too, since a probe is a CONNECT
+  to the stub's own address. Assert what a front end dialled with
+  `client_dials()`; `requests()` is for probe assertions
 - bind port 0 everywhere - nothing in the suite may touch 7890/7891
 - the logging subscriber is scoped with `tracing::subscriber::with_default`,
   since several daemons run in one test process
