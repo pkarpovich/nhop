@@ -56,6 +56,18 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   are the only ways into it.
 - **Only an upstream failure flips the health verdict down.** A SOCKS reply
   about a destination proves the upstream is serving (`upstream/mod.rs`).
+- **The prober patrols both verdict states with two-probe hysteresis.** `patrol`
+  probes from startup on, Up and Down alike. A probe contradicting the live
+  verdict only opens a pending sequence recording the state it aims at and the
+  verdict it started from; a confirming probe after `PROBE_CONFIRM_DELAY` has to
+  agree with that recorded target before the verdict moves. An agreeing probe,
+  or a verdict change arriving by any other path, discards the sequence. A real
+  dial failure still flips Down on one failure - it is evidence a user already
+  paid for, a self-generated timeout is not.
+- **Every outbound relay socket carries keepalive.** `direct()` and `through()`
+  both apply `keep_alive` before handing the stream back, and a failed setsockopt
+  warns rather than failing a dial that otherwise succeeded. Probe sockets are
+  exempt: they live milliseconds.
 
 ## Tests
 

@@ -422,15 +422,30 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 - Modify: `Cargo.toml` (+ `Cargo.lock` via cargo)
 - Modify: `README.md`, `CLAUDE.md`
 
-- [ ] bump the workspace version 0.1.2 -> 0.1.3
-- [ ] README: document keepalive on relayed sockets with the split benefit
+- [x] bump the workspace version 0.1.2 -> 0.1.3
+      - `Cargo.lock` refreshed with `cargo update -w --offline`, which rewrites
+        both member entries and nothing else
+- [x] README: document keepalive on relayed sockets with the split benefit
       (NAT refresh for direct, dead-peer detection for upstream), the patrol
       lifecycle (immediate first probe, two-probe hysteresis both ways, dial
       failures still immediate), and `connect_ms` in the log-fields list of
       "Agent-friendly by design"
-- [ ] CLAUDE.md: update the upstream invariant and add the relay-keepalive
+      - two new sections between "Limits" and "Init file": "Long-lived
+        connections" (the split benefit) and "The upstream verdict" (the patrol
+        lifecycle), so the transport story sits with the other behaviour prose
+        rather than inside the install steps
+- [x] CLAUDE.md: update the upstream invariant and add the relay-keepalive
       transport contract to the invariants list
-- [ ] run `mise run check` - must pass before task 5
+      - the existing "only an upstream failure flips the verdict down" line
+        stays as it is and two invariants follow it: the patrol with its
+        recorded target and baseline, and keepalive on both dial sites with
+        probe sockets exempt
+- [x] run `mise run check` - must pass before task 5
+      - ⚠️ fmt and clippy green, every integration target green (58 tests via
+        `cargo test --tests --no-fail-fast`); the same three pre-existing
+        container failures from tasks 1-3 still abort the lib target
+        (`cli::client::tests::a_daemon_that_hangs_up_reports_a_closed_connection`
+        and the two `cli::tail` ones), 250 lib tests pass beside them
 
 ### Task 5: verify acceptance criteria
 
