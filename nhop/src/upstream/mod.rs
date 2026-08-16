@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_socks::tcp::Socks5Stream;
 
-use crate::daemon::state::LiveUpstream;
+use crate::daemon::state::{LOAD_TIMEOUT, LiveUpstream};
 use crate::proxy::{Dialled, NO_UPSTREAM, NextHop, UpstreamDown};
 use crate::rules::{Decision, RuleId};
 
@@ -40,10 +40,23 @@ const NO_UPSTREAM_TICK: Duration = Duration::from_millis(250);
 
 /// How long the patrol looks at [`NO_UPSTREAM_TICK`] before falling back to the interval.
 ///
-/// Only cold start is worth the fast tick. A daemon configured with no upstream at all - no init
-/// file yet, or a ruleset of nothing but `never` rules - is a supported steady state, and it must
-/// not wake four times a second for the rest of its life to keep finding nothing.
-const NO_UPSTREAM_EAGER: Duration = Duration::from_secs(5);
+/// Only cold start is worth the fast tick, and cold start lasts as long as the first load may: a
+/// load publishes its address on commit, so a script that runs for most of [`LOAD_TIMEOUT`] leaves
+/// the snapshot at [`NO_UPSTREAM`] until the end of that window. Sizing the window on anything
+/// shorter would hand a slow init file back the interval-long wait the tick exists to remove.
+///
+/// [`LOAD_TIMEOUT`] alone is not that size, because the two clocks do not start together: this one
+/// starts when `spawn_frontends` spawns the patrol, the script's starts later, once the state task
+/// exists, the startup `Reload` has been served and `init_script::run` has been spawned. A script
+/// finishing just inside its own timeout therefore publishes just outside a window measured as the
+/// timeout exactly. [`PROBE_INTERVAL`] of slack covers that startup order with orders of magnitude
+/// to spare, and costs a daemon with no upstream one extra interval of ticking.
+///
+/// It is still a window rather than "until an address appears", because a daemon configured with
+/// no upstream at all - no init file, or a ruleset of nothing but `never` rules - is a supported
+/// steady state, and it must not wake four times a second for the rest of its life to keep finding
+/// nothing.
+const NO_UPSTREAM_EAGER: Duration = LOAD_TIMEOUT.saturating_add(PROBE_INTERVAL);
 
 /// How long a relay socket may sit idle before the first keepalive probe goes out.
 pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
@@ -656,6 +669,16 @@ mod tests {
 
         assert_eq!(dialled.peer_addr().unwrap(), listener.local_addr().unwrap());
         assert_eq!(hop.health().state(), HealthState::Up);
+    }
+
+    #[test]
+    fn the_eager_window_outlasts_a_load_that_publishes_late() {
+        assert!(
+            NO_UPSTREAM_EAGER > LOAD_TIMEOUT,
+            "the first load publishes on commit and its timeout starts after this window does, so \
+             the fast tick has to outlast the whole run: {NO_UPSTREAM_EAGER:?} against \
+             {LOAD_TIMEOUT:?}"
+        );
     }
 
     #[tokio::test]
