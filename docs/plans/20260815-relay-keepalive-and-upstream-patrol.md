@@ -268,55 +268,87 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
   three call sites gain the fourth argument)
 - Modify: `nhop/tests/support/mod.rs` (`StubSocks5` gains the client-dial view)
 
-- [ ] replace `probe_while_down` with `patrol`: probe first, sleep after, probe
+- [x] replace `probe_while_down` with `patrol`: probe first, sleep after, probe
       in both verdict states every `interval`
-- [ ] implement the pending-sequence rule: a contradicting probe records the
+- [x] implement the pending-sequence rule: a contradicting probe records the
       target state and the baseline verdict and schedules a confirming probe
       after `confirm_delay`; the verdict moves only on a second probe agreeing
       with that target; an agreeing probe or any verdict change from another
       path discards the sequence
-- [ ] do not sleep a full interval while the snapshot is `NO_UPSTREAM` -
+      - the rule lives in `advance(pending, seen, &health) -> Option<Pending>`,
+        a pure fold the loop calls with each observation; the sleep that
+        follows is `confirm_delay` while a sequence is open and `interval`
+        otherwise
+- [x] do not sleep a full interval while the snapshot is `NO_UPSTREAM` -
       re-check on a short tick so the address published by the first init load
       is probed promptly
-- [ ] keep the dial-failure path flipping Down on one failure, and keep the
+      - ➕ the tick is a private `NO_UPSTREAM_TICK` = 250ms, taken as
+        `NO_UPSTREAM_TICK.min(interval)` so a test running on a shorter
+        interval than the tick is not slowed down by it
+- [x] keep the dial-failure path flipping Down on one failure, and keep the
       "any SOCKS reply counts as serving" classification in `probe()` untouched
-- [ ] thread `confirm_delay` through `UpstreamHop::start` and update all five
+- [x] thread `confirm_delay` through `UpstreamHop::start` and update all five
       call sites; production passes `PROBE_CONFIRM_DELAY`, test helpers pass a
       long delay by default
-- [ ] add a client-dial view to `StubSocks5` that excludes self-addressed probe
+- [x] add a client-dial view to `StubSocks5` that excludes self-addressed probe
       CONNECTs
-- [ ] replace `no_probe_is_sent_while_the_verdict_is_up` with its inverse: a
+- [x] replace `no_probe_is_sent_while_the_verdict_is_up` with its inverse: a
       probe IS sent while the verdict is Up
-- [ ] relax `the_verdict_flips_up_once_the_upstream_answers_a_probe` to expect
+- [x] relax `the_verdict_flips_up_once_the_upstream_answers_a_probe` to expect
       at least two probes, all aimed at the upstream's own address
-- [ ] rework the three request-counting tests onto the client-dial view:
+- [x] rework the three request-counting tests onto the client-dial view:
       `a_require_rule_travels_through_the_upstream_as_the_name_the_client_wrote`
       and `a_prefer_rule_travels_through_the_upstream_while_the_verdict_is_up`
       assert the user dial is present without asserting it is the only request;
       restate `a_down_verdict_reaches_no_upstream_at_all` as "no client dial
       reaches the upstream while Down" - keeping, in all three, the guarantee
       that a require rule never reaches the destination directly
-- [ ] write a test: cold start against a healthy stub reaches Up shortly after
+      - renamed to `no_client_dial_reaches_the_upstream_while_the_verdict_is_down`
+- [x] write a test: cold start against a healthy stub reaches Up shortly after
       `confirm_delay`, without waiting out an interval
-- [ ] write a test: starting from `LiveUpstream::default()` and publishing the
+      (`a_cold_start_reaches_up_shortly_after_the_confirm_delay`, interval
+      `PATIENT`, so an interval wait could only fail it)
+- [x] write a test: starting from `LiveUpstream::default()` and publishing the
       stub afterwards still reaches Up well inside `PROBE_INTERVAL` (this is the
       daemon's real startup order; the test must be able to fail if the
       `NO_UPSTREAM` tick is missing)
-- [ ] write a test: a stub answering exactly once never flips the verdict Up
-- [ ] write a test: verdict Up, stub gone, verdict reaches Down within
+      - ➕ the test has to let the patrol task poll once *before* publishing,
+        or the spawned task reads the address on its first iteration and the
+        `NO_UPSTREAM` branch is never taken - the first draft passed with the
+        tick removed. Verified by mutation: with the branch sleeping a full
+        interval the test now fails at its 2s budget
+- [x] write a test: a stub answering exactly once never flips the verdict Up
+- [x] write a test: verdict Up, stub gone, verdict reaches Down within
       `interval + confirm_delay + 2 * PROBE_TIMEOUT`
-- [ ] write a test: a live stub that misses one probe and answers the next
+- [x] write a test: a live stub that misses one probe and answers the next
       leaves the verdict Up, so no `require` connection is refused
-- [ ] write a test for the baseline rule: bank a contradicting probe against Up,
+- [x] write a test for the baseline rule: bank a contradicting probe against Up,
       flip the verdict Down through a dial failure mid-sequence, then let a
       *successful* confirming probe land - the verdict must stay Down until a
       second agreeing probe
-- [ ] add a stub that accepts and withholds its SOCKS reply, so the
+      - verified by mutation: with `advance` accepting any pending sequence
+        instead of one whose target and baseline still match, this is the only
+        test in the tree that fails
+- [x] add a stub that accepts and withholds its SOCKS reply, so the
       `PROBE_TIMEOUT` path is exercised rather than only the fast-RST one
-- [ ] leave the in-module closed-port hops (`upstream/mod.rs:337-346`) asserting
+      - ➕ done as `Answers` on `StubSocks5` rather than a fourth stub type:
+        `Always`, `Once`, `AfterOneDrop`, `Never`. The three new upstream
+        behaviours the tests need are one enum on the stub that already exists,
+        and `Never` is the withheld-reply one
+      - the mute test asserts both halves: at least `2 * PROBE_TIMEOUT` elapsed
+        (so the timeout path really ran) and Down inside the stated budget plus
+        a 500ms `GRACE`, since the worst case is exactly the budget
+- [x] leave the in-module closed-port hops (`upstream/mod.rs:337-346`) asserting
       Up: one failing probe no longer flips anything, and their helper passes a
       long `confirm_delay`, so no confirming probe fires inside the test body
-- [ ] run `mise run check` - must pass before task 3
+- [x] run `mise run check` - must pass before task 3
+      - ⚠️ fmt, clippy and every other target green; the same three
+        pre-existing container failures from task 1
+        (`cli::client::tests::a_daemon_that_hangs_up_reports_a_closed_connection`
+        and the two `cli::tail` ones) still fail here and abort the lib target,
+        so the integration targets were run separately with
+        `cargo test --tests --no-fail-fast`: all green, 15/15 in
+        `upstream_dialer`
 
 ### Task 3: connect_ms in the decision event
 

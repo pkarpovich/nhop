@@ -26,7 +26,7 @@ use crate::daemon::state::{
 };
 use crate::logging;
 use crate::proxy::{self, Listen, NextHop};
-use crate::upstream::{PROBE_INTERVAL, UpstreamHop};
+use crate::upstream::{PROBE_CONFIRM_DELAY, PROBE_INTERVAL, UpstreamHop};
 
 /// Addresses both front ends bind until an init script moves them.
 pub const DEFAULT_LISTEN: Listen = Listen {
@@ -323,6 +323,7 @@ pub fn spawn_frontends(live: &Live, listen: Listen) -> io::Result<Frontends> {
         live.upstream().clone(),
         live.health().clone(),
         PROBE_INTERVAL,
+        PROBE_CONFIRM_DELAY,
     );
     Frontends::bind(live.clone(), Arc::new(hop), listen)
 }

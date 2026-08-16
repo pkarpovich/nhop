@@ -15,17 +15,28 @@ use tokio::task::JoinHandle;
 use tokio_socks::tcp::Socks5Stream;
 
 use crate::daemon::state::LiveUpstream;
-use crate::proxy::{NextHop, UpstreamDown};
+use crate::proxy::{NO_UPSTREAM, NextHop, UpstreamDown};
 use crate::rules::{Decision, RuleId};
 
 /// How long a dial through the upstream may take before it counts as a failure.
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long the dialer waits between probes while the verdict is down.
+/// How long the patrol waits between probes, in either verdict state.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long one probe may take before it counts as a failure.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the patrol waits before the probe that has to confirm a contradicting one.
+pub const PROBE_CONFIRM_DELAY: Duration = Duration::from_secs(1);
+
+/// How long the patrol waits before looking again for an address worth probing.
+///
+/// The daemon binds the front ends - and so spawns the hop - before any init script runs, so the
+/// snapshot is [`NO_UPSTREAM`] until the first load publishes the configured address. Sleeping a
+/// whole interval on that snapshot would make cold start slower than it is today; a short tick
+/// means the published address is probed as soon as it appears.
+const NO_UPSTREAM_TICK: Duration = Duration::from_millis(250);
 
 /// How long a relay socket may sit idle before the first keepalive probe goes out.
 pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
@@ -45,7 +56,7 @@ pub const KEEPALIVE_RETRIES: u32 = 4;
 pub struct UpstreamHop {
     upstream: LiveUpstream,
     health: HealthHandle,
-    probing: JoinHandle<()>,
+    patrolling: JoinHandle<()>,
 }
 
 impl Drop for UpstreamHop {
@@ -53,22 +64,33 @@ impl Drop for UpstreamHop {
         let Self {
             upstream: _,
             health: _,
-            probing,
+            patrolling,
         } = self;
-        probing.abort();
+        patrolling.abort();
     }
 }
 
 impl UpstreamHop {
-    /// Starts dialling through the published upstream, probing it while the verdict is down.
+    /// Starts dialling through the published upstream, patrolling it in both verdict states.
     ///
-    /// The interval is a parameter so tests do not wait out [`PROBE_INTERVAL`].
-    pub fn start(upstream: LiveUpstream, health: HealthHandle, interval: Duration) -> Self {
-        let probing = tokio::spawn(probe_while_down(upstream.clone(), health.clone(), interval));
+    /// The interval and the confirm delay are parameters so tests do not wait out
+    /// [`PROBE_INTERVAL`] and [`PROBE_CONFIRM_DELAY`].
+    pub fn start(
+        upstream: LiveUpstream,
+        health: HealthHandle,
+        interval: Duration,
+        confirm_delay: Duration,
+    ) -> Self {
+        let patrolling = tokio::spawn(patrol(
+            upstream.clone(),
+            health.clone(),
+            interval,
+            confirm_delay,
+        ));
         Self {
             upstream,
             health,
-            probing,
+            patrolling,
         }
     }
 
@@ -261,18 +283,79 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
     }
 }
 
-async fn probe_while_down(upstream: LiveUpstream, health: HealthHandle, interval: Duration) {
+/// One contradicting observation waiting for a second one to agree with it.
+///
+/// Both ends of the sequence are recorded. The `target` is what the sequence is trying to reach,
+/// and anchoring on it rather than on "contradicts whatever the verdict is right now" is
+/// load-bearing: a contradiction banked against [`HealthState::Up`], a dial failure flipping the
+/// verdict down underneath it, and then a *successful* confirming probe would otherwise read as a
+/// second contradiction and declare the upstream alive on one good probe. The `baseline` is the
+/// verdict the sequence started from, so a verdict that moved by any other path - a real dial
+/// failure, an operator command - retires the sequence instead of counting towards it.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    target: HealthState,
+    baseline: HealthState,
+}
+
+/// Probes the upstream in both verdict states, moving the verdict only on two probes that agree.
+///
+/// The first probe goes out immediately, so a daemon that starts against a live upstream does not
+/// hand the discovery to the first user dial, and a dead one is found by the patrol rather than by
+/// a connection somebody is waiting on.
+///
+/// A single observation never moves the verdict: one 2s [`PROBE_TIMEOUT`] miss against a
+/// momentarily loaded upstream must not hard-refuse `require` traffic, and one stray answer while
+/// the upstream boots must not declare it alive. A verdict change therefore costs
+/// `interval + confirm_delay` plus up to one [`PROBE_TIMEOUT`] per observation, which is the
+/// difference between a peer that refuses fast and one that black-holes.
+///
+/// A real dial failure still flips down on one failure, in [`UpstreamHop`]: that path is evidence
+/// a user already paid for, while a self-generated timeout is not.
+async fn patrol(
+    upstream: LiveUpstream,
+    health: HealthHandle,
+    interval: Duration,
+    confirm_delay: Duration,
+) {
+    let mut pending = None;
     loop {
-        tokio::time::sleep(interval).await;
-        match health.state() {
-            HealthState::Up => continue,
-            HealthState::Down => {}
+        let addr = upstream.snapshot();
+        if addr == NO_UPSTREAM {
+            tokio::time::sleep(NO_UPSTREAM_TICK.min(interval)).await;
+            continue;
         }
-        match probe(upstream.snapshot()).await {
-            HealthState::Down => continue,
-            HealthState::Up => health.set(HealthState::Up),
-        }
+        pending = advance(pending, probe(addr).await, &health);
+        let waited = match pending {
+            Some(_sequence) => confirm_delay,
+            None => interval,
+        };
+        tokio::time::sleep(waited).await;
     }
+}
+
+/// Folds one observation into the pending sequence, moving the verdict when the sequence closes.
+///
+/// An observation agreeing with the live verdict discards whatever was pending, since the verdict
+/// it contradicted is the one in force again.
+fn advance(pending: Option<Pending>, seen: HealthState, health: &HealthHandle) -> Option<Pending> {
+    let settled = health.state();
+    match (settled, seen) {
+        (HealthState::Up, HealthState::Up) | (HealthState::Down, HealthState::Down) => return None,
+        (HealthState::Up, HealthState::Down) | (HealthState::Down, HealthState::Up) => {}
+    }
+    let confirms = match pending {
+        None => false,
+        Some(Pending { target, baseline }) => target == seen && baseline == settled,
+    };
+    if confirms {
+        health.set(seen);
+        return None;
+    }
+    Some(Pending {
+        target: seen,
+        baseline: settled,
+    })
 }
 
 /// Asks the upstream to carry a connection to its own address, and reads the answer as a verdict.
@@ -314,7 +397,7 @@ mod tests {
         published.publish(upstream);
         let health = HealthHandle::default();
         health.set(state);
-        UpstreamHop::start(published, health, interval)
+        UpstreamHop::start(published, health, interval, PATIENT)
     }
 
     fn upstream_decision(class: RuleClass, rule: usize) -> Decision {

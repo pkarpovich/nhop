@@ -209,6 +209,22 @@ pub struct SocksRequest {
     pub port: u16,
 }
 
+/// How a stub upstream treats the connections that arrive.
+#[derive(Debug, Clone, Copy)]
+pub enum Answers {
+    /// Every connection gets the handshake and a granted reply.
+    Always,
+    /// The first connection is answered and the listener then closes, so every later dial is
+    /// refused - an upstream that answered once while booting and then went away.
+    Once,
+    /// The first connection is dropped unanswered and every later one is answered - an upstream
+    /// that misses one probe and is alive for the next.
+    AfterOneDrop,
+    /// Every connection is accepted and left without a reply, so the caller waits out its own
+    /// timeout instead of being refused - a powered-off host that black-holes rather than RSTs.
+    Never,
+}
+
 /// SOCKS5 upstream that records every request and echoes the payload that follows.
 #[derive(Debug)]
 pub struct StubSocks5 {
@@ -219,20 +235,46 @@ pub struct StubSocks5 {
 
 impl StubSocks5 {
     pub async fn start() -> Self {
+        Self::answering(Answers::Always).await
+    }
+
+    pub async fn answering(answers: Answers) -> Self {
         let listener = TcpListener::bind(ephemeral()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let serving = Serving(tokio::spawn({
             let requests = requests.clone();
             async move {
+                let mut arrived = 0usize;
+                let mut held = Vec::new();
                 loop {
                     let Ok((stream, _peer)) = listener.accept().await else {
                         return;
                     };
+                    arrived += 1;
                     let requests = requests.clone();
-                    tokio::spawn(async move {
-                        let _served = socks5(stream, requests).await;
-                    });
+                    match answers {
+                        Answers::Always => {
+                            tokio::spawn(async move {
+                                let _served = socks5(stream, requests).await;
+                            });
+                        }
+                        Answers::Once => {
+                            tokio::spawn(async move {
+                                let _served = socks5(stream, requests).await;
+                            });
+                            return;
+                        }
+                        Answers::AfterOneDrop => {
+                            if arrived == 1 {
+                                continue;
+                            }
+                            tokio::spawn(async move {
+                                let _served = socks5(stream, requests).await;
+                            });
+                        }
+                        Answers::Never => held.push(stream),
+                    }
                 }
             }
         }));
@@ -250,6 +292,28 @@ impl StubSocks5 {
     /// Returns what the upstream was asked to connect to, in arrival order.
     pub fn requests(&self) -> Vec<SocksRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Returns only what a client asked the upstream to connect to, in arrival order.
+    ///
+    /// A health probe is a CONNECT to the upstream's own address, so dropping those leaves exactly
+    /// the dials a front end made - which is what "a require rule travels through the upstream"
+    /// and "a down verdict reaches no upstream" are about, now that the patrol probes in both
+    /// verdict states.
+    pub fn client_dials(&self) -> Vec<SocksRequest> {
+        let probe = SocksRequest {
+            atyp: 0x01,
+            host: self.addr.ip().to_string(),
+            port: self.addr.port(),
+        };
+        let mut dials = Vec::new();
+        for request in self.requests() {
+            if request == probe {
+                continue;
+            }
+            dials.push(request);
+        }
+        dials
     }
 }
 
