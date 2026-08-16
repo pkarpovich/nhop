@@ -7,9 +7,10 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nhop::daemon::{self, Daemon};
-use nhop::proxy::{Listen, NextHop, UpstreamDown};
+use nhop::proxy::{Dialled, Listen, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleId};
 use nhop_ipc::{Command, Host, Paths, Port, Response, UpstreamAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -209,6 +210,22 @@ pub struct SocksRequest {
     pub port: u16,
 }
 
+/// How a stub upstream treats the connections that arrive.
+#[derive(Debug, Clone, Copy)]
+pub enum Answers {
+    /// Every connection gets the handshake and a granted reply.
+    Always,
+    /// The first connection is answered and the listener then closes, so every later dial is
+    /// refused - an upstream that answered once while booting and then went away.
+    Once,
+    /// The first connection is dropped unanswered and every later one is answered - an upstream
+    /// that misses one probe and is alive for the next.
+    AfterOneDrop,
+    /// Every connection is accepted and left without a reply, so the caller waits out its own
+    /// timeout instead of being refused - a powered-off host that black-holes rather than RSTs.
+    Never,
+}
+
 /// SOCKS5 upstream that records every request and echoes the payload that follows.
 #[derive(Debug)]
 pub struct StubSocks5 {
@@ -219,20 +236,46 @@ pub struct StubSocks5 {
 
 impl StubSocks5 {
     pub async fn start() -> Self {
+        Self::answering(Answers::Always).await
+    }
+
+    pub async fn answering(answers: Answers) -> Self {
         let listener = TcpListener::bind(ephemeral()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let serving = Serving(tokio::spawn({
             let requests = requests.clone();
             async move {
+                let mut arrived = 0usize;
+                let mut held = Vec::new();
                 loop {
                     let Ok((stream, _peer)) = listener.accept().await else {
                         return;
                     };
+                    arrived += 1;
                     let requests = requests.clone();
-                    tokio::spawn(async move {
-                        let _served = socks5(stream, requests).await;
-                    });
+                    match answers {
+                        Answers::Always => {
+                            tokio::spawn(async move {
+                                let _served = socks5(stream, requests).await;
+                            });
+                        }
+                        Answers::Once => {
+                            tokio::spawn(async move {
+                                let _served = socks5(stream, requests).await;
+                            });
+                            return;
+                        }
+                        Answers::AfterOneDrop => {
+                            if arrived == 1 {
+                                continue;
+                            }
+                            tokio::spawn(async move {
+                                let _served = socks5(stream, requests).await;
+                            });
+                        }
+                        Answers::Never => held.push(stream),
+                    }
                 }
             }
         }));
@@ -250,6 +293,28 @@ impl StubSocks5 {
     /// Returns what the upstream was asked to connect to, in arrival order.
     pub fn requests(&self) -> Vec<SocksRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Returns only what a client asked the upstream to connect to, in arrival order.
+    ///
+    /// A health probe is a CONNECT to the upstream's own address, so dropping those leaves exactly
+    /// the dials a front end made - which is what "a require rule travels through the upstream"
+    /// and "a down verdict reaches no upstream" are about, now that the patrol probes in both
+    /// verdict states.
+    pub fn client_dials(&self) -> Vec<SocksRequest> {
+        let probe = SocksRequest {
+            atyp: 0x01,
+            host: self.addr.ip().to_string(),
+            port: self.addr.port(),
+        };
+        let mut dials = Vec::new();
+        for request in self.requests() {
+            if request == probe {
+                continue;
+            }
+            dials.push(request);
+        }
+        dials
     }
 }
 
@@ -329,24 +394,37 @@ impl NextHop for StubHop {
         host: &'a Host,
         port: Port,
         decision: Decision,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Dialled> + Send + 'a>> {
         self.asked
             .lock()
             .unwrap()
             .push((host.clone(), port, decision));
-        Box::pin(async move { TcpStream::connect(self.target).await })
+        Box::pin(async move { Dialled::Attempted(TcpStream::connect(self.target).await) })
     }
 }
 
+/// When a [`DownHop`] gives up on a dial, which is what says whether it has a dial time at all.
+#[derive(Debug, Clone, Copy)]
+pub enum Refusal {
+    /// A `require` rule whose verdict is already down: refused before any socket was opened.
+    BeforeDialling,
+    /// A dial that was really made, took this long, and then failed upstream-side.
+    AfterDialling(Duration),
+}
+
 /// Next hop that refuses every dial as if the upstream were down.
+///
+/// Both refusals carry the same [`UpstreamDown`] surface, exactly as the real dialer does, so a
+/// front end cannot tell them apart from the error alone.
 #[derive(Debug)]
 pub struct DownHop {
     upstream: SocketAddr,
+    refusal: Refusal,
 }
 
 impl DownHop {
-    pub fn new(upstream: SocketAddr) -> Self {
-        Self { upstream }
+    pub fn new(upstream: SocketAddr, refusal: Refusal) -> Self {
+        Self { upstream, refusal }
     }
 }
 
@@ -356,10 +434,20 @@ impl NextHop for DownHop {
         _host: &'a Host,
         _port: Port,
         decision: Decision,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Dialled> + Send + 'a>> {
         let rule = decision.rule().unwrap_or(RuleId(0));
         let upstream = self.upstream;
-        Box::pin(async move { Err(UpstreamDown::new(upstream, rule).into()) })
+        let refusal = self.refusal;
+        Box::pin(async move {
+            let refused: io::Error = UpstreamDown::new(upstream, rule).into();
+            match refusal {
+                Refusal::BeforeDialling => Dialled::Refused(refused),
+                Refusal::AfterDialling(took) => {
+                    tokio::time::sleep(took).await;
+                    Dialled::Attempted(Err(refused))
+                }
+            }
+        })
     }
 }
 

@@ -156,6 +156,7 @@ fn same_decision(asked: &DecisionView, routed: &EventView) {
         rule_index: taken_index,
         class: taken_class,
         upstream: _,
+        connect_ms: _,
         duration_ms: _,
         error: _,
     } = routed;
@@ -229,7 +230,7 @@ async fn require_reaches_upstream() {
     relayed(daemon.socks_addr(), origin.addr()).await;
 
     assert_eq!(decision, through(RuleClass::Require, upstream.addr()));
-    assert_eq!(upstream.requests(), vec![asked_for(origin.addr())]);
+    assert_eq!(upstream.client_dials(), vec![asked_for(origin.addr())]);
     assert_eq!(
         origin.connections(),
         0,
@@ -260,7 +261,7 @@ async fn prefer_reaches_upstream() {
     relayed(daemon.socks_addr(), origin.addr()).await;
 
     assert_eq!(decision, through(RuleClass::Prefer, upstream.addr()));
-    assert_eq!(upstream.requests(), vec![asked_for(origin.addr())]);
+    assert_eq!(upstream.client_dials(), vec![asked_for(origin.addr())]);
     assert_eq!(
         origin.connections(),
         0,

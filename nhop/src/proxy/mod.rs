@@ -12,7 +12,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nhop_ipc::{EventView, HealthState, Host, Port, UpstreamAddr};
 use tokio::net::TcpStream;
@@ -124,6 +124,7 @@ fn reporting(event: EventView, dropped: u64) -> EventView {
         rule_index,
         class,
         upstream,
+        connect_ms,
         duration_ms,
         error,
     } = event;
@@ -138,6 +139,7 @@ fn reporting(event: EventView, dropped: u64) -> EventView {
         rule_index,
         class,
         upstream,
+        connect_ms,
         duration_ms,
         error: Some(error),
     }
@@ -229,6 +231,18 @@ pub struct ConnCtx {
     pub events: EventTx,
 }
 
+/// What the dial phase of one connection cost.
+///
+/// The two variants are what separates a slow dial from a long-lived connection in the log, which
+/// [`EventView::duration_ms`] alone cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connect {
+    /// No dial was made, so there is no dial time: the decision refused before the network.
+    Refused,
+    /// A dial was made and took this long, whether or not it produced a connection.
+    Attempted(Duration),
+}
+
 /// One connection, from the decision that routed it to the line it leaves in the log.
 ///
 /// The verdict is taken at the decision and the duration at the end, so the event reports what
@@ -239,6 +253,7 @@ pub struct Routed {
     port: Port,
     decision: Decision,
     upstream: HealthState,
+    connect: Option<Duration>,
     started: Instant,
     events: EventTx,
 }
@@ -251,9 +266,18 @@ impl Routed {
             port,
             decision,
             upstream: ctx.health.state(),
+            connect: None,
             started: Instant::now(),
             events: ctx.events.clone(),
         }
+    }
+
+    /// Records what the dial phase cost, once the front end has been through it.
+    pub fn dialled(&mut self, connect: Connect) {
+        self.connect = match connect {
+            Connect::Refused => None,
+            Connect::Attempted(took) => Some(took),
+        };
     }
 
     /// Emits the single event this connection produces, once it has ended.
@@ -266,6 +290,7 @@ impl Routed {
             port,
             decision,
             upstream,
+            connect,
             started,
             events,
         } = self;
@@ -276,7 +301,8 @@ impl Routed {
             rule_index: matched_index(decision),
             class: decision.class(),
             upstream,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            connect_ms: connect.map(millis),
+            duration_ms: millis(started.elapsed()),
             error: failure.map(io::Error::to_string),
         };
         logging::decision(&event);
@@ -284,19 +310,51 @@ impl Routed {
     }
 }
 
+fn millis(took: Duration) -> u64 {
+    u64::try_from(took.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn matched_index(decision: Decision) -> Option<u32> {
     let RuleId(index) = decision.rule()?;
     Some(u32::try_from(index).unwrap_or(u32::MAX))
+}
+
+/// What one dial did, and the connection it produced if it produced one.
+///
+/// Only the dial site knows whether the network was touched: [`UpstreamHop`] answers a `require`
+/// rule with the same [`UpstreamDown`] surface whether it refused before dialling or dialled and
+/// failed, and timing cannot tell them apart either, since a refusal and an instant failure both
+/// take about no time. So the distinction is carried out of the dial rather than inferred after it.
+///
+/// [`UpstreamHop`]: crate::upstream::UpstreamHop
+#[derive(Debug)]
+pub enum Dialled {
+    /// Nothing was dialled: a `require` rule whose upstream is down is refused before the network.
+    Refused(io::Error),
+    /// A dial was made over the network, whether or not it produced a connection.
+    Attempted(io::Result<TcpStream>),
+}
+
+impl Dialled {
+    /// Splits the outcome into what the dial phase cost and the connection it produced.
+    ///
+    /// The elapsed time belongs to the caller, which is the only side that can measure the await;
+    /// it is kept only when a dial was actually made.
+    pub fn timed(self, took: Duration) -> (Connect, io::Result<TcpStream>) {
+        match self {
+            Self::Refused(failure) => (Connect::Refused, Err(failure)),
+            Self::Attempted(next) => (Connect::Attempted(took), next),
+        }
+    }
 }
 
 /// Opens the connection a [`Decision`] calls for.
 pub trait NextHop: fmt::Debug + Send + Sync + 'static {
     /// Connects to the destination, through the upstream or directly.
     ///
-    /// # Errors
-    ///
-    /// Returns an [`io::Error`] carrying [`UpstreamDown`] when a `require` rule needs an upstream
-    /// that is down, and the underlying failure when the dial itself failed.
+    /// A [`Dialled::Refused`] carries an [`io::Error`] holding [`UpstreamDown`] when a `require`
+    /// rule needs an upstream that is down; a [`Dialled::Attempted`] carries the connection, or the
+    /// underlying failure when the dial itself failed.
     ///
     /// [`io::Error`]: std::io::Error
     fn dial<'a>(
@@ -304,7 +362,7 @@ pub trait NextHop: fmt::Debug + Send + Sync + 'static {
         host: &'a Host,
         port: Port,
         decision: Decision,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Dialled> + Send + 'a>>;
 }
 
 #[cfg(test)]
@@ -458,8 +516,32 @@ mod tests {
             rule_index: None,
             class: None,
             upstream: HealthState::Down,
+            connect_ms: Some(0),
             duration_ms: 1,
             error: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_dial_that_was_made_reports_its_time_and_a_refusal_reports_none() {
+        let events = EventTx::default();
+        let mut queue = events.subscribe();
+        let ctx = ConnCtx {
+            rules: Arc::new(Ruleset::default()),
+            health: HealthHandle::default(),
+            upstream: NO_UPSTREAM,
+            events: events.clone(),
+        };
+        let host = Host("api.example.com".to_owned());
+
+        let mut attempted = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
+        attempted.dialled(Connect::Attempted(Duration::from_millis(41)));
+        attempted.ended(None);
+        let mut refused = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
+        refused.dialled(Connect::Refused);
+        refused.ended(None);
+
+        assert_eq!(queue.try_recv().unwrap().connect_ms, Some(41));
+        assert_eq!(queue.try_recv().unwrap().connect_ms, None);
     }
 }

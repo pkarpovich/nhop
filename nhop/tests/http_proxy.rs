@@ -7,12 +7,13 @@ use std::time::Duration;
 use nhop::proxy::{ConnCtx, EventTx, NextHop, http};
 use nhop::rules::{RuleClass, RuleKind, RuleValue, Ruleset};
 use nhop::upstream::HealthHandle;
-use nhop_ipc::{Command, ErrKind, Paths, Response};
+use nhop_ipc::{Command, ErrKind, EventView, Paths, Response};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
-use support::{DownHop, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
+use support::{DownHop, Refusal, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -50,6 +51,28 @@ fn require(value: &str) -> Ruleset {
         )
         .unwrap();
     rules
+}
+
+fn watched(rules: Ruleset, upstream: SocketAddr) -> (ConnCtx, mpsc::Receiver<EventView>) {
+    let events = EventTx::default();
+    let decisions = events.subscribe();
+    let ctx = ConnCtx {
+        rules: Arc::new(rules),
+        health: HealthHandle::default(),
+        upstream,
+        events,
+    };
+    (ctx, decisions)
+}
+
+async fn next_decision(decisions: &mut mpsc::Receiver<EventView>) -> EventView {
+    let Ok(published) = tokio::time::timeout(PATIENCE, decisions.recv()).await else {
+        panic!("the connection published no decision");
+    };
+    let Some(event) = published else {
+        panic!("the decision stream ended before the connection was routed");
+    };
+    event
 }
 
 async fn establish(front: SocketAddr, destination: SocketAddr) -> TcpStream {
@@ -316,13 +339,12 @@ async fn a_destination_that_refuses_the_dial_is_answered_with_502() {
 #[tokio::test]
 async fn a_require_rule_is_refused_with_502_while_the_upstream_is_down() {
     let upstream: SocketAddr = "192.0.2.10:1080".parse().unwrap();
-    let ctx = ConnCtx {
-        rules: Arc::new(require("example.com")),
-        health: HealthHandle::default(),
-        upstream,
-        events: EventTx::default(),
-    };
-    let front = serve_once(ctx, Arc::new(DownHop::new(upstream))).await;
+    let (ctx, mut decisions) = watched(require("example.com"), upstream);
+    let front = serve_once(
+        ctx,
+        Arc::new(DownHop::new(upstream, Refusal::BeforeDialling)),
+    )
+    .await;
 
     let answer = answer_of(front, "CONNECT example.com:443 HTTP/1.1\r\n\r\n").await;
 
@@ -331,6 +353,8 @@ async fn a_require_rule_is_refused_with_502_while_the_upstream_is_down() {
         answer.ends_with("nhop: upstream 192.0.2.10:1080 is down (require rule 0)"),
         "{answer}"
     );
+    let event = next_decision(&mut decisions).await;
+    assert_eq!(event.connect_ms, None, "{event:?}");
 }
 
 #[tokio::test]

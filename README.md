@@ -112,6 +112,52 @@ The origin therefore ends the answer by closing, rather than the proxy
 half-closing its write side - legal, but silently unanswered by some origins,
 Apple's timestamp service among them.
 
+## Long-lived connections
+
+Every socket the router relays a connection over carries TCP keepalive: 15
+seconds idle, 15 seconds between probes, 4 lost probes and the connection is
+declared dead - health probes are exempt, since they live milliseconds. 15
+seconds is what Go's dialer uses and sits well inside the safe band; Chrome does
+the same at 45 for its own direct sockets. What it buys differs per hop, and
+both halves are the point:
+
+- **direct connections** cross the home NAT, so the probes refresh the router's
+  mapping. Consumer routers drop idle established TCP long before the two hours
+  RFC 5382 asks of them - the network this was written for cuts at about 25
+  minutes - and a tunnel through nhop that sent no keepalive of its own died
+  there while the browser's direct sockets survived. With keepalive, idle
+  long-poll connections stop dying and the browser stops handing out dead
+  pooled tunnels.
+- **upstream connections** terminate on the LAN at the SOCKS5 proxy, so they
+  refresh no NAT mapping. What keepalive buys there is bounded dead-peer
+  detection: a powered-off proxy host surfaces in about 75 seconds instead of
+  hanging until the OS gives up, so descriptors stop piling up in dying states.
+  The hop onward from the proxy is beyond this router's reach.
+
+The client half is loopback and gets nothing - loopback cannot die silently.
+
+## The upstream verdict
+
+`up` or `down`, and everything `require` and `prefer` do hangs off it. A prober
+patrols the upstream every 5 seconds in **both** states, starting with a probe
+as soon as the daemon has an upstream address rather than after a first
+interval, so a proxy that went away is found by the prober and not by whichever
+connection dials next.
+
+A probe that disagrees with the live verdict does not move it. It opens a
+pending sequence, and a confirming probe a second later has to agree before the
+verdict changes; anything else discards the sequence - a probe agreeing with the
+current verdict, or a verdict moved by another path. That hysteresis is why one
+missed probe against a momentarily loaded proxy, a transient loss or the instant
+after the Mac wakes does not hard-refuse `require` traffic with 502, and why one
+stray answer while the proxy host boots does not declare the upstream alive. It
+is paid for in seconds: a verdict change lands within the probe interval plus
+the confirm delay plus two probe timeouts - about ten seconds against a host
+that black-holes, closer to six against one that refuses fast.
+
+A failed connection is not a probe. It is evidence a user already paid for, so
+it still flips the verdict down immediately, on one failure.
+
 ## Init file
 
 `~/.config/nhop/init` is the profile. The daemon runs it as a program at start
@@ -422,8 +468,15 @@ nhop logs --since 1h --json |
 ```
 
 Every decision event carries `host`, `port`, `decision`, `rule_index`, `class`,
-`upstream` (the health verdict at the time), `duration_ms` and `error`. Hostnames
-and ports only - no request bodies, headers or credentials are ever logged.
+`upstream` (the health verdict at the time), `connect_ms`, `duration_ms` and
+`error`. The two timings answer different questions: `connect_ms` is the dial
+alone, `duration_ms` the whole connection, so "slow to reach" and "held open for
+an hour" stop looking alike. `connect_ms` is absent only when nothing was
+dialled - a `require` refusal while the upstream is down - and present on a
+failed dial as well, so an attempt that cost two seconds before failing is still
+visible. The plain text form of `logs` and `tail` carries it too, as a
+`(dial 37ms)` suffix on the lifetime. Hostnames and ports only - no request
+bodies, headers or credentials are ever logged.
 
 The first line of a run is not a decision but the open-file limit the daemon
 raised itself to, as `open_files_soft` and `open_files_hard`. It is there because

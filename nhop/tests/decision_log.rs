@@ -97,6 +97,7 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
             rule_index,
             class,
             upstream,
+            connect_ms,
             duration_ms,
             error,
         } = event;
@@ -107,6 +108,10 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
         assert_eq!(class, None);
         assert_eq!(upstream, HealthState::Down);
         assert!(duration_ms < 60_000, "{duration_ms}");
+        let Some(connect_ms) = connect_ms else {
+            panic!("a direct connection dialled, so its dial time must be recorded");
+        };
+        assert!(connect_ms <= duration_ms, "{connect_ms} > {duration_ms}");
         assert_eq!(error, None);
     }
     assert_eq!(origin.connections(), 2);

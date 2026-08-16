@@ -36,14 +36,28 @@ pub async fn ask(socket_file: &Path, command: &Command) -> Result<Response, Unre
 
     let mut reader = BufReader::new(reader);
     let mut answer = String::new();
-    let read = reader
-        .read_line(&mut answer)
-        .await
-        .map_err(Unreachable::Io)?;
+    let read = read_or_hangup(reader.read_line(&mut answer).await)?;
     if read == 0 {
         return Err(Unreachable::Closed);
     }
     serde_json::from_str(&answer).map_err(Unreachable::Malformed)
+}
+
+/// Folds a reset read into the end of file it stands for.
+///
+/// A peer that closes the socket while bytes it never read are still queued makes the next read
+/// fail with `ConnectionReset` rather than return zero - which is what a daemon shutting down on a
+/// command it never answered does. Both are the same event, and reporting one of them as a raw
+/// errno tells the caller nothing the other does not.
+pub(crate) fn read_or_hangup(read: io::Result<usize>) -> Result<usize, Unreachable> {
+    let failure = match read {
+        Ok(read) => return Ok(read),
+        Err(failure) => failure,
+    };
+    match failure.kind() {
+        io::ErrorKind::ConnectionReset => Ok(0),
+        _ => Err(Unreachable::Io(failure)),
+    }
 }
 
 /// Opens the IPC socket, naming an absent daemon rather than the errno behind it.
@@ -103,6 +117,23 @@ mod tests {
             panic!("a dead socket must report an absent daemon: {failure}");
         };
         assert_eq!(named, socket_file);
+    }
+
+    #[test]
+    fn a_reset_read_counts_as_the_hang_up_it_is() {
+        let read = read_or_hangup(Err(io::Error::from(io::ErrorKind::ConnectionReset)));
+
+        assert_eq!(read.unwrap(), 0);
+    }
+
+    #[test]
+    fn any_other_read_failure_is_still_reported_as_itself() {
+        let read = read_or_hangup(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+
+        let Err(Unreachable::Io(failure)) = read else {
+            panic!("a read that did not hang up must carry its own error");
+        };
+        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]

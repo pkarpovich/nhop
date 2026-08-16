@@ -222,24 +222,42 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 - Modify: `Cargo.toml` (workspace deps), `nhop/Cargo.toml`
 - Modify: `nhop/src/upstream/mod.rs`
 
-- [ ] add `socket2` with the `all` feature to the workspace and crate manifests
-- [ ] add the three keepalive constants and `keep_alive(&TcpStream)` with a doc
+- [x] add `socket2` with the `all` feature to the workspace and crate manifests
+- [x] add the three keepalive constants and `keep_alive(&TcpStream)` with a doc
       comment carrying the why: NAT-mapping refresh for `direct()` (RFC 6202
       §5.5 band; Chrome 45s / Go 15s precedent) and bounded dead-peer detection
       for `through()`, whose socket stays on the LAN
-- [ ] apply it in `direct()` and `through()` before the stream is returned,
+- [x] apply it in `direct()` and `through()` before the stream is returned,
       warning without failing the dial when the syscall errors; leave `probe()`
       untouched (probe connections live milliseconds)
-- [ ] write a test: a stream from `direct()` against a local listener reads back
+- [x] write a test: a stream from `direct()` against a local listener reads back
       `keepalive() == true`, `tcp_keepalive_interval() == KEEPALIVE_INTERVAL`
       and `tcp_keepalive_retries() == KEEPALIVE_RETRIES` through `SockRef`
-- [ ] write a test: the same four-value read-back on the stream returned by
+      (`a_direct_socket_carries_keepalive`)
+- [x] write a test: the same four-value read-back on the stream returned by
       `through()` against the in-module SOCKS stub, proving `into_inner()` does
       not drop the options
-- [ ] cover the idle time too: assert `tcp_keepalive_time() == KEEPALIVE_IDLE`
+      (`an_upstream_socket_carries_keepalive_through_into_inner`, against a new
+      `GRANTED` reply constant)
+- [x] cover the idle time too: assert `tcp_keepalive_time() == KEEPALIVE_IDLE`
       where the getter exists on macOS; if it does not, state that in this file
       and assert the two available timers instead - do not silently skip it
-- [ ] run `mise run check` - must pass before task 2
+      - the getter **does** exist on macOS: socket2 0.6.5 gates
+        `Socket::tcp_keepalive_time` on `all(feature = "all", not(any(windows,
+        haiku, openbsd, vita)))`, so all four values are asserted
+- [x] run `mise run check` - must pass before task 2
+      - ➕ `set_tcp_keepalive` does **not** set `SO_KEEPALIVE` on unix (checked
+        against socket2 0.6.5 `sys/unix.rs`), so `keep_alive` calls
+        `set_keepalive(true)` first - without it `keepalive()` reads back false
+        and no probe is ever sent
+      - ⚠️ three pre-existing failures in this Linux dev container, unrelated to
+        this task and present on the base commit as well:
+        `cli::client::tests::a_daemon_that_hangs_up_reports_a_closed_connection`,
+        `cli::tail::tests::every_published_decision_is_printed_until_the_daemon_hangs_up`,
+        `cli::tail::tests::the_human_form_prints_one_text_line_per_decision`
+        (unix-socket hang-up surfaces as ECONNRESET rather than EOF). fmt,
+        clippy and every other target are green; 246 pass here against 244 on
+        the base commit
 
 ### Task 2: patrol prober with immediate start and two-probe hysteresis
 
@@ -250,55 +268,87 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
   three call sites gain the fourth argument)
 - Modify: `nhop/tests/support/mod.rs` (`StubSocks5` gains the client-dial view)
 
-- [ ] replace `probe_while_down` with `patrol`: probe first, sleep after, probe
+- [x] replace `probe_while_down` with `patrol`: probe first, sleep after, probe
       in both verdict states every `interval`
-- [ ] implement the pending-sequence rule: a contradicting probe records the
+- [x] implement the pending-sequence rule: a contradicting probe records the
       target state and the baseline verdict and schedules a confirming probe
       after `confirm_delay`; the verdict moves only on a second probe agreeing
       with that target; an agreeing probe or any verdict change from another
       path discards the sequence
-- [ ] do not sleep a full interval while the snapshot is `NO_UPSTREAM` -
+      - the rule lives in `advance(pending, seen, &health) -> Option<Pending>`,
+        a pure fold the loop calls with each observation; the sleep that
+        follows is `confirm_delay` while a sequence is open and `interval`
+        otherwise
+- [x] do not sleep a full interval while the snapshot is `NO_UPSTREAM` -
       re-check on a short tick so the address published by the first init load
       is probed promptly
-- [ ] keep the dial-failure path flipping Down on one failure, and keep the
+      - ➕ the tick is a private `NO_UPSTREAM_TICK` = 250ms, taken as
+        `NO_UPSTREAM_TICK.min(interval)` so a test running on a shorter
+        interval than the tick is not slowed down by it
+- [x] keep the dial-failure path flipping Down on one failure, and keep the
       "any SOCKS reply counts as serving" classification in `probe()` untouched
-- [ ] thread `confirm_delay` through `UpstreamHop::start` and update all five
+- [x] thread `confirm_delay` through `UpstreamHop::start` and update all five
       call sites; production passes `PROBE_CONFIRM_DELAY`, test helpers pass a
       long delay by default
-- [ ] add a client-dial view to `StubSocks5` that excludes self-addressed probe
+- [x] add a client-dial view to `StubSocks5` that excludes self-addressed probe
       CONNECTs
-- [ ] replace `no_probe_is_sent_while_the_verdict_is_up` with its inverse: a
+- [x] replace `no_probe_is_sent_while_the_verdict_is_up` with its inverse: a
       probe IS sent while the verdict is Up
-- [ ] relax `the_verdict_flips_up_once_the_upstream_answers_a_probe` to expect
+- [x] relax `the_verdict_flips_up_once_the_upstream_answers_a_probe` to expect
       at least two probes, all aimed at the upstream's own address
-- [ ] rework the three request-counting tests onto the client-dial view:
+- [x] rework the three request-counting tests onto the client-dial view:
       `a_require_rule_travels_through_the_upstream_as_the_name_the_client_wrote`
       and `a_prefer_rule_travels_through_the_upstream_while_the_verdict_is_up`
       assert the user dial is present without asserting it is the only request;
       restate `a_down_verdict_reaches_no_upstream_at_all` as "no client dial
       reaches the upstream while Down" - keeping, in all three, the guarantee
       that a require rule never reaches the destination directly
-- [ ] write a test: cold start against a healthy stub reaches Up shortly after
+      - renamed to `no_client_dial_reaches_the_upstream_while_the_verdict_is_down`
+- [x] write a test: cold start against a healthy stub reaches Up shortly after
       `confirm_delay`, without waiting out an interval
-- [ ] write a test: starting from `LiveUpstream::default()` and publishing the
+      (`a_cold_start_reaches_up_shortly_after_the_confirm_delay`, interval
+      `PATIENT`, so an interval wait could only fail it)
+- [x] write a test: starting from `LiveUpstream::default()` and publishing the
       stub afterwards still reaches Up well inside `PROBE_INTERVAL` (this is the
       daemon's real startup order; the test must be able to fail if the
       `NO_UPSTREAM` tick is missing)
-- [ ] write a test: a stub answering exactly once never flips the verdict Up
-- [ ] write a test: verdict Up, stub gone, verdict reaches Down within
+      - ➕ the test has to let the patrol task poll once *before* publishing,
+        or the spawned task reads the address on its first iteration and the
+        `NO_UPSTREAM` branch is never taken - the first draft passed with the
+        tick removed. Verified by mutation: with the branch sleeping a full
+        interval the test now fails at its 2s budget
+- [x] write a test: a stub answering exactly once never flips the verdict Up
+- [x] write a test: verdict Up, stub gone, verdict reaches Down within
       `interval + confirm_delay + 2 * PROBE_TIMEOUT`
-- [ ] write a test: a live stub that misses one probe and answers the next
+- [x] write a test: a live stub that misses one probe and answers the next
       leaves the verdict Up, so no `require` connection is refused
-- [ ] write a test for the baseline rule: bank a contradicting probe against Up,
+- [x] write a test for the baseline rule: bank a contradicting probe against Up,
       flip the verdict Down through a dial failure mid-sequence, then let a
       *successful* confirming probe land - the verdict must stay Down until a
       second agreeing probe
-- [ ] add a stub that accepts and withholds its SOCKS reply, so the
+      - verified by mutation: with `advance` accepting any pending sequence
+        instead of one whose target and baseline still match, this is the only
+        test in the tree that fails
+- [x] add a stub that accepts and withholds its SOCKS reply, so the
       `PROBE_TIMEOUT` path is exercised rather than only the fast-RST one
-- [ ] leave the in-module closed-port hops (`upstream/mod.rs:337-346`) asserting
+      - ➕ done as `Answers` on `StubSocks5` rather than a fourth stub type:
+        `Always`, `Once`, `AfterOneDrop`, `Never`. The three new upstream
+        behaviours the tests need are one enum on the stub that already exists,
+        and `Never` is the withheld-reply one
+      - the mute test asserts both halves: at least `2 * PROBE_TIMEOUT` elapsed
+        (so the timeout path really ran) and Down inside the stated budget plus
+        a 500ms `GRACE`, since the worst case is exactly the budget
+- [x] leave the in-module closed-port hops (`upstream/mod.rs:337-346`) asserting
       Up: one failing probe no longer flips anything, and their helper passes a
       long `confirm_delay`, so no confirming probe fires inside the test body
-- [ ] run `mise run check` - must pass before task 3
+- [x] run `mise run check` - must pass before task 3
+      - ⚠️ fmt, clippy and every other target green; the same three
+        pre-existing container failures from task 1
+        (`cli::client::tests::a_daemon_that_hangs_up_reports_a_closed_connection`
+        and the two `cli::tail` ones) still fail here and abort the lib target,
+        so the integration targets were run separately with
+        `cargo test --tests --no-fail-fast`: all green, 15/15 in
+        `upstream_dialer`
 
 ### Task 3: connect_ms in the decision event
 
@@ -311,28 +361,60 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 - Modify: `nhop/tests/support/mod.rs` (`StubHop` and `DownHop` implement
   `NextHop`, so they move with the dial-result shape)
 
-- [ ] add `connect_ms: Option<u64>` (`#[serde(default)]`, doc comment) to
+- [x] add `connect_ms: Option<u64>` (`#[serde(default)]`, doc comment) to
       `EventView`
-- [ ] give `NextHop::dial` a result that distinguishes `Refused` from
+- [x] give `NextHop::dial` a result that distinguishes `Refused` from
       `Attempted(Duration)`, time the await inside `relay(..)` in both serve
       paths, and carry the outcome to `Routed`; record in this plan how it
       travels across the `relay` boundary
-- [ ] update **every** `EventView` literal and destructure in the tree - all ten
+      - the trait returns `proxy::Dialled` - `Refused(io::Error)` against
+        `Attempted(io::Result<TcpStream>)` - and the duration is never in that
+        type, because only the caller can time the await. `Dialled::timed(took)`
+        folds the two into `(Connect, io::Result<TcpStream>)`, where
+        `Connect::Refused` / `Connect::Attempted(Duration)` is the reportable
+        form
+      - it travels across the `relay` boundary as a `&mut Routed` argument:
+        `serve` builds the `Routed` as before and hands it to `relay`, which
+        calls `routed.dialled(connect)` the moment the dial returns. No return
+        value or out-parameter, so a `relay` that fails later still leaves the
+        dial time recorded
+- [x] update **every** `EventView` literal and destructure in the tree - all ten
       files above - without introducing `..` rest patterns
-- [ ] add the field to the test-side `deny_unknown_fields` struct in
+- [x] add the field to the test-side `deny_unknown_fields` struct in
       `logging.rs` so the emitted line still parses
-- [ ] render the dial time in the human `tail`/`logs` line when present
-- [ ] write tests: JSON round-trip with and without `connect_ms`, proving an old
+- [x] render the dial time in the human `tail`/`logs` line when present
+      - as a ` (dial 37ms)` suffix on the lifetime, so a line without the field
+        renders exactly as it did before
+- [x] write tests: JSON round-trip with and without `connect_ms`, proving an old
       log line still parses
-- [ ] write a test that separates the two timings: hold an established tunnel
+      (`a_dial_time_round_trips`, `an_absent_dial_time_round_trips`,
+      `a_line_written_before_the_dial_time_existed_still_parses`)
+- [x] write a test that separates the two timings: hold an established tunnel
       open well past a quick dial, then assert `duration_ms` covers the hold
       while `connect_ms` does not
-- [ ] write tests for the two absent/present cases: a `require` refusal while
+      (`the_dial_time_covers_the_dial_alone_while_the_duration_covers_the_whole_connection`)
+- [x] write tests for the two absent/present cases: a `require` refusal while
       the verdict is Down reports `None`; an attempted dial that fails
       **upstream-side** (so it surfaces as `UpstreamDown`, the same error the
       refusal produces) reports `Some` - this is the test that catches the
       banned `UpstreamDown`-means-`None` shortcut
-- [ ] run `mise run check` - must pass before task 4
+      - ➕ `DownHop` gained a `Refusal` enum (`BeforeDialling` /
+        `AfterDialling(Duration)`) rather than a second stub type: both arms
+        answer the client with the same `0x04` reply and the same
+        `UpstreamDown` error, so `a_require_refusal_reports_no_dial_time` and
+        `a_dial_that_failed_upstream_side_still_reports_what_it_cost` differ
+        only in the `Dialled` variant
+      - verified by mutation: with `Dialled::timed` reporting
+        `Connect::Attempted` for a refusal, the refusal test is the one that
+        fails
+      - the two upstream-side halves are pinned at the dial site as well
+        (`a_require_refusal_reports_that_nothing_was_dialled`,
+        `a_require_dial_that_fails_upstream_side_still_reports_an_attempt`)
+- [x] run `mise run check` - must pass before task 4
+      - ⚠️ fmt and clippy green; the same three pre-existing container failures
+        from tasks 1 and 2 still abort the lib target, so the integration
+        targets were run with `cargo test --tests --no-fail-fast`: all green,
+        250 lib tests pass against 246 before this task
 
 ### Task 4: version bump and documentation
 
@@ -340,30 +422,94 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 - Modify: `Cargo.toml` (+ `Cargo.lock` via cargo)
 - Modify: `README.md`, `CLAUDE.md`
 
-- [ ] bump the workspace version 0.1.2 -> 0.1.3
-- [ ] README: document keepalive on relayed sockets with the split benefit
+- [x] bump the workspace version 0.1.2 -> 0.1.3
+      - `Cargo.lock` refreshed with `cargo update -w --offline`, which rewrites
+        both member entries and nothing else
+- [x] README: document keepalive on relayed sockets with the split benefit
       (NAT refresh for direct, dead-peer detection for upstream), the patrol
       lifecycle (immediate first probe, two-probe hysteresis both ways, dial
       failures still immediate), and `connect_ms` in the log-fields list of
       "Agent-friendly by design"
-- [ ] CLAUDE.md: update the upstream invariant and add the relay-keepalive
+      - two new sections between "Limits" and "Init file": "Long-lived
+        connections" (the split benefit) and "The upstream verdict" (the patrol
+        lifecycle), so the transport story sits with the other behaviour prose
+        rather than inside the install steps
+- [x] CLAUDE.md: update the upstream invariant and add the relay-keepalive
       transport contract to the invariants list
-- [ ] run `mise run check` - must pass before task 5
+      - the existing "only an upstream failure flips the verdict down" line
+        stays as it is and two invariants follow it: the patrol with its
+        recorded target and baseline, and keepalive on both dial sites with
+        probe sockets exempt
+- [x] run `mise run check` - must pass before task 5
+      - ⚠️ fmt and clippy green, every integration target green (58 tests via
+        `cargo test --tests --no-fail-fast`); the same three pre-existing
+        container failures from tasks 1-3 still abort the lib target
+        (`cli::client::tests::a_daemon_that_hangs_up_reports_a_closed_connection`
+        and the two `cli::tail` ones), 250 lib tests pass beside them
 
 ### Task 5: verify acceptance criteria
 
-- [ ] all three Overview defects addressed: keepalive options readable off both
+- [x] all three Overview defects addressed: keepalive options readable off both
       dial sites' sockets, patrol probing both states with hysteresis,
       `connect_ms` present in JSON and human output
-- [ ] wire compat verified: old log lines parse, `--json` consumers see only an
+      - defect 1: `a_direct_socket_carries_keepalive` and
+        `an_upstream_socket_carries_keepalive_through_into_inner` both read all
+        four values back through `SockRef` and pass; `probe()` is untouched
+      - defect 2: `patrol` with `advance(pending, seen, &health)` and the
+        `NO_UPSTREAM_TICK` branch, covered by 15 green tests in
+        `upstream_dialer.rs` including both hysteresis directions, the
+        mid-sequence baseline case and the cold-start pair
+      - defect 3: `EventView.connect_ms` is emitted by `logging.rs:85`, rendered
+        as ` (dial Nms)` by `cli/mod.rs:929` and sourced from `Connect` at
+        `proxy/mod.rs:304`
+- [x] wire compat verified: old log lines parse, `--json` consumers see only an
       added optional field
-- [ ] no test in the tree still asserts a retired invariant
-- [ ] full gate: `mise run check`
+      - the field is `Option<u64>` behind `#[serde(default)]`, so it is purely
+        additive; `a_line_written_before_the_dial_time_existed_still_parses`
+        (`nhop-ipc/src/view.rs:264`) and the `logging.rs` `deny_unknown_fields`
+        round-trip pin both halves
+- [x] no test in the tree still asserts a retired invariant
+      - `no_probe_is_sent_while_the_verdict_is_up`,
+        `a_down_verdict_reaches_no_upstream_at_all` and `probe_while_down` have
+        no occurrence left outside this plan file; the three request-counting
+        tests read `client_dials()`, and the two `requests()` assertions left in
+        `acceptance.rs` are against `StubHop`-shaped upstreams that see no
+        probe, and pass
+- [x] full gate: `mise run check`
+      - fmt and clippy green; `cargo test` reports 250 lib pass beside the same
+        three container failures carried since task 1, and every other target
+        green (`cargo test --tests --no-fail-fast`: acceptance 4, decision_log
+        1, http_proxy 14, init_run 4, logs_follow 2, packaging 3, socks5_proxy
+        13, tail_stream 2, upstream_dialer 15, nhop-ipc 23)
+      - the "pre-existing" claim is now measured rather than asserted: the three
+        failures reproduce identically on the base commit `3a0c788` in a
+        throwaway worktree, before a line of this branch's code exists. They are
+        this Linux container answering ECONNRESET where macOS gives EOF on a
+        unix-socket hang-up, so CI on macOS is unaffected
 
 ### Task 6: [Final] close out the plan
 
-- [ ] re-read the README/CLAUDE.md deltas against the final code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] re-read the README/CLAUDE.md deltas against the final code
+      - every number in the prose is the constant that shipped: keepalive 15s
+        idle / 15s interval / 4 retries (`upstream/mod.rs:42-48`), so README's
+        "about 75 seconds" is `KEEPALIVE_IDLE + KEEPALIVE_RETRIES *
+        KEEPALIVE_INTERVAL` and matches `keep_alive`'s own doc comment;
+        `PROBE_INTERVAL` 5s + `PROBE_CONFIRM_DELAY` 1s + `2 * PROBE_TIMEOUT` 2s
+        is README's "about ten seconds ... closer to six against one that
+        refuses fast"
+      - README's field list for a decision event is in the emission order of
+        `logging::decision` (`logging.rs:78-88`), `connect_ms` between
+        `upstream` and `duration_ms`
+      - README's "`connect_ms` is absent only when nothing was dialled" is
+        exact: `Routed::connect` starts `None` but `relay(..)` calls
+        `routed.dialled(connect)` on the line after the dial in both front ends
+        (`http.rs:195`, `socks5.rs:110`) before any early return, so the only
+        `None` a live connection can produce is `Connect::Refused`
+      - CLAUDE.md's two new invariants read true against `patrol`/`advance`
+        (`upstream/mod.rs:314-358`) and against the `keep_alive` call sites in
+        `direct()` and `through()` with `probe()` untouched
+      - no prose drifted; no correction needed
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

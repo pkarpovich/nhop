@@ -174,6 +174,13 @@ pub struct EventView {
     pub class: Option<RuleClass>,
     /// Upstream verdict at the time of the decision.
     pub upstream: HealthState,
+    /// How long the dial phase took, absent when no dial was attempted.
+    ///
+    /// A `require` rule refused while the verdict is down never touches the network, so it reports
+    /// nothing; a dial that was made reports its time whether or not it produced a connection.
+    /// Absent as well on a line written before the field existed.
+    #[serde(default)]
+    pub connect_ms: Option<u64>,
     /// How long the connection lasted.
     pub duration_ms: u64,
     /// Why the connection ended badly, absent when it did not.
@@ -220,6 +227,48 @@ mod tests {
             serde_json::to_string(&decision).unwrap(),
             r#"{"decision":"direct","rule_index":null,"class":null,"next_hop":"example.com:443"}"#
         );
+    }
+
+    fn routed() -> EventView {
+        EventView {
+            host: Host("api.example.com".to_owned()),
+            port: Port(443),
+            decision: DecisionKind::Upstream,
+            rule_index: Some(2),
+            class: Some(RuleClass::Require),
+            upstream: HealthState::Up,
+            connect_ms: Some(37),
+            duration_ms: 1_204,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_dial_time_round_trips() {
+        let event = routed();
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(wire.contains(r#""connect_ms":37"#), "{wire}");
+        assert_eq!(serde_json::from_str::<EventView>(&wire).unwrap(), event);
+    }
+
+    #[test]
+    fn an_absent_dial_time_round_trips() {
+        let mut event = routed();
+        event.connect_ms = None;
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(wire.contains(r#""connect_ms":null"#), "{wire}");
+        assert_eq!(serde_json::from_str::<EventView>(&wire).unwrap(), event);
+    }
+
+    #[test]
+    fn a_line_written_before_the_dial_time_existed_still_parses() {
+        let wire = r#"{"host":"api.example.com","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","duration_ms":1204,"error":null}"#;
+
+        let event: EventView = serde_json::from_str(wire).unwrap();
+
+        let mut expected = routed();
+        expected.connect_ms = None;
+        assert_eq!(event, expected);
     }
 
     #[test]
