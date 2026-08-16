@@ -491,6 +491,8 @@ mod tests {
                         return;
                     };
                     let _answered = stream.write_all(&reply).await;
+                    let mut carried = Vec::new();
+                    let _relayed = stream.read_to_end(&mut carried).await;
                 });
             }
         });
