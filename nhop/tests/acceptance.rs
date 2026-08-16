@@ -156,6 +156,7 @@ fn same_decision(asked: &DecisionView, routed: &EventView) {
         rule_index: taken_index,
         class: taken_class,
         upstream: _,
+        connect_ms: _,
         duration_ms: _,
         error: _,
     } = routed;

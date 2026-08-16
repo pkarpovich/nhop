@@ -312,6 +312,7 @@ mod tests {
                 rule_index: None,
                 class: None,
                 upstream: HealthState::Up,
+                connect_ms: Some(4),
                 duration_ms: 12,
                 error: Some("reset by peer".to_owned()),
             }),

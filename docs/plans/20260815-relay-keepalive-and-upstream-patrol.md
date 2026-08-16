@@ -361,28 +361,60 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 - Modify: `nhop/tests/support/mod.rs` (`StubHop` and `DownHop` implement
   `NextHop`, so they move with the dial-result shape)
 
-- [ ] add `connect_ms: Option<u64>` (`#[serde(default)]`, doc comment) to
+- [x] add `connect_ms: Option<u64>` (`#[serde(default)]`, doc comment) to
       `EventView`
-- [ ] give `NextHop::dial` a result that distinguishes `Refused` from
+- [x] give `NextHop::dial` a result that distinguishes `Refused` from
       `Attempted(Duration)`, time the await inside `relay(..)` in both serve
       paths, and carry the outcome to `Routed`; record in this plan how it
       travels across the `relay` boundary
-- [ ] update **every** `EventView` literal and destructure in the tree - all ten
+      - the trait returns `proxy::Dialled` - `Refused(io::Error)` against
+        `Attempted(io::Result<TcpStream>)` - and the duration is never in that
+        type, because only the caller can time the await. `Dialled::timed(took)`
+        folds the two into `(Connect, io::Result<TcpStream>)`, where
+        `Connect::Refused` / `Connect::Attempted(Duration)` is the reportable
+        form
+      - it travels across the `relay` boundary as a `&mut Routed` argument:
+        `serve` builds the `Routed` as before and hands it to `relay`, which
+        calls `routed.dialled(connect)` the moment the dial returns. No return
+        value or out-parameter, so a `relay` that fails later still leaves the
+        dial time recorded
+- [x] update **every** `EventView` literal and destructure in the tree - all ten
       files above - without introducing `..` rest patterns
-- [ ] add the field to the test-side `deny_unknown_fields` struct in
+- [x] add the field to the test-side `deny_unknown_fields` struct in
       `logging.rs` so the emitted line still parses
-- [ ] render the dial time in the human `tail`/`logs` line when present
-- [ ] write tests: JSON round-trip with and without `connect_ms`, proving an old
+- [x] render the dial time in the human `tail`/`logs` line when present
+      - as a ` (dial 37ms)` suffix on the lifetime, so a line without the field
+        renders exactly as it did before
+- [x] write tests: JSON round-trip with and without `connect_ms`, proving an old
       log line still parses
-- [ ] write a test that separates the two timings: hold an established tunnel
+      (`a_dial_time_round_trips`, `an_absent_dial_time_round_trips`,
+      `a_line_written_before_the_dial_time_existed_still_parses`)
+- [x] write a test that separates the two timings: hold an established tunnel
       open well past a quick dial, then assert `duration_ms` covers the hold
       while `connect_ms` does not
-- [ ] write tests for the two absent/present cases: a `require` refusal while
+      (`the_dial_time_covers_the_dial_alone_while_the_duration_covers_the_whole_connection`)
+- [x] write tests for the two absent/present cases: a `require` refusal while
       the verdict is Down reports `None`; an attempted dial that fails
       **upstream-side** (so it surfaces as `UpstreamDown`, the same error the
       refusal produces) reports `Some` - this is the test that catches the
       banned `UpstreamDown`-means-`None` shortcut
-- [ ] run `mise run check` - must pass before task 4
+      - ➕ `DownHop` gained a `Refusal` enum (`BeforeDialling` /
+        `AfterDialling(Duration)`) rather than a second stub type: both arms
+        answer the client with the same `0x04` reply and the same
+        `UpstreamDown` error, so `a_require_refusal_reports_no_dial_time` and
+        `a_dial_that_failed_upstream_side_still_reports_what_it_cost` differ
+        only in the `Dialled` variant
+      - verified by mutation: with `Dialled::timed` reporting
+        `Connect::Attempted` for a refusal, the refusal test is the one that
+        fails
+      - the two upstream-side halves are pinned at the dial site as well
+        (`a_require_refusal_reports_that_nothing_was_dialled`,
+        `a_require_dial_that_fails_upstream_side_still_reports_an_attempt`)
+- [x] run `mise run check` - must pass before task 4
+      - ⚠️ fmt and clippy green; the same three pre-existing container failures
+        from tasks 1 and 2 still abort the lib target, so the integration
+        targets were run with `cargo test --tests --no-fail-fast`: all green,
+        250 lib tests pass against 246 before this task
 
 ### Task 4: version bump and documentation
 

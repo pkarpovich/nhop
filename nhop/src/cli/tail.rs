@@ -112,6 +112,7 @@ mod tests {
             rule_index: Some(2),
             class: None,
             upstream: HealthState::Up,
+            connect_ms: None,
             duration_ms: 9,
             error: None,
         }

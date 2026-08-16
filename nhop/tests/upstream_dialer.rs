@@ -1,14 +1,15 @@
 mod support;
 
+use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use nhop::daemon::state::LiveUpstream;
-use nhop::proxy::{NextHop, UpstreamDown};
+use nhop::proxy::{Dialled, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleClass, RuleId};
 use nhop::upstream::{HealthHandle, PROBE_INTERVAL, PROBE_TIMEOUT, UpstreamHop};
 use nhop_ipc::{HealthState, Host, Port};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use support::{Answers, SocksRequest, StubOrigin, StubSocks5, ephemeral};
 
@@ -32,6 +33,22 @@ fn verdict(state: HealthState) -> HealthHandle {
 
 fn hop(upstream: SocketAddr, state: HealthState) -> UpstreamHop {
     UpstreamHop::start(published(upstream), verdict(state), PATIENT, PATIENT)
+}
+
+/// Dials through the hop, keeping only whether a connection came back.
+///
+/// Whether the network was touched is asserted where it is the point, so every other test reads
+/// the dial as the plain result it used to be.
+async fn dial(
+    hop: &UpstreamHop,
+    host: &Host,
+    port: Port,
+    decision: Decision,
+) -> io::Result<TcpStream> {
+    match hop.dial(host, port, decision).await {
+        Dialled::Refused(failure) => Err(failure),
+        Dialled::Attempted(next) => next,
+    }
 }
 
 async fn closed_port() -> SocketAddr {
@@ -79,7 +96,7 @@ async fn a_prefer_rule_reaches_the_destination_while_the_upstream_is_closed() {
     let hop = hop(upstream, HealthState::Up);
     let (host, port) = named(origin.addr());
 
-    let dialled = hop.dial(&host, port, prefer(1)).await.unwrap();
+    let dialled = dial(&hop, &host, port, prefer(1)).await.unwrap();
 
     assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
     assert_eq!(hop.health().state(), HealthState::Down);
@@ -92,7 +109,7 @@ async fn a_require_rule_is_refused_while_the_upstream_is_closed() {
     let hop = hop(upstream, HealthState::Up);
     let (host, port) = named(origin.addr());
 
-    let failure = hop.dial(&host, port, require(2)).await.unwrap_err();
+    let failure = dial(&hop, &host, port, require(2)).await.unwrap_err();
 
     let Some(down) = UpstreamDown::carried_by(&failure) else {
         panic!("a require rule must be refused with the upstream-down surface: {failure}");
@@ -110,8 +127,7 @@ async fn a_require_rule_travels_through_the_upstream_as_the_name_the_client_wrot
     let stub = StubSocks5::start().await;
     let hop = hop(stub.addr(), HealthState::Up);
 
-    let dialled = hop
-        .dial(&Host("example.com".to_owned()), Port(443), require(0))
+    let dialled = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
         .await
         .unwrap();
 
@@ -132,8 +148,7 @@ async fn a_prefer_rule_travels_through_the_upstream_while_the_verdict_is_up() {
     let stub = StubSocks5::start().await;
     let hop = hop(stub.addr(), HealthState::Up);
 
-    let dialled = hop
-        .dial(&Host("example.net".to_owned()), Port(80), prefer(0))
+    let dialled = dial(&hop, &Host("example.net".to_owned()), Port(80), prefer(0))
         .await
         .unwrap();
 
@@ -156,9 +171,11 @@ async fn no_client_dial_reaches_the_upstream_while_the_verdict_is_down() {
     let (host, port) = named(origin.addr());
 
     let refused = hop.dial(&host, port, require(0)).await;
-    let dialled = hop.dial(&host, port, prefer(1)).await.unwrap();
+    let dialled = dial(&hop, &host, port, prefer(1)).await.unwrap();
 
-    assert!(refused.is_err(), "a require rule must be refused");
+    let Dialled::Refused(_refusal) = refused else {
+        panic!("a require rule must be refused before the network");
+    };
     assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
     assert_eq!(stub.client_dials(), Vec::new());
 }
@@ -304,8 +321,7 @@ async fn one_missed_probe_leaves_the_verdict_up() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert_eq!(health.state(), HealthState::Up);
-    let dialled = hop
-        .dial(&Host("example.com".to_owned()), Port(443), require(0))
+    let dialled = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
         .await
         .unwrap();
     assert_eq!(dialled.peer_addr().unwrap(), stub.addr());
@@ -325,8 +341,7 @@ async fn a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes() {
     );
 
     live.publish(closed_port().await);
-    let failure = hop
-        .dial(&Host("example.com".to_owned()), Port(443), require(0))
+    let failure = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
         .await
         .unwrap_err();
     assert!(
@@ -355,8 +370,7 @@ async fn a_dial_to_a_black_holed_upstream_fails_within_three_seconds() {
     let hop = hop(blackhole, HealthState::Up);
     let started = Instant::now();
 
-    let failure = hop
-        .dial(&Host("example.com".to_owned()), Port(443), require(0))
+    let failure = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
         .await
         .unwrap_err();
 

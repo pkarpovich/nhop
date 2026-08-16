@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_socks::tcp::Socks5Stream;
 
 use crate::daemon::state::LiveUpstream;
-use crate::proxy::{NO_UPSTREAM, NextHop, UpstreamDown};
+use crate::proxy::{Dialled, NO_UPSTREAM, NextHop, UpstreamDown};
 use crate::rules::{Decision, RuleId};
 
 /// How long a dial through the upstream may take before it counts as a failure.
@@ -99,38 +99,37 @@ impl UpstreamHop {
         &self.health
     }
 
-    async fn routed(
-        &self,
-        host: &Host,
-        port: Port,
-        class: RuleClass,
-        rule: RuleId,
-    ) -> io::Result<TcpStream> {
+    async fn routed(&self, host: &Host, port: Port, class: RuleClass, rule: RuleId) -> Dialled {
         let upstream = self.upstream.snapshot();
         match class {
-            RuleClass::Never => direct(host, port).await,
+            RuleClass::Never => Dialled::Attempted(direct(host, port).await),
             RuleClass::Require => self.required(host, port, rule, upstream).await,
-            RuleClass::Prefer => self.preferred(host, port, upstream).await,
+            RuleClass::Prefer => Dialled::Attempted(self.preferred(host, port, upstream).await),
         }
     }
 
+    /// Dials a `require` destination, refusing before the network while the verdict is down.
+    ///
+    /// The refusal and a dial that failed upstream-side carry the same [`UpstreamDown`] surface on
+    /// purpose - a `require` rule has one meaning for the client either way - so the two are told
+    /// apart by the [`Dialled`] variant rather than by the error inside it.
     async fn required(
         &self,
         host: &Host,
         port: Port,
         rule: RuleId,
         upstream: SocketAddr,
-    ) -> io::Result<TcpStream> {
+    ) -> Dialled {
         match self.health.state() {
-            HealthState::Down => Err(UpstreamDown::new(upstream, rule).into()),
-            HealthState::Up => match through(host, port, upstream).await {
+            HealthState::Down => Dialled::Refused(UpstreamDown::new(upstream, rule).into()),
+            HealthState::Up => Dialled::Attempted(match through(host, port, upstream).await {
                 Ok(next) => Ok(next),
                 Err(DialFailure::Destination(failure)) => Err(failure),
                 Err(DialFailure::Upstream(_failure)) => {
                     self.health.set(HealthState::Down);
                     Err(UpstreamDown::new(upstream, rule).into())
                 }
-            },
+            }),
         }
     }
 
@@ -169,11 +168,11 @@ impl NextHop for UpstreamHop {
         host: &'a Host,
         port: Port,
         decision: Decision,
-    ) -> Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Dialled> + Send + 'a>> {
         Box::pin(async move {
             match decision {
-                Decision::Direct => direct(host, port).await,
-                Decision::Never { rule: _ } => direct(host, port).await,
+                Decision::Direct => Dialled::Attempted(direct(host, port).await),
+                Decision::Never { rule: _ } => Dialled::Attempted(direct(host, port).await),
                 Decision::Upstream { class, rule } => self.routed(host, port, class, rule).await,
             }
         })
@@ -407,6 +406,18 @@ mod tests {
         }
     }
 
+    async fn dial(
+        hop: &UpstreamHop,
+        host: &Host,
+        port: Port,
+        decision: Decision,
+    ) -> io::Result<TcpStream> {
+        match hop.dial(host, port, decision).await {
+            Dialled::Refused(failure) => Err(failure),
+            Dialled::Attempted(next) => next,
+        }
+    }
+
     async fn destination() -> (TcpListener, Host, Port) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -485,7 +496,7 @@ mod tests {
         let (listener, host, port) = destination().await;
         let hop = hop(closed_port().await, HealthState::Down, PATIENT);
 
-        let dialled = hop.dial(&host, port, Decision::Direct).await.unwrap();
+        let dialled = dial(&hop, &host, port, Decision::Direct).await.unwrap();
 
         assert_eq!(dialled.peer_addr().unwrap(), listener.local_addr().unwrap());
     }
@@ -495,8 +506,7 @@ mod tests {
         let (listener, host, port) = destination().await;
         let hop = hop(closed_port().await, HealthState::Up, PATIENT);
 
-        let dialled = hop
-            .dial(&host, port, Decision::Never { rule: RuleId(2) })
+        let dialled = dial(&hop, &host, port, Decision::Never { rule: RuleId(2) })
             .await
             .unwrap();
 
@@ -509,8 +519,7 @@ mod tests {
         let (listener, host, port) = destination().await;
         let hop = hop(closed_port().await, HealthState::Up, PATIENT);
 
-        let dialled = hop
-            .dial(&host, port, upstream_decision(RuleClass::Never, 0))
+        let dialled = dial(&hop, &host, port, upstream_decision(RuleClass::Never, 0))
             .await
             .unwrap();
 
@@ -523,8 +532,7 @@ mod tests {
         let upstream = closed_port().await;
         let hop = hop(upstream, HealthState::Down, PATIENT);
 
-        let failure = hop
-            .dial(&host, port, upstream_decision(RuleClass::Require, 4))
+        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 4))
             .await
             .unwrap_err();
 
@@ -538,12 +546,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_require_refusal_reports_that_nothing_was_dialled() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(closed_port().await, HealthState::Down, PATIENT);
+
+        let dialled = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 4))
+            .await;
+
+        let Dialled::Refused(_refusal) = dialled else {
+            panic!("a require rule refused while down never touched the network");
+        };
+    }
+
+    #[tokio::test]
+    async fn a_require_dial_that_fails_upstream_side_still_reports_an_attempt() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(closed_port().await, HealthState::Up, PATIENT);
+
+        let dialled = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 4))
+            .await;
+
+        let Dialled::Attempted(next) = dialled else {
+            panic!("a dial that reached the network must be reported as attempted");
+        };
+        let failure = next.unwrap_err();
+        assert!(
+            UpstreamDown::carried_by(&failure).is_some(),
+            "the client still sees the upstream-down surface: {failure}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_prefer_decision_goes_direct_at_once_while_the_verdict_is_down() {
         let (listener, host, port) = destination().await;
         let hop = hop(closed_port().await, HealthState::Down, PATIENT);
 
-        let dialled = hop
-            .dial(&host, port, upstream_decision(RuleClass::Prefer, 0))
+        let dialled = dial(&hop, &host, port, upstream_decision(RuleClass::Prefer, 0))
             .await
             .unwrap();
 
@@ -556,8 +596,7 @@ mod tests {
         let (_listener, host, port) = destination().await;
         let hop = hop(closed_port().await, HealthState::Up, PATIENT);
 
-        let failure = hop
-            .dial(&host, port, upstream_decision(RuleClass::Require, 3))
+        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 3))
             .await
             .unwrap_err();
 
@@ -572,8 +611,7 @@ mod tests {
         let (_listener, host, port) = destination().await;
         let hop = hop(upstream_answering(REFUSED).await, HealthState::Up, PATIENT);
 
-        let failure = hop
-            .dial(&host, port, upstream_decision(RuleClass::Require, 1))
+        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 1))
             .await
             .unwrap_err();
 
@@ -589,8 +627,7 @@ mod tests {
         let (listener, host, port) = destination().await;
         let hop = hop(upstream_answering(REFUSED).await, HealthState::Up, PATIENT);
 
-        let dialled = hop
-            .dial(&host, port, upstream_decision(RuleClass::Prefer, 0))
+        let dialled = dial(&hop, &host, port, upstream_decision(RuleClass::Prefer, 0))
             .await
             .unwrap();
 
@@ -622,8 +659,7 @@ mod tests {
         let (_listener, host, port) = destination().await;
         let hop = hop(upstream_answering(OFF_RFC).await, HealthState::Up, PATIENT);
 
-        let failure = hop
-            .dial(&host, port, upstream_decision(RuleClass::Require, 1))
+        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 1))
             .await
             .unwrap_err();
 
@@ -643,8 +679,7 @@ mod tests {
             PATIENT,
         );
 
-        let failure = hop
-            .dial(&host, port, upstream_decision(RuleClass::Require, 1))
+        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 1))
             .await
             .unwrap_err();
 

@@ -69,6 +69,7 @@ pub fn decision(event: &EventView) {
         rule_index,
         class,
         upstream,
+        connect_ms,
         duration_ms,
         error,
     } = event;
@@ -81,6 +82,7 @@ pub fn decision(event: &EventView) {
         rule_index = rule_index.map(u64::from),
         class = class.map(class_name),
         upstream = health_name(*upstream),
+        connect_ms = *connect_ms,
         duration_ms = *duration_ms,
         error = error.as_deref(),
     );
@@ -261,6 +263,7 @@ mod tests {
         rule_index: Option<u32>,
         class: Option<RuleClass>,
         upstream: HealthState,
+        connect_ms: Option<u64>,
         duration_ms: u64,
         error: Option<String>,
     }
@@ -279,6 +282,7 @@ mod tests {
             rule_index: Some(3),
             class: Some(RuleClass::Require),
             upstream: HealthState::Up,
+            connect_ms: Some(2),
             duration_ms: 17,
             error: Some("reset by peer".to_owned()),
         }
@@ -292,6 +296,7 @@ mod tests {
             rule_index: None,
             class: None,
             upstream: HealthState::Down,
+            connect_ms: None,
             duration_ms: 4,
             error: None,
         }
@@ -339,6 +344,7 @@ mod tests {
             rule_index,
             class,
             upstream,
+            connect_ms,
             duration_ms,
             error,
         } = matched();
@@ -351,12 +357,14 @@ mod tests {
                 rule_index,
                 class,
                 upstream,
+                connect_ms,
                 duration_ms,
                 error,
             }
         );
         let absent = fields_of(&lines[1]);
         assert_eq!(absent.rule_index, None);
+        assert_eq!(absent.connect_ms, None);
         assert_eq!(absent.class, None);
         assert_eq!(absent.error, None);
     }

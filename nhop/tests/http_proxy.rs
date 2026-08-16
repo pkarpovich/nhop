@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use support::{DownHop, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
+use support::{DownHop, Refusal, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -322,7 +322,11 @@ async fn a_require_rule_is_refused_with_502_while_the_upstream_is_down() {
         upstream,
         events: EventTx::default(),
     };
-    let front = serve_once(ctx, Arc::new(DownHop::new(upstream))).await;
+    let front = serve_once(
+        ctx,
+        Arc::new(DownHop::new(upstream, Refusal::BeforeDialling)),
+    )
+    .await;
 
     let answer = answer_of(front, "CONNECT example.com:443 HTTP/1.1\r\n\r\n").await;
 

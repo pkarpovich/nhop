@@ -916,6 +916,7 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         rule_index,
         class,
         upstream,
+        connect_ms,
         duration_ms,
         error,
     } = event;
@@ -925,9 +926,13 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         Some(error) => error,
         None => "-",
     };
+    let dialled = match connect_ms {
+        Some(connect_ms) => format!(" (dial {connect_ms}ms)"),
+        None => String::new(),
+    };
     let _ = writeln!(
         out,
-        "{host}:{port}  {} via {}  upstream {}  {duration_ms}ms  {error}",
+        "{host}:{port}  {} via {}  upstream {}  {duration_ms}ms{dialled}  {error}",
         decision_name(*decision),
         rule_name(*rule_index, *class),
         health_name(*upstream)
@@ -1695,6 +1700,24 @@ mod tests {
         );
         assert!(lines.next().unwrap().contains("hello"), "{out}");
         assert_eq!(lines.next(), None);
+    }
+
+    #[tokio::test]
+    async fn logs_render_the_dial_time_of_a_line_that_carries_one() {
+        let (_home, paths) = temp_paths();
+        let dialled = r#"{"timestamp":"2026-08-03T10:00:00Z","level":"INFO","fields":{"host":"api.example.com","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","connect_ms":37,"duration_ms":9},"target":"nhop::proxy"}"#;
+        write_log(&paths, "2026-08-03", &[dialled.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some(
+                "2026-08-03T10:00:00Z  api.example.com:443  upstream via rule 2 (require)  upstream up  9ms (dial 37ms)  -"
+            )
+        );
     }
 
     #[tokio::test]

@@ -612,6 +612,7 @@ mod tests {
             rule_index: None,
             class: None,
             upstream: HealthState::Down,
+            connect_ms: Some(1),
             duration_ms: 3,
             error: None,
         }

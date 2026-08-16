@@ -1,5 +1,6 @@
 use std::io;
 use std::str;
+use std::time::Instant;
 
 use nhop_ipc::{Host, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional};
@@ -135,8 +136,17 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
         rest: rest_of_body(method, body, behind),
     };
     let decision = ctx.rules.decide(&host, port);
-    let routed = Routed::begun(&ctx, &host, port, decision);
-    let served = relay(&mut client, forward, &host, port, decision, hop).await;
+    let mut routed = Routed::begun(&ctx, &host, port, decision);
+    let served = relay(
+        &mut client,
+        forward,
+        &host,
+        port,
+        decision,
+        hop,
+        &mut routed,
+    )
+    .await;
     routed.ended(served.as_ref().err());
     served
 }
@@ -171,6 +181,7 @@ async fn relay(
     port: Port,
     decision: Decision,
     hop: &dyn NextHop,
+    routed: &mut Routed,
 ) -> io::Result<()> {
     let Forward {
         method,
@@ -178,7 +189,10 @@ async fn relay(
         behind,
         rest,
     } = forward;
+    let dialling = Instant::now();
     let dialled = hop.dial(host, port, decision).await;
+    let (connect, dialled) = dialled.timed(dialling.elapsed());
+    routed.dialled(connect);
     let mut next = match dialled {
         Ok(next) => next,
         Err(failure) => {
