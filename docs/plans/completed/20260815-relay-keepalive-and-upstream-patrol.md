@@ -489,8 +489,27 @@ Three defects found during live investigation (2026-08-15), one release (0.1.3):
 
 ### Task 6: [Final] close out the plan
 
-- [ ] re-read the README/CLAUDE.md deltas against the final code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] re-read the README/CLAUDE.md deltas against the final code
+      - every number in the prose is the constant that shipped: keepalive 15s
+        idle / 15s interval / 4 retries (`upstream/mod.rs:42-48`), so README's
+        "about 75 seconds" is `KEEPALIVE_IDLE + KEEPALIVE_RETRIES *
+        KEEPALIVE_INTERVAL` and matches `keep_alive`'s own doc comment;
+        `PROBE_INTERVAL` 5s + `PROBE_CONFIRM_DELAY` 1s + `2 * PROBE_TIMEOUT` 2s
+        is README's "about ten seconds ... closer to six against one that
+        refuses fast"
+      - README's field list for a decision event is in the emission order of
+        `logging::decision` (`logging.rs:78-88`), `connect_ms` between
+        `upstream` and `duration_ms`
+      - README's "`connect_ms` is absent only when nothing was dialled" is
+        exact: `Routed::connect` starts `None` but `relay(..)` calls
+        `routed.dialled(connect)` on the line after the dial in both front ends
+        (`http.rs:195`, `socks5.rs:110`) before any early return, so the only
+        `None` a live connection can produce is `Connect::Refused`
+      - CLAUDE.md's two new invariants read true against `patrol`/`advance`
+        (`upstream/mod.rs:314-358`) and against the `keep_alive` call sites in
+        `direct()` and `through()` with `probe()` untouched
+      - no prose drifted; no correction needed
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
