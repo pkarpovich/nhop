@@ -7,7 +7,7 @@ use std::time::Duration;
 use nhop::proxy::{ConnCtx, EventTx, NextHop, socks5};
 use nhop::rules::{Decision, Host, Port, RuleClass, RuleId, RuleKind, RuleValue, Ruleset};
 use nhop::upstream::HealthHandle;
-use nhop_ipc::{EventView, Paths};
+use nhop_ipc::{DecisionKind, EventView, Paths};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -52,6 +52,18 @@ fn require(value: &str) -> Ruleset {
     rules
         .push(
             RuleClass::Require,
+            RuleKind::Suffix,
+            RuleValue(value.to_owned()),
+        )
+        .unwrap();
+    rules
+}
+
+fn never(value: &str) -> Ruleset {
+    let mut rules = Ruleset::default();
+    rules
+        .push(
+            RuleClass::Never,
             RuleKind::Suffix,
             RuleValue(value.to_owned()),
         )
@@ -237,6 +249,51 @@ async fn the_front_ends_own_address_by_name_is_refused_identically() {
     assert_eq!(reply, NOT_ALLOWED);
     assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
     assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, mut decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop).await;
+
+    let reply = reply_to(front, &ipv4_request(front)).await;
+
+    assert_eq!(reply, NOT_ALLOWED);
+    let event = next_decision(&mut decisions).await;
+    assert_eq!(
+        event.error,
+        Some(format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{event:?}"
+    );
+    assert_eq!(event.connect_ms, None, "{event:?}");
+}
+
+#[tokio::test]
+async fn a_never_rule_matching_the_front_ends_own_name_does_not_bypass_the_refusal() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, mut decisions) = watched(never("localhost"), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+
+    let reply = reply_to(front, &domain_request("localhost", front.port())).await;
+
+    assert_eq!(reply, NOT_ALLOWED);
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+    let event = next_decision(&mut decisions).await;
+    assert_eq!(event.decision, DecisionKind::Never, "{event:?}");
+    assert_eq!(event.rule_index, Some(0), "{event:?}");
+    assert_eq!(
+        event.error,
+        Some(format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{event:?}"
+    );
 }
 
 #[tokio::test]

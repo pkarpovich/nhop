@@ -200,17 +200,18 @@ impl EventTx {
 /// worth, so short forms such as `127.1` - which only `getaddrinfo` expands - are not caught.
 ///
 /// [RFC 9110 §7.6.3]: https://httpwg.org/specs/rfc9110.html#field.via
-pub fn dials_itself(destination: &Host, port: Port, listening: SocketAddr) -> bool {
+fn dials_itself(destination: &Host, port: Port, listening: SocketAddr) -> bool {
     let Port(port) = port;
     if port != listening.port() {
         return false;
     }
+    let listening = canonical(listening.ip());
     let destination = NormalizedHost::new(destination);
     let Some(address) = destination.address() else {
-        return destination.as_str() == LOCALHOST && listening.ip().is_loopback();
+        return destination.as_str() == LOCALHOST && listening.is_loopback();
     };
     let address = canonical(address);
-    address.is_unspecified() || address == canonical(listening.ip())
+    address.is_unspecified() || address == listening
 }
 
 /// Whether the destination is the address this connection was accepted on.
@@ -515,6 +516,8 @@ mod tests {
         assert!(loops("::ffff:127.0.0.1", 7890, "127.0.0.1:7890"));
         assert!(loops("::1", 7890, "[::1]:7890"));
         assert!(loops("127.0.0.1", 7890, "[::ffff:127.0.0.1]:7890"));
+        assert!(loops("localhost", 7890, "[::ffff:127.0.0.1]:7890"));
+        assert!(!loops("localhost", 7890, "[::ffff:192.168.1.5]:7890"));
     }
 
     #[test]

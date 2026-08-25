@@ -7,7 +7,7 @@ use std::time::Duration;
 use nhop::proxy::{ConnCtx, EventTx, NextHop, http};
 use nhop::rules::{RuleClass, RuleKind, RuleValue, Ruleset};
 use nhop::upstream::HealthHandle;
-use nhop_ipc::{Command, ErrKind, EventView, Paths, Response};
+use nhop_ipc::{Command, DecisionKind, ErrKind, EventView, Paths, Response};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,7 +31,11 @@ async fn closed_port() -> SocketAddr {
 }
 
 async fn serve_once(ctx: ConnCtx, hop: Arc<dyn NextHop>) -> SocketAddr {
-    let listener = TcpListener::bind(ephemeral()).await.unwrap();
+    serve_once_bound(ephemeral(), ctx, hop).await
+}
+
+async fn serve_once_bound(bind: SocketAddr, ctx: ConnCtx, hop: Arc<dyn NextHop>) -> SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let Ok((stream, _peer)) = listener.accept().await else {
@@ -47,6 +51,18 @@ fn require(value: &str) -> Ruleset {
     rules
         .push(
             RuleClass::Require,
+            RuleKind::Suffix,
+            RuleValue(value.to_owned()),
+        )
+        .unwrap();
+    rules
+}
+
+fn never(value: &str) -> Ruleset {
+    let mut rules = Ruleset::default();
+    rules
+        .push(
+            RuleClass::Never,
             RuleKind::Suffix,
             RuleValue(value.to_owned()),
         )
@@ -424,6 +440,81 @@ async fn the_front_ends_own_address_by_name_is_refused_the_same_way() {
     assert!(
         answer.ends_with(&format!(
             "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{answer}"
+    );
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn an_origin_form_request_naming_the_front_end_in_its_host_header_is_refused_the_same_way() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+
+    let answer = answer_of(front, &format!("GET / HTTP/1.1\r\nHost: {front}\r\n\r\n")).await;
+
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+    assert!(
+        answer.ends_with(&format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{answer}"
+    );
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn a_never_rule_matching_the_front_ends_own_name_does_not_bypass_the_refusal() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, mut decisions) = watched(never("localhost"), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+    let named = format!("localhost:{}", front.port());
+
+    let answer = answer_of(
+        front,
+        &format!("CONNECT {named} HTTP/1.1\r\nHost: {named}\r\n\r\n"),
+    )
+    .await;
+
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+    let event = next_decision(&mut decisions).await;
+    assert_eq!(event.decision, DecisionKind::Never, "{event:?}");
+    assert_eq!(event.rule_index, Some(0), "{event:?}");
+    assert_eq!(event.class, Some(RuleClass::Never), "{event:?}");
+    assert_eq!(
+        event.error,
+        Some(format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_front_end_bound_to_the_wildcard_refuses_the_interface_the_client_reached() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let bound = serve_once_bound("0.0.0.0:0".parse().unwrap(), ctx, hop.clone()).await;
+    let reached: SocketAddr = format!("127.0.0.1:{}", bound.port()).parse().unwrap();
+
+    let answer = answer_of(
+        reached,
+        &format!("CONNECT {reached} HTTP/1.1\r\nHost: {reached}\r\n\r\n"),
+    )
+    .await;
+
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+    assert!(
+        answer.ends_with(&format!(
+            "nhop: refusing to dial my own listening address {reached}"
         )),
         "{answer}"
     );

@@ -75,7 +75,10 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   threaded through `Live`, `ConnCtx` or the wire. It compares the destination
   against `listening.ip()` rather than "any loopback", so a front end on
   `127.0.0.1:7890` refuses itself and leaves a different service on
-  `127.0.0.2:7890` alone. It sits between the rule decision and the dial - after,
+  `127.0.0.2:7890` alone; `0.0.0.0` and `::` count as that address whatever it
+  is, since connecting to one of them lands on a local one. Both sides of the
+  comparison go through `canonical`, so an IPv4-mapped listening address is
+  loopback for the `localhost` arm too. It sits between the rule decision and the dial - after,
   so the decision that would have applied is still logged; before, so no
   descriptor is spent - answers 502 or SOCKS `0x02` and returns `DialsItself` as
   an error, so the connection's one decision event carries that text and a null
