@@ -19,7 +19,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::logging;
-use crate::rules::{Decision, RuleId, Ruleset};
+use crate::rules::{Decision, NormalizedHost, RuleId, Ruleset};
 use crate::upstream::HealthHandle;
 
 /// Addresses the two front ends listen on.
@@ -36,6 +36,8 @@ pub struct Listen {
 pub const NO_UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 const SOCKS5_SCHEME: &str = "socks5://";
+
+const LOCALHOST: &str = "localhost";
 
 /// Rejection of an upstream address that cannot be dialled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -180,6 +182,45 @@ impl EventTx {
         let Self(subscribers) = self;
         let subscribers = subscribers.lock().unwrap();
         subscribers.len()
+    }
+}
+
+/// Answers whether a destination is the address the connection was accepted on.
+///
+/// [RFC 9110 §7.6.3] requires a proxy that detects a forwarding loop to answer with an error, and
+/// its `Via` mechanism cannot serve a tunnelling front end: `CONNECT` relays opaque bytes and
+/// SOCKS5 carries no headers at all, so a loop is visible only as an address. `listening` is the
+/// accepted socket's local address, which under a wildcard bind is the concrete interface the
+/// client reached rather than the wildcard the listener would report.
+///
+/// The port is compared first because it is two integers on every accepted connection; the host is
+/// looked at only when the ports match, which is rare.
+///
+/// Names are not resolved, deliberately: a lookup per connection costs more than the case is
+/// worth, so short forms such as `127.1` - which only `getaddrinfo` expands - are not caught.
+///
+/// [RFC 9110 §7.6.3]: https://httpwg.org/specs/rfc9110.html#field.via
+pub fn dials_itself(destination: &Host, port: Port, listening: SocketAddr) -> bool {
+    let Port(port) = port;
+    if port != listening.port() {
+        return false;
+    }
+    let destination = NormalizedHost::new(destination);
+    let Some(address) = destination.address() else {
+        return destination.as_str() == LOCALHOST && listening.ip().is_loopback();
+    };
+    let address = canonical(address);
+    address.is_unspecified() || address == canonical(listening.ip())
+}
+
+/// Folds an IPv4-mapped IPv6 address back to v4, so `::ffff:127.0.0.1` and `127.0.0.1` compare equal.
+fn canonical(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => IpAddr::V4(address),
+        IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(address) => IpAddr::V4(address),
+            None => IpAddr::V6(address),
+        },
     }
 }
 
@@ -397,6 +438,67 @@ mod tests {
         assert!(failure.to_string().contains("vm.example.com"), "{failure}");
         assert!(upstream("").is_err());
         assert!(upstream("socks5://192.0.2.10").is_err());
+    }
+
+    fn loops(destination: &str, port: u16, listening: &str) -> bool {
+        dials_itself(
+            &Host(destination.to_owned()),
+            Port(port),
+            listening.parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_front_end_asked_for_its_own_address_sees_a_loop() {
+        assert!(loops("127.0.0.1", 7890, "127.0.0.1:7890"));
+        assert!(loops("localhost", 7890, "127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_destination_is_the_address_it_maps_to() {
+        assert!(loops("::ffff:127.0.0.1", 7890, "127.0.0.1:7890"));
+        assert!(loops("::1", 7890, "[::1]:7890"));
+        assert!(loops("127.0.0.1", 7890, "[::ffff:127.0.0.1]:7890"));
+    }
+
+    #[test]
+    fn an_unspecified_destination_lands_on_a_local_address_so_it_is_a_loop() {
+        assert!(loops("0.0.0.0", 7890, "127.0.0.1:7890"));
+        assert!(loops("::", 7890, "127.0.0.1:7890"));
+        assert!(loops("0.0.0.0", 7890, "192.168.1.5:7890"));
+    }
+
+    #[test]
+    fn a_name_written_as_the_host_would_write_it_still_matches() {
+        assert!(loops("LocalHost", 7890, "127.0.0.1:7890"));
+        assert!(loops("localhost.", 7890, "127.0.0.1:7890"));
+        assert!(loops("LOCALHOST.", 7890, "127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn another_address_on_the_same_port_is_not_a_loop() {
+        assert!(!loops("127.0.0.2", 7890, "127.0.0.1:7890"));
+        assert!(!loops("192.0.2.10", 7890, "127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn a_front_end_off_the_loopback_refuses_its_own_address_and_not_the_name() {
+        assert!(loops("192.168.1.5", 7890, "192.168.1.5:7890"));
+        assert!(!loops("localhost", 7890, "192.168.1.5:7890"));
+        assert!(!loops("127.0.0.1", 7890, "192.168.1.5:7890"));
+    }
+
+    #[test]
+    fn the_same_host_on_another_port_is_not_a_loop() {
+        assert!(!loops("127.0.0.1", 19998, "127.0.0.1:7890"));
+        assert!(!loops("localhost", 19998, "127.0.0.1:7890"));
+        assert!(!loops("127.0.0.1", 7891, "127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn a_short_form_is_not_caught_because_names_are_not_resolved() {
+        assert!(!loops("127.1", 7890, "127.0.0.1:7890"));
+        assert!(!loops("localhost.localdomain", 7890, "127.0.0.1:7890"));
     }
 
     #[test]

@@ -190,27 +190,27 @@ should be answerable from `nhop logs` alone.
 **Files:**
 - Modify: `nhop/src/proxy/mod.rs`
 
-- [ ] add `dials_itself(destination, port, listening)` with a doc comment stating
+- [x] add `dials_itself(destination, port, listening)` with a doc comment stating
       why the check exists (RFC 9110 §7.6.3 loop requirement; `Via` unusable on a
       tunnelling front end), and recording the deliberate gap: names are not
       resolved, so short forms like `127.1` are not caught
-- [ ] port comparison first, host inspection only on a port match
-- [ ] canonicalise a literal destination: parse to `IpAddr`, fold IPv4-mapped IPv6
+- [x] port comparison first, host inspection only on a port match
+- [x] canonicalise a literal destination: parse to `IpAddr`, fold IPv4-mapped IPv6
       back to v4 with `to_ipv4_mapped()`
-- [ ] a loop is: canonical destination equals `listening.ip()`; or the destination
+- [x] a loop is: canonical destination equals `listening.ip()`; or the destination
       is unspecified (`0.0.0.0`, `::`); or the destination is the name `localhost`
       (case-insensitive, trailing dot stripped) while `listening.ip()` is loopback
-- [ ] write tests for each arm: `127.0.0.1` and `localhost` against a
+- [x] write tests for each arm: `127.0.0.1` and `localhost` against a
       `127.0.0.1:7890` front end are loops; `::ffff:127.0.0.1` is a loop (this is
       the exact string `socks5.rs:178` renders for an ATYP_IPV6 request);
       `0.0.0.0` and `::` are loops
-- [ ] write tests for the boundaries: `127.0.0.2:7890` against a `127.0.0.1:7890`
+- [x] write tests for the boundaries: `127.0.0.2:7890` against a `127.0.0.1:7890`
       front end is **not** a loop; a non-loopback front end (`192.168.1.5:7890`)
       refuses its own address and not `localhost`; the same host on a different
       port is not a loop; trailing dot and mixed case still match
-- [ ] write a test pinning the known gap: `127.1` is **not** caught, so the limit
+- [x] write a test pinning the known gap: `127.1` is **not** caught, so the limit
       is visible in the suite rather than only in prose
-- [ ] run `mise run check` - must pass before task 2
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: refuse on the HTTP front end
 
