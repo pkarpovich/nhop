@@ -299,10 +299,17 @@ should be answerable from `nhop logs` alone.
 
 ### Task 6: verify acceptance criteria
 
-- [ ] a loop is refused on both front ends, by literal and by name
-- [ ] no outbound socket is opened for a refused loop
-- [ ] ordinary local destinations are untouched
-- [ ] full gate: `mise run check`
+- [x] a loop is refused on both front ends, by literal and by name
+      (HTTP: `a_connect_request_for_the_front_ends_own_address_is_refused_before_any_dial`,
+      `an_absolute_form_request_..`, ➕ `the_front_ends_own_address_by_name_is_refused_the_same_way`;
+      SOCKS5: `a_request_for_the_front_ends_own_address_is_refused_before_any_dial`,
+      `the_front_ends_own_address_by_name_is_refused_identically`)
+- [x] no outbound socket is opened for a refused loop - every refusal test asserts
+      both `hop.asked() == []` and `origin.connections() == 0`
+- [x] ordinary local destinations are untouched
+      (`an_ordinary_local_destination_still_reaches_its_origin` on `localhost:19998`,
+      and the SOCKS5 `127.0.0.1:8443` direct dial)
+- [x] full gate: `mise run check` - fmt, clippy `-D warnings`, 354 tests green
 
 ### Task 7: [Final] close out the plan
 

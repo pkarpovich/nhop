@@ -407,6 +407,31 @@ async fn an_absolute_form_request_for_the_front_ends_own_address_is_refused_the_
 }
 
 #[tokio::test]
+async fn the_front_ends_own_address_by_name_is_refused_the_same_way() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+    let named = format!("localhost:{}", front.port());
+
+    let answer = answer_of(
+        front,
+        &format!("CONNECT {named} HTTP/1.1\r\nHost: {named}\r\n\r\n"),
+    )
+    .await;
+
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+    assert!(
+        answer.ends_with(&format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{answer}"
+    );
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
 async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
