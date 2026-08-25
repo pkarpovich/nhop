@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use support::{DownHop, Refusal, StubHop, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
 
@@ -403,6 +404,36 @@ async fn an_absolute_form_request_for_the_front_ends_own_address_is_refused_the_
     );
     assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
     assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, mut decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop).await;
+
+    let answer = answer_of(
+        front,
+        &format!("CONNECT {front} HTTP/1.1\r\nHost: {front}\r\n\r\n"),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+
+    let event = next_decision(&mut decisions).await;
+    assert_eq!(
+        event.error,
+        Some(format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{event:?}"
+    );
+    assert_eq!(event.connect_ms, None, "{event:?}");
+    match decisions.try_recv() {
+        Ok(extra) => panic!("a refused loop must publish exactly one decision: {extra:?}"),
+        Err(TryRecvError::Empty) => (),
+        Err(TryRecvError::Disconnected) => (),
+    }
 }
 
 #[tokio::test]

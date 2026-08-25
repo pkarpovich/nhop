@@ -263,18 +263,18 @@ should be answerable from `nhop logs` alone.
 **Files:**
 - Modify: `nhop/tests/http_proxy.rs`
 
-- [ ] assert through the **event fan-out**, not the log file: the
+- [x] assert through the **event fan-out**, not the log file: the
       `watched()` / `next_decision()` idiom already used in `http_proxy.rs` and
       `socks5_proxy.rs`, which needs no tracing subscriber
-- [ ] do **not** touch `nhop/tests/decision_log.rs`: it is a single-test binary
+- [x] do **not** touch `nhop/tests/decision_log.rs`: it is a single-test binary
       whose test installs a process-global subscriber
       (`tracing::subscriber::set_global_default(..).unwrap()`, `decision_log.rs:82`)
       and reads events back out of its own tempdir. A second test in that binary
       either panics on the second `set_global_default`, or logs into the other
       test's tempdir, or races it through a shared `Paths`
-- [ ] write a test: a refused loop produces exactly one decision event whose
+- [x] write a test: a refused loop produces exactly one decision event whose
       `error` is the pinned `DialsItself` text and whose `connect_ms` is null
-- [ ] run `mise run check` - must pass before task 5
+- [x] run `mise run check` - must pass before task 5
 
 ### Task 5: version bump and documentation
 
