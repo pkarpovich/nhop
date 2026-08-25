@@ -282,20 +282,20 @@ should be answerable from `nhop logs` alone.
 - Modify: `Cargo.toml` (+ `Cargo.lock` via cargo)
 - Modify: `README.md`, `CLAUDE.md`
 
-- [ ] bump the workspace version 0.1.3 -> 0.1.4
-- [ ] README: a short paragraph under the front-end description - the router
+- [x] bump the workspace version 0.1.3 -> 0.1.4
+- [x] README: a short paragraph under the front-end description - the router
       refuses to dial its own listening address, what the client sees (502 and
       SOCKS `0x02`), and the two deliberate limits: the cross-port case is not
       covered, and names are not resolved so short forms like `127.1` slip through
-- [ ] CLAUDE.md: add the invariant that a front end never dials the address it
+- [x] CLAUDE.md: add the invariant that a front end never dials the address it
       accepted the connection on, that the check reads `client.local_addr()`
       rather than any shared state, and that it compares against `listening.ip()`
       rather than "any loopback"
-- [ ] verify the existing `Dialled::Refused` doc comment (`proxy/mod.rs:332`) and
+- [x] verify the existing `Dialled::Refused` doc comment (`proxy/mod.rs:332`) and
       its CLAUDE.md invariant still read true - this plan deliberately uses
       `Connect::Refused` so neither needs changing; if either was touched, put it
       back
-- [ ] run `mise run check` - must pass before task 6
+- [x] run `mise run check` - must pass before task 6
 
 ### Task 6: verify acceptance criteria
 

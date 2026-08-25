@@ -69,6 +69,18 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   both apply `keep_alive` before handing the stream back, and a failed setsockopt
   warns rather than failing a dial that otherwise succeeded. Probe sockets are
   exempt: they live milliseconds.
+- **A front end never dials the address it accepted the connection on.** The
+  check reads `client.local_addr()`, which under a wildcard bind is the only
+  source naming the interface the client actually reached, so nothing new is
+  threaded through `Live`, `ConnCtx` or the wire. It compares the destination
+  against `listening.ip()` rather than "any loopback", so a front end on
+  `127.0.0.1:7890` refuses itself and leaves a different service on
+  `127.0.0.2:7890` alone. It sits between the rule decision and the dial - after,
+  so the decision that would have applied is still logged; before, so no
+  descriptor is spent - answers 502 or SOCKS `0x02` and returns `DialsItself` as
+  an error, so the connection's one decision event carries that text and a null
+  `connect_ms`. Names are not resolved: short forms like `127.1` are a stated
+  gap, not an oversight.
 - **A dial reports whether it touched the network; nothing asks afterwards.**
   `NextHop::dial` returns `Dialled` - `Refused` for a `require` rule turned away
   before any socket, `Attempted` for anything that reached the network - because

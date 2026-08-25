@@ -112,6 +112,17 @@ The origin therefore ends the answer by closing, rather than the proxy
 half-closing its write side - legal, but silently unanswered by some origins,
 Apple's timestamp service among them.
 
+Neither front end dials the address it accepted the connection on. A client that
+asks nhop to connect it to nhop is answered `502 Bad Gateway` on the HTTP side
+and reply `0x02` - RFC 1928's "connection not allowed by ruleset", which is what
+a policy refusal is - on the SOCKS5 one, before any outbound socket is opened,
+and the connection leaves one decision in the log carrying the refusal. The
+destination is compared against the address the client actually reached, by IP
+literal or by the name `localhost`. Two cases are deliberately out of scope:
+arriving on one front end and asking for the other one's port, which costs a
+single useless connection rather than a carousel, and short forms like `127.1`
+that only a resolver expands - names are not resolved on the hot path.
+
 ## Long-lived connections
 
 Every socket the router relays a connection over carries TCP keepalive: 15
