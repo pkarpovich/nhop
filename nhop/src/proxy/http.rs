@@ -7,7 +7,9 @@ use nhop_ipc::{Host, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional};
 use tokio::net::TcpStream;
 
-use crate::proxy::{ConnCtx, Connect, DialsItself, NextHop, Routed, UpstreamDown, dials_itself};
+use crate::proxy::{
+    ConnCtx, Connect, DialsItself, Loop, NextHop, Routed, UpstreamDown, own_address,
+};
 use crate::rules::Decision;
 
 /// Largest request head the front end reads, in bytes.
@@ -155,29 +157,6 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
     };
     routed.ended(served.as_ref().err());
     served
-}
-
-/// Whether the destination is the address this connection was accepted on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Loop {
-    /// The destination is this front end itself, reached on that address.
-    Own(SocketAddr),
-    /// The destination is somewhere else, or the accepted socket could not name itself.
-    Elsewhere,
-}
-
-/// Reads the address the client reached and answers whether the destination is that same address.
-///
-/// A socket that cannot name itself is treated as no loop: refusing traffic because a socket call
-/// failed would be worse than the loop the check guards against.
-fn own_address(client: &TcpStream, host: &Host, port: Port) -> Loop {
-    let Ok(listening) = client.local_addr() else {
-        return Loop::Elsewhere;
-    };
-    if dials_itself(host, port, listening) {
-        return Loop::Own(listening);
-    }
-    Loop::Elsewhere
 }
 
 /// Answers a loop with 502 and fails the connection, without opening any outbound socket.

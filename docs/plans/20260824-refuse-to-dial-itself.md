@@ -240,18 +240,23 @@ should be answerable from `nhop logs` alone.
 - Modify: `nhop/src/proxy/socks5.rs`
 - Modify: `nhop/tests/socks5_proxy.rs`
 
-- [ ] same read of `client.local_addr()`, same placement between decision and
+- [x] same read of `client.local_addr()`, same placement between decision and
       `relay(..)`
-- [ ] refuse with reply `0x02` (RFC 1928 "connection not allowed by ruleset"),
+- [x] refuse with reply `0x02` (RFC 1928 "connection not allowed by ruleset"),
       record `routed.dialled(Connect::Refused)` and return the same `DialsItself`
       error, so the event's `error` matches the HTTP side character for character
-- [ ] add `Reply::NotAllowed` (`0x02`) to the reply enum if it is not there yet -
+- [x] add `Reply::NotAllowed` (`0x02`) to the reply enum if it is not there yet -
       `socks5.rs:52` currently defines Granted/Failure/HostUnreachable/
       CommandNotSupported/AddressNotSupported
-- [ ] write a test: a SOCKS request for the front end's own address answers
-      `0x01` and dials nothing
-- [ ] write a test: the same address by name (`localhost`) is refused identically
-- [ ] run `mise run check` - must pass before task 4
+- [x] write a test: a SOCKS request for the front end's own address answers
+      `0x02` and dials nothing (the plan read `0x01` here, contradicting the reply
+      code this task pins everywhere else; corrected to `0x02`)
+- [x] write a test: the same address by name (`localhost`) is refused identically
+- [x] run `mise run check` - must pass before task 4
+
+➕ `Loop` and `own_address` moved from `proxy/http.rs` to `proxy/mod.rs`, private
+   there so both front ends see them, rather than duplicating the
+   `client.local_addr()` read on the SOCKS5 side
 
 ### Task 4: the refusal is visible as an event
 

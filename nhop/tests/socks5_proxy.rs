@@ -17,6 +17,7 @@ use support::{DownHop, Refusal, StubHop, StubOrigin, TestDaemon, ephemeral};
 
 const GREETING: [u8; 3] = [0x05, 0x01, 0x00];
 const GRANTED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+const NOT_ALLOWED: [u8; 10] = [0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 const HOST_UNREACHABLE: [u8; 10] = [0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -210,6 +211,32 @@ async fn an_ipv4_request_reaches_the_next_hop_as_an_address() {
         hop.asked(),
         vec![(Host("127.0.0.1".to_owned()), Port(8443), Decision::Direct)]
     );
+}
+
+#[tokio::test]
+async fn a_request_for_the_front_ends_own_address_is_refused_before_any_dial() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let front = serve_once(ctx_of(Ruleset::default(), ephemeral()), hop.clone()).await;
+
+    let reply = reply_to(front, &ipv4_request(front)).await;
+
+    assert_eq!(reply, NOT_ALLOWED);
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn the_front_ends_own_address_by_name_is_refused_identically() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let front = serve_once(ctx_of(Ruleset::default(), ephemeral()), hop.clone()).await;
+
+    let reply = reply_to(front, &domain_request("localhost", front.port())).await;
+
+    assert_eq!(reply, NOT_ALLOWED);
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
 }
 
 #[tokio::test]

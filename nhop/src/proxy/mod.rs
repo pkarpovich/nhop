@@ -213,6 +213,29 @@ pub fn dials_itself(destination: &Host, port: Port, listening: SocketAddr) -> bo
     address.is_unspecified() || address == canonical(listening.ip())
 }
 
+/// Whether the destination is the address this connection was accepted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loop {
+    /// The destination is this front end itself, reached on that address.
+    Own(SocketAddr),
+    /// The destination is somewhere else, or the accepted socket could not name itself.
+    Elsewhere,
+}
+
+/// Reads the address the client reached and answers whether the destination is that same address.
+///
+/// A socket that cannot name itself is treated as no loop: refusing traffic because a socket call
+/// failed would be worse than the loop the check guards against.
+fn own_address(client: &TcpStream, host: &Host, port: Port) -> Loop {
+    let Ok(listening) = client.local_addr() else {
+        return Loop::Elsewhere;
+    };
+    if dials_itself(host, port, listening) {
+        return Loop::Own(listening);
+    }
+    Loop::Elsewhere
+}
+
 /// Folds an IPv4-mapped IPv6 address back to v4, so `::ffff:127.0.0.1` and `127.0.0.1` compare equal.
 fn canonical(address: IpAddr) -> IpAddr {
     match address {
