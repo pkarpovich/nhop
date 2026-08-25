@@ -106,10 +106,8 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
 
 /// Answers a loop with `0x02` and fails the connection, without opening any outbound socket.
 ///
-/// RFC 1928 calls that code "connection not allowed by ruleset", which is what a policy refusal is;
-/// `0x04` would claim the host is unreachable, which is untrue. The failure is returned rather than
-/// swallowed so [`Routed::ended`] fills the event's error with the same text the HTTP front end
-/// records.
+/// RFC 1928 calls `0x02` "connection not allowed by ruleset"; `0x04` would claim the host is
+/// unreachable, which is untrue. The failure is returned so [`Routed::ended`] records it.
 async fn refuse_loop(
     client: &mut TcpStream,
     listening: SocketAddr,

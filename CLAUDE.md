@@ -70,20 +70,13 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   warns rather than failing a dial that otherwise succeeded. Probe sockets are
   exempt: they live milliseconds.
 - **A front end never dials the address it accepted the connection on.** The
-  check reads `client.local_addr()`, which under a wildcard bind is the only
-  source naming the interface the client actually reached, so nothing new is
-  threaded through `Live`, `ConnCtx` or the wire. It compares the destination
-  against `listening.ip()` rather than "any loopback", so a front end on
-  `127.0.0.1:7890` refuses itself and leaves a different service on
-  `127.0.0.2:7890` alone; `0.0.0.0` and `::` count as that address whatever it
-  is, since connecting to one of them lands on a local one. Both sides of the
-  comparison go through `canonical`, so an IPv4-mapped listening address is
-  loopback for the `localhost` arm too. It sits between the rule decision and the dial - after,
-  so the decision that would have applied is still logged; before, so no
-  descriptor is spent - answers 502 or SOCKS `0x02` and returns `DialsItself` as
-  an error, so the connection's one decision event carries that text and a null
-  `connect_ms`. Names are not resolved: short forms like `127.1` are a stated
-  gap, not an oversight.
+  check reads `client.local_addr()` - under a wildcard bind the only source
+  naming the interface the client reached - so nothing new is threaded through
+  `Live`, `ConnCtx` or the wire. It compares against `listening.ip()` rather than
+  "any loopback", so `127.0.0.2:7890` stays reachable from a front end on
+  `127.0.0.1:7890`. It sits between the rule decision and the dial: after, so the
+  decision that would have applied is still logged; before, so no descriptor is
+  spent. Names are not resolved, leaving short forms like `127.1` a stated gap.
 - **A dial reports whether it touched the network; nothing asks afterwards.**
   `NextHop::dial` returns `Dialled` - `Refused` for a `require` rule turned away
   before any socket, `Attempted` for anything that reached the network - because

@@ -161,8 +161,8 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
 
 /// Answers a loop with 502 and fails the connection, without opening any outbound socket.
 ///
-/// The failure is returned rather than swallowed so [`Routed::ended`] fills the event's error with
-/// the refusal, which is the one line that makes a loop answerable from `nhop logs`.
+/// The failure is returned rather than swallowed so [`Routed::ended`] records it: that log line is
+/// the only trace a loop leaves.
 async fn refuse_loop(
     client: &mut TcpStream,
     listening: SocketAddr,

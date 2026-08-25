@@ -187,17 +187,12 @@ impl EventTx {
 
 /// Answers whether a destination is the address the connection was accepted on.
 ///
-/// [RFC 9110 §7.6.3] requires a proxy that detects a forwarding loop to answer with an error, and
-/// its `Via` mechanism cannot serve a tunnelling front end: `CONNECT` relays opaque bytes and
-/// SOCKS5 carries no headers at all, so a loop is visible only as an address. `listening` is the
-/// accepted socket's local address, which under a wildcard bind is the concrete interface the
-/// client reached rather than the wildcard the listener would report.
+/// [RFC 9110 §7.6.3] requires a proxy to answer a forwarding loop with an error, and its `Via`
+/// mechanism cannot serve a tunnelling front end - `CONNECT` relays opaque bytes, SOCKS5 has no
+/// headers - so a loop is visible only as an address.
 ///
-/// The port is compared first because it is two integers on every accepted connection; the host is
-/// looked at only when the ports match, which is rare.
-///
-/// Names are not resolved, deliberately: a lookup per connection costs more than the case is
-/// worth, so short forms such as `127.1` - which only `getaddrinfo` expands - are not caught.
+/// Names are not resolved: short forms such as `127.1`, which only `getaddrinfo` expands, are a
+/// stated gap rather than an oversight.
 ///
 /// [RFC 9110 §7.6.3]: https://httpwg.org/specs/rfc9110.html#field.via
 fn dials_itself(destination: &Host, port: Port, listening: SocketAddr) -> bool {
@@ -225,8 +220,8 @@ enum Loop {
 
 /// Reads the address the client reached and answers whether the destination is that same address.
 ///
-/// A socket that cannot name itself is treated as no loop: refusing traffic because a socket call
-/// failed would be worse than the loop the check guards against.
+/// A socket that cannot name itself is treated as no loop: failing a dial over a failed socket call
+/// would be worse than the loop this guards against.
 fn own_address(client: &TcpStream, host: &Host, port: Port) -> Loop {
     let Ok(listening) = client.local_addr() else {
         return Loop::Elsewhere;
@@ -249,9 +244,6 @@ fn canonical(address: IpAddr) -> IpAddr {
 }
 
 /// Refusal a front end produces when it is asked to dial the address it accepted the connection on.
-///
-/// The address is the accepted socket's local address, so the text names the interface the client
-/// actually reached rather than whatever the listener was bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialsItself {
     listening: SocketAddr,
