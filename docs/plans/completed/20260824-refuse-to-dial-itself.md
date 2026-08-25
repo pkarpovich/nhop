@@ -313,8 +313,14 @@ should be answerable from `nhop logs` alone.
 
 ### Task 7: [Final] close out the plan
 
-- [ ] re-read the README/CLAUDE.md deltas against the final code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] re-read the README/CLAUDE.md deltas against the final code: the README
+      paragraph and the CLAUDE.md invariant both describe what shipped - the
+      `client.local_addr()` read, the comparison against `listening.ip()`, the
+      placement between decision and dial, 502 / SOCKS `0x02`, the `DialsItself`
+      error behind the event's `error`, and the two stated gaps (cross-port,
+      unresolved short forms). `Dialled::Refused` and its invariant are untouched;
+      no `0.1.3` reference survives outside this plan
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
