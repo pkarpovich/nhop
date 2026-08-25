@@ -224,6 +224,39 @@ fn canonical(address: IpAddr) -> IpAddr {
     }
 }
 
+/// Refusal a front end produces when it is asked to dial the address it accepted the connection on.
+///
+/// The address is the accepted socket's local address, so the text names the interface the client
+/// actually reached rather than whatever the listener was bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialsItself {
+    listening: SocketAddr,
+}
+
+impl DialsItself {
+    pub fn new(listening: SocketAddr) -> Self {
+        Self { listening }
+    }
+}
+
+impl fmt::Display for DialsItself {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { listening } = self;
+        write!(
+            out,
+            "nhop: refusing to dial my own listening address {listening}"
+        )
+    }
+}
+
+impl std::error::Error for DialsItself {}
+
+impl From<DialsItself> for io::Error {
+    fn from(refused: DialsItself) -> Self {
+        Self::new(io::ErrorKind::PermissionDenied, refused)
+    }
+}
+
 /// Refusal a `require` rule produces when the upstream it needs is down.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamDown {
@@ -499,6 +532,21 @@ mod tests {
     fn a_short_form_is_not_caught_because_names_are_not_resolved() {
         assert!(!loops("127.1", 7890, "127.0.0.1:7890"));
         assert!(!loops("localhost.localdomain", 7890, "127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn the_loop_refusal_names_the_address_it_was_reached_on() {
+        let refused = DialsItself::new("127.0.0.1:7890".parse().unwrap());
+        assert_eq!(
+            refused.to_string(),
+            "nhop: refusing to dial my own listening address 127.0.0.1:7890"
+        );
+        let failure = io::Error::from(refused);
+        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            failure.to_string(),
+            "nhop: refusing to dial my own listening address 127.0.0.1:7890"
+        );
     }
 
     #[test]

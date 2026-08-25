@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use support::{DownHop, Refusal, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
+use support::{DownHop, Refusal, StubHop, StubHttpOrigin, StubOrigin, TestDaemon, ephemeral};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -355,6 +355,73 @@ async fn a_require_rule_is_refused_with_502_while_the_upstream_is_down() {
     );
     let event = next_decision(&mut decisions).await;
     assert_eq!(event.connect_ms, None, "{event:?}");
+}
+
+#[tokio::test]
+async fn a_connect_request_for_the_front_ends_own_address_is_refused_before_any_dial() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+
+    let answer = answer_of(
+        front,
+        &format!("CONNECT {front} HTTP/1.1\r\nHost: {front}\r\n\r\n"),
+    )
+    .await;
+
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+    assert!(
+        answer.ends_with(&format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{answer}"
+    );
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn an_absolute_form_request_for_the_front_ends_own_address_is_refused_the_same_way() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+
+    let answer = answer_of(
+        front,
+        &format!("GET http://{front}/ HTTP/1.1\r\nHost: {front}\r\n\r\n"),
+    )
+    .await;
+
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer}");
+    assert!(
+        answer.ends_with(&format!(
+            "nhop: refusing to dial my own listening address {front}"
+        )),
+        "{answer}"
+    );
+    assert_eq!(hop.asked(), Vec::new(), "the loop must reach no next hop");
+    assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn an_ordinary_local_destination_still_reaches_its_origin() {
+    let origin = StubOrigin::start().await;
+    let hop = Arc::new(StubHop::new(origin.addr()));
+    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let front = serve_once(ctx, hop.clone()).await;
+
+    let mut client = TcpStream::connect(front).await.unwrap();
+    let request = "CONNECT localhost:19998 HTTP/1.1\r\nHost: localhost:19998\r\n\r\n";
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut established = [0u8; ESTABLISHED.len()];
+    client.read_exact(&mut established).await.unwrap();
+
+    assert_eq!(&established, ESTABLISHED);
+    assert_eq!(echoed(client, b"ping").await, b"ping");
+    assert_eq!(hop.asked().len(), 1, "{:?}", hop.asked());
+    assert_eq!(origin.connections(), 1);
 }
 
 #[tokio::test]

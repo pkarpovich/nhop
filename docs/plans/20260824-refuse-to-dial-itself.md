@@ -218,21 +218,21 @@ should be answerable from `nhop logs` alone.
 - Modify: `nhop/src/proxy/http.rs`
 - Modify: `nhop/tests/http_proxy.rs`
 
-- [ ] read `client.local_addr()` in `serve`, treating a read failure as "not a
+- [x] read `client.local_addr()` in `serve`, treating a read failure as "not a
       loop"
-- [ ] add the `DialsItself` error beside `UpstreamDown` in `proxy/mod.rs`, its
+- [x] add the `DialsItself` error beside `UpstreamDown` in `proxy/mod.rs`, its
       `Display` rendering `nhop: refusing to dial my own listening address <addr>`
-- [ ] between the rule decision and `relay(..)`, refuse a loop: answer
+- [x] between the rule decision and `relay(..)`, refuse a loop: answer
       `502 Bad Gateway` with that text as the body, record
       `routed.dialled(Connect::Refused)`, and **return the error** from `serve` so
       `Routed::ended` fills the event's `error` rather than leaving it null
-- [ ] write a test: `CONNECT` to the front end's own address answers 502 **and
+- [x] write a test: `CONNECT` to the front end's own address answers 502 **and
       the stub destination records no dial at all**
-- [ ] write a test: an absolute-form request aimed at the front end's own address
+- [x] write a test: an absolute-form request aimed at the front end's own address
       is refused the same way
-- [ ] write a test: `localhost:19998` still reaches its destination, pinning the
+- [x] write a test: `localhost:19998` still reaches its destination, pinning the
       behaviour of ordinary local services
-- [ ] run `mise run check` - must pass before task 3
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: refuse on the SOCKS5 front end
 
