@@ -1,4 +1,5 @@
 use std::io;
+use std::net::SocketAddr;
 use std::str;
 use std::time::Instant;
 
@@ -6,7 +7,9 @@ use nhop_ipc::{Host, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional};
 use tokio::net::TcpStream;
 
-use crate::proxy::{ConnCtx, NextHop, Routed, UpstreamDown};
+use crate::proxy::{
+    ConnCtx, Connect, DialsItself, Loop, NextHop, Routed, UpstreamDown, own_address,
+};
 use crate::rules::Decision;
 
 /// Largest request head the front end reads, in bytes.
@@ -137,18 +140,38 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
     };
     let decision = ctx.rules.decide(&host, port);
     let mut routed = Routed::begun(&ctx, &host, port, decision);
-    let served = relay(
-        &mut client,
-        forward,
-        &host,
-        port,
-        decision,
-        hop,
-        &mut routed,
-    )
-    .await;
+    let served = match own_address(&client, &host, port) {
+        Loop::Own(listening) => refuse_loop(&mut client, listening, &mut routed).await,
+        Loop::Elsewhere => {
+            relay(
+                &mut client,
+                forward,
+                &host,
+                port,
+                decision,
+                hop,
+                &mut routed,
+            )
+            .await
+        }
+    };
     routed.ended(served.as_ref().err());
     served
+}
+
+/// Answers a loop with 502 and fails the connection, without opening any outbound socket.
+///
+/// The failure is returned rather than swallowed so [`Routed::ended`] records it: that log line is
+/// the only trace a loop leaves.
+async fn refuse_loop(
+    client: &mut TcpStream,
+    listening: SocketAddr,
+    routed: &mut Routed,
+) -> io::Result<()> {
+    routed.dialled(Connect::Refused);
+    let refusal = DialsItself::new(listening);
+    respond(client, BAD_GATEWAY, &refusal.to_string()).await?;
+    Err(refusal.into())
 }
 
 fn behind_the_head(rest: &[u8], method: Method, body: Body) -> &[u8] {

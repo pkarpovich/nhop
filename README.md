@@ -112,6 +112,21 @@ The origin therefore ends the answer by closing, rather than the proxy
 half-closing its write side - legal, but silently unanswered by some origins,
 Apple's timestamp service among them.
 
+Neither front end dials the address it accepted the connection on. A client that
+asks nhop to connect it to nhop is answered `502 Bad Gateway` on the HTTP side
+and reply `0x02` - RFC 1928's "connection not allowed by ruleset", which is what
+a policy refusal is - on the SOCKS5 one, before any outbound socket is opened,
+and the connection leaves one decision in the log carrying the refusal. The
+destination is compared against the address the client actually reached, by IP
+literal or by the name `localhost`; the unspecified addresses `0.0.0.0` and `::`
+count as that address too, since connecting to one of them lands on a local one.
+`nhop test` answers from the ruleset alone, so it still reports the route a
+listening address would have taken - the front end refuses it at connection time
+regardless. Two cases are deliberately out of scope: arriving on one front end
+and asking for the other one's port, which costs a single useless connection
+rather than a carousel, and short forms like `127.1` that only a resolver
+expands - names are not resolved on the hot path.
+
 ## Long-lived connections
 
 Every socket the router relays a connection over carries TCP keepalive: 15
@@ -472,8 +487,8 @@ Every decision event carries `host`, `port`, `decision`, `rule_index`, `class`,
 `error`. The two timings answer different questions: `connect_ms` is the dial
 alone, `duration_ms` the whole connection, so "slow to reach" and "held open for
 an hour" stop looking alike. `connect_ms` is absent only when nothing was
-dialled - a `require` refusal while the upstream is down - and present on a
-failed dial as well, so an attempt that cost two seconds before failing is still
+dialled - a `require` refusal while the upstream is down, or a request for the
+front end's own listening address - and present on a failed dial as well, so an attempt that cost two seconds before failing is still
 visible. The plain text form of `logs` and `tail` carries it too, as a
 `(dial 37ms)` suffix on the lifetime. Hostnames and ports only - no request
 bodies, headers or credentials are ever logged.

@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::time::Instant;
 
@@ -7,7 +7,9 @@ use nhop_ipc::{Host, Port};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::TcpStream;
 
-use crate::proxy::{ConnCtx, NextHop, Routed, UpstreamDown};
+use crate::proxy::{
+    ConnCtx, Connect, DialsItself, Loop, NextHop, Routed, UpstreamDown, own_address,
+};
 use crate::rules::Decision;
 
 const VERSION: u8 = 0x05;
@@ -37,6 +39,8 @@ enum Reply {
     Granted,
     /// The dial failed for a reason of its own.
     Failure,
+    /// The destination is refused by policy, the front end's own listening address included.
+    NotAllowed,
     /// A `require` rule needs an upstream that is down.
     HostUnreachable,
     /// The request was neither `CONNECT` nor anything else served.
@@ -50,6 +54,7 @@ impl Reply {
         match self {
             Self::Granted => 0x00,
             Self::Failure => 0x01,
+            Self::NotAllowed => 0x02,
             Self::HostUnreachable => 0x04,
             Self::CommandNotSupported => 0x07,
             Self::AddressNotSupported => 0x08,
@@ -91,9 +96,26 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
     };
     let decision = ctx.rules.decide(&host, port);
     let mut routed = Routed::begun(&ctx, &host, port, decision);
-    let served = relay(&mut client, &host, port, decision, hop, &mut routed).await;
+    let served = match own_address(&client, &host, port) {
+        Loop::Own(listening) => refuse_loop(&mut client, listening, &mut routed).await,
+        Loop::Elsewhere => relay(&mut client, &host, port, decision, hop, &mut routed).await,
+    };
     routed.ended(served.as_ref().err());
     served
+}
+
+/// Answers a loop with `0x02` and fails the connection, without opening any outbound socket.
+///
+/// RFC 1928 calls `0x02` "connection not allowed by ruleset"; `0x04` would claim the host is
+/// unreachable, which is untrue. The failure is returned so [`Routed::ended`] records it.
+async fn refuse_loop(
+    client: &mut TcpStream,
+    listening: SocketAddr,
+    routed: &mut Routed,
+) -> io::Result<()> {
+    routed.dialled(Connect::Refused);
+    answer(client, Reply::NotAllowed).await?;
+    Err(DialsItself::new(listening).into())
 }
 
 async fn relay(
@@ -335,6 +357,10 @@ mod tests {
         assert_eq!(
             written(Reply::Failure).await,
             vec![0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            written(Reply::NotAllowed).await,
+            vec![0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
             written(Reply::HostUnreachable).await,

@@ -176,8 +176,9 @@ pub struct EventView {
     pub upstream: HealthState,
     /// How long the dial phase took, absent when no dial was attempted.
     ///
-    /// A `require` rule refused while the verdict is down never touches the network, so it reports
-    /// nothing; a dial that was made reports its time whether or not it produced a connection.
+    /// A `require` rule refused while the verdict is down, and a request for the front end's own
+    /// listening address, never touch the network, so they report nothing; a dial that was made
+    /// reports its time whether or not it produced a connection.
     /// Absent as well on a line written before the field existed.
     #[serde(default)]
     pub connect_ms: Option<u64>,

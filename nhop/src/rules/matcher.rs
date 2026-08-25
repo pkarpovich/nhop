@@ -60,6 +60,11 @@ impl NormalizedHost {
     pub fn as_str(&self) -> &str {
         &self.host
     }
+
+    /// Returns the address the host was written as, absent when it is a name.
+    pub fn address(&self) -> Option<IpAddr> {
+        self.address
+    }
 }
 
 /// Hostname suffix matched exactly or on a dot boundary.

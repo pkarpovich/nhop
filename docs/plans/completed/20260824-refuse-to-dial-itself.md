@@ -190,27 +190,27 @@ should be answerable from `nhop logs` alone.
 **Files:**
 - Modify: `nhop/src/proxy/mod.rs`
 
-- [ ] add `dials_itself(destination, port, listening)` with a doc comment stating
+- [x] add `dials_itself(destination, port, listening)` with a doc comment stating
       why the check exists (RFC 9110 §7.6.3 loop requirement; `Via` unusable on a
       tunnelling front end), and recording the deliberate gap: names are not
       resolved, so short forms like `127.1` are not caught
-- [ ] port comparison first, host inspection only on a port match
-- [ ] canonicalise a literal destination: parse to `IpAddr`, fold IPv4-mapped IPv6
+- [x] port comparison first, host inspection only on a port match
+- [x] canonicalise a literal destination: parse to `IpAddr`, fold IPv4-mapped IPv6
       back to v4 with `to_ipv4_mapped()`
-- [ ] a loop is: canonical destination equals `listening.ip()`; or the destination
+- [x] a loop is: canonical destination equals `listening.ip()`; or the destination
       is unspecified (`0.0.0.0`, `::`); or the destination is the name `localhost`
       (case-insensitive, trailing dot stripped) while `listening.ip()` is loopback
-- [ ] write tests for each arm: `127.0.0.1` and `localhost` against a
+- [x] write tests for each arm: `127.0.0.1` and `localhost` against a
       `127.0.0.1:7890` front end are loops; `::ffff:127.0.0.1` is a loop (this is
       the exact string `socks5.rs:178` renders for an ATYP_IPV6 request);
       `0.0.0.0` and `::` are loops
-- [ ] write tests for the boundaries: `127.0.0.2:7890` against a `127.0.0.1:7890`
+- [x] write tests for the boundaries: `127.0.0.2:7890` against a `127.0.0.1:7890`
       front end is **not** a loop; a non-loopback front end (`192.168.1.5:7890`)
       refuses its own address and not `localhost`; the same host on a different
       port is not a loop; trailing dot and mixed case still match
-- [ ] write a test pinning the known gap: `127.1` is **not** caught, so the limit
+- [x] write a test pinning the known gap: `127.1` is **not** caught, so the limit
       is visible in the suite rather than only in prose
-- [ ] run `mise run check` - must pass before task 2
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: refuse on the HTTP front end
 
@@ -218,21 +218,21 @@ should be answerable from `nhop logs` alone.
 - Modify: `nhop/src/proxy/http.rs`
 - Modify: `nhop/tests/http_proxy.rs`
 
-- [ ] read `client.local_addr()` in `serve`, treating a read failure as "not a
+- [x] read `client.local_addr()` in `serve`, treating a read failure as "not a
       loop"
-- [ ] add the `DialsItself` error beside `UpstreamDown` in `proxy/mod.rs`, its
+- [x] add the `DialsItself` error beside `UpstreamDown` in `proxy/mod.rs`, its
       `Display` rendering `nhop: refusing to dial my own listening address <addr>`
-- [ ] between the rule decision and `relay(..)`, refuse a loop: answer
+- [x] between the rule decision and `relay(..)`, refuse a loop: answer
       `502 Bad Gateway` with that text as the body, record
       `routed.dialled(Connect::Refused)`, and **return the error** from `serve` so
       `Routed::ended` fills the event's `error` rather than leaving it null
-- [ ] write a test: `CONNECT` to the front end's own address answers 502 **and
+- [x] write a test: `CONNECT` to the front end's own address answers 502 **and
       the stub destination records no dial at all**
-- [ ] write a test: an absolute-form request aimed at the front end's own address
+- [x] write a test: an absolute-form request aimed at the front end's own address
       is refused the same way
-- [ ] write a test: `localhost:19998` still reaches its destination, pinning the
+- [x] write a test: `localhost:19998` still reaches its destination, pinning the
       behaviour of ordinary local services
-- [ ] run `mise run check` - must pass before task 3
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: refuse on the SOCKS5 front end
 
@@ -240,36 +240,41 @@ should be answerable from `nhop logs` alone.
 - Modify: `nhop/src/proxy/socks5.rs`
 - Modify: `nhop/tests/socks5_proxy.rs`
 
-- [ ] same read of `client.local_addr()`, same placement between decision and
+- [x] same read of `client.local_addr()`, same placement between decision and
       `relay(..)`
-- [ ] refuse with reply `0x02` (RFC 1928 "connection not allowed by ruleset"),
+- [x] refuse with reply `0x02` (RFC 1928 "connection not allowed by ruleset"),
       record `routed.dialled(Connect::Refused)` and return the same `DialsItself`
       error, so the event's `error` matches the HTTP side character for character
-- [ ] add `Reply::NotAllowed` (`0x02`) to the reply enum if it is not there yet -
+- [x] add `Reply::NotAllowed` (`0x02`) to the reply enum if it is not there yet -
       `socks5.rs:52` currently defines Granted/Failure/HostUnreachable/
       CommandNotSupported/AddressNotSupported
-- [ ] write a test: a SOCKS request for the front end's own address answers
-      `0x01` and dials nothing
-- [ ] write a test: the same address by name (`localhost`) is refused identically
-- [ ] run `mise run check` - must pass before task 4
+- [x] write a test: a SOCKS request for the front end's own address answers
+      `0x02` and dials nothing (the plan read `0x01` here, contradicting the reply
+      code this task pins everywhere else; corrected to `0x02`)
+- [x] write a test: the same address by name (`localhost`) is refused identically
+- [x] run `mise run check` - must pass before task 4
+
+➕ `Loop` and `own_address` moved from `proxy/http.rs` to `proxy/mod.rs`, private
+   there so both front ends see them, rather than duplicating the
+   `client.local_addr()` read on the SOCKS5 side
 
 ### Task 4: the refusal is visible as an event
 
 **Files:**
 - Modify: `nhop/tests/http_proxy.rs`
 
-- [ ] assert through the **event fan-out**, not the log file: the
+- [x] assert through the **event fan-out**, not the log file: the
       `watched()` / `next_decision()` idiom already used in `http_proxy.rs` and
       `socks5_proxy.rs`, which needs no tracing subscriber
-- [ ] do **not** touch `nhop/tests/decision_log.rs`: it is a single-test binary
+- [x] do **not** touch `nhop/tests/decision_log.rs`: it is a single-test binary
       whose test installs a process-global subscriber
       (`tracing::subscriber::set_global_default(..).unwrap()`, `decision_log.rs:82`)
       and reads events back out of its own tempdir. A second test in that binary
       either panics on the second `set_global_default`, or logs into the other
       test's tempdir, or races it through a shared `Paths`
-- [ ] write a test: a refused loop produces exactly one decision event whose
+- [x] write a test: a refused loop produces exactly one decision event whose
       `error` is the pinned `DialsItself` text and whose `connect_ms` is null
-- [ ] run `mise run check` - must pass before task 5
+- [x] run `mise run check` - must pass before task 5
 
 ### Task 5: version bump and documentation
 
@@ -277,32 +282,45 @@ should be answerable from `nhop logs` alone.
 - Modify: `Cargo.toml` (+ `Cargo.lock` via cargo)
 - Modify: `README.md`, `CLAUDE.md`
 
-- [ ] bump the workspace version 0.1.3 -> 0.1.4
-- [ ] README: a short paragraph under the front-end description - the router
+- [x] bump the workspace version 0.1.3 -> 0.1.4
+- [x] README: a short paragraph under the front-end description - the router
       refuses to dial its own listening address, what the client sees (502 and
       SOCKS `0x02`), and the two deliberate limits: the cross-port case is not
       covered, and names are not resolved so short forms like `127.1` slip through
-- [ ] CLAUDE.md: add the invariant that a front end never dials the address it
+- [x] CLAUDE.md: add the invariant that a front end never dials the address it
       accepted the connection on, that the check reads `client.local_addr()`
       rather than any shared state, and that it compares against `listening.ip()`
       rather than "any loopback"
-- [ ] verify the existing `Dialled::Refused` doc comment (`proxy/mod.rs:332`) and
+- [x] verify the existing `Dialled::Refused` doc comment (`proxy/mod.rs:332`) and
       its CLAUDE.md invariant still read true - this plan deliberately uses
       `Connect::Refused` so neither needs changing; if either was touched, put it
       back
-- [ ] run `mise run check` - must pass before task 6
+- [x] run `mise run check` - must pass before task 6
 
 ### Task 6: verify acceptance criteria
 
-- [ ] a loop is refused on both front ends, by literal and by name
-- [ ] no outbound socket is opened for a refused loop
-- [ ] ordinary local destinations are untouched
-- [ ] full gate: `mise run check`
+- [x] a loop is refused on both front ends, by literal and by name
+      (HTTP: `a_connect_request_for_the_front_ends_own_address_is_refused_before_any_dial`,
+      `an_absolute_form_request_..`, ➕ `the_front_ends_own_address_by_name_is_refused_the_same_way`;
+      SOCKS5: `a_request_for_the_front_ends_own_address_is_refused_before_any_dial`,
+      `the_front_ends_own_address_by_name_is_refused_identically`)
+- [x] no outbound socket is opened for a refused loop - every refusal test asserts
+      both `hop.asked() == []` and `origin.connections() == 0`
+- [x] ordinary local destinations are untouched
+      (`an_ordinary_local_destination_still_reaches_its_origin` on `localhost:19998`,
+      and the SOCKS5 `127.0.0.1:8443` direct dial)
+- [x] full gate: `mise run check` - fmt, clippy `-D warnings`, 354 tests green
 
 ### Task 7: [Final] close out the plan
 
-- [ ] re-read the README/CLAUDE.md deltas against the final code
-- [ ] move this plan to `docs/plans/completed/`
+- [x] re-read the README/CLAUDE.md deltas against the final code: the README
+      paragraph and the CLAUDE.md invariant both describe what shipped - the
+      `client.local_addr()` read, the comparison against `listening.ip()`, the
+      placement between decision and dial, 502 / SOCKS `0x02`, the `DialsItself`
+      error behind the event's `error`, and the two stated gaps (cross-port,
+      unresolved short forms). `Dialled::Refused` and its invariant are untouched;
+      no `0.1.3` reference survives outside this plan
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
