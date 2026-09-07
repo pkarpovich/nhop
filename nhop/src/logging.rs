@@ -3,7 +3,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use nhop_ipc::{DecisionKind, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp};
+use nhop_ipc::{
+    DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp,
+};
 use tracing::Subscriber;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::EnvFilter;
@@ -70,6 +72,7 @@ pub fn decision(event: &EventView) {
         class,
         upstream,
         connect_ms,
+        hop,
         duration_ms,
         error,
     } = event;
@@ -83,6 +86,7 @@ pub fn decision(event: &EventView) {
         class = class.map(class_name),
         upstream = health_name(*upstream),
         connect_ms = *connect_ms,
+        hop = hop.map(hop_name),
         duration_ms = *duration_ms,
         error = error.as_deref(),
     );
@@ -241,6 +245,14 @@ fn class_name(class: RuleClass) -> &'static str {
     }
 }
 
+fn hop_name(hop: EffectiveHop) -> &'static str {
+    match hop {
+        EffectiveHop::Direct => "direct",
+        EffectiveHop::Upstream => "upstream",
+        EffectiveHop::FallbackDirect => "fallback_direct",
+    }
+}
+
 fn health_name(health: HealthState) -> &'static str {
     match health {
         HealthState::Up => "up",
@@ -264,6 +276,7 @@ mod tests {
         class: Option<RuleClass>,
         upstream: HealthState,
         connect_ms: Option<u64>,
+        hop: Option<EffectiveHop>,
         duration_ms: u64,
         error: Option<String>,
     }
@@ -283,6 +296,7 @@ mod tests {
             class: Some(RuleClass::Require),
             upstream: HealthState::Up,
             connect_ms: Some(2),
+            hop: Some(EffectiveHop::Upstream),
             duration_ms: 17,
             error: Some("reset by peer".to_owned()),
         }
@@ -297,6 +311,7 @@ mod tests {
             class: None,
             upstream: HealthState::Down,
             connect_ms: None,
+            hop: None,
             duration_ms: 4,
             error: None,
         }
@@ -345,6 +360,7 @@ mod tests {
             class,
             upstream,
             connect_ms,
+            hop,
             duration_ms,
             error,
         } = matched();
@@ -358,6 +374,7 @@ mod tests {
                 class,
                 upstream,
                 connect_ms,
+                hop,
                 duration_ms,
                 error,
             }
@@ -365,6 +382,7 @@ mod tests {
         let absent = fields_of(&lines[1]);
         assert_eq!(absent.rule_index, None);
         assert_eq!(absent.connect_ms, None);
+        assert_eq!(absent.hop, None);
         assert_eq!(absent.class, None);
         assert_eq!(absent.error, None);
     }
@@ -516,6 +534,17 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&health).unwrap(),
                 format!("\"{}\"", health_name(health))
+            );
+        }
+        let hops = [
+            EffectiveHop::Direct,
+            EffectiveHop::Upstream,
+            EffectiveHop::FallbackDirect,
+        ];
+        for hop in hops {
+            assert_eq!(
+                serde_json::to_string(&hop).unwrap(),
+                format!("\"{}\"", hop_name(hop))
             );
         }
     }

@@ -273,16 +273,16 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 - Modify: `nhop/tests/support/mod.rs`
 - Modify: `nhop/tests/upstream_dialer.rs`
 
-- [ ] add `EffectiveHop` to `nhop-ipc/src/view.rs` beside `DecisionKind`, deriving the same traits and `#[serde(rename_all = "snake_case")]`
-- [ ] reshape `Dialled::Attempted` and `Connect::Attempted` exactly as "The dial reports its path" specifies, add `hop` to `Routed`, and fill `EventView.hop` in `ended`
-- [ ] change `preferred()` to return `(EffectiveHop, io::Result<TcpStream>)` and wrap it in `routed()`; `required()` reports `Upstream`, the `Direct`/`Never` arms of `dial()` report `Direct`
-- [ ] update every construction and pattern of the changed shapes: the `.timed(..)` callers in `http.rs` and `socks5.rs`, the `Connect::Attempted` construction in the `proxy/mod.rs` unit tests, `StubHop` and `DownHop` in the support module, the `dial` helper and the refusal test in `nhop/tests/upstream_dialer.rs`, the unit tests in `nhop/src/upstream/mod.rs` that match on `Dialled::`, and the tests Tasks 2-4 added - asserting the hop where it is the point and ignoring it elsewhere
-- [ ] add `hop: Option<EffectiveHop>` to `EventView` with `#[serde(default)]` and a doc comment naming both absences: no dial was made, and a line written before the field existed
-- [ ] emit it in `logging::decision` via a `hop_name` helper, and in `render_event` as the ` -> direct` suffix after the rule when the hop is `FallbackDirect` only
-- [ ] write the unit test `a_prefer_fallback_reports_fallback_direct`: a `prefer` decision with the verdict seeded `Down` returns `Dialled::Attempted { hop: FallbackDirect, .. }`; and `a_require_dial_reports_upstream` for a `require` decision through `upstream_answering(GRANTED)`
-- [ ] write the rendering test `a_fallback_direct_line_renders_the_suffix` in `nhop/src/cli/mod.rs`, asserting the full expected line for an event with `decision: Upstream`, `class: Prefer`, `hop: Some(FallbackDirect)` in the shape of the example under "Event and log shape"; confirm `logs_renders_a_decision_line_as_text_and_leaves_the_rest_alone` and `logs_render_the_dial_time_of_a_line_that_carries_one` still pass with their expected strings byte-unchanged
-- [ ] extend the serde-parity test in `nhop/src/logging.rs` (the one iterating `DecisionKind`, `RuleClass`, `HealthState`) to cover every `EffectiveHop` variant against `hop_name`
-- [ ] run `mise run check` - must pass before task 6
+- [x] add `EffectiveHop` to `nhop-ipc/src/view.rs` beside `DecisionKind`, deriving the same traits and `#[serde(rename_all = "snake_case")]`
+- [x] reshape `Dialled::Attempted` and `Connect::Attempted` exactly as "The dial reports its path" specifies, add `hop` to `Routed`, and fill `EventView.hop` in `ended`
+- [x] change `preferred()` to return `(EffectiveHop, io::Result<TcpStream>)` and wrap it in `routed()`; `required()` reports `Upstream`, the `Direct`/`Never` arms of `dial()` report `Direct`
+- [x] update every construction and pattern of the changed shapes: the `.timed(..)` callers in `http.rs` and `socks5.rs`, the `Connect::Attempted` construction in the `proxy/mod.rs` unit tests, `StubHop` and `DownHop` in the support module, the `dial` helper and the refusal test in `nhop/tests/upstream_dialer.rs`, the unit tests in `nhop/src/upstream/mod.rs` that match on `Dialled::`, and the tests Tasks 2-4 added - asserting the hop where it is the point and ignoring it elsewhere
+- [x] add `hop: Option<EffectiveHop>` to `EventView` with `#[serde(default)]` and a doc comment naming both absences: no dial was made, and a line written before the field existed
+- [x] emit it in `logging::decision` via a `hop_name` helper, and in `render_event` as the ` -> direct` suffix after the rule when the hop is `FallbackDirect` only
+- [x] write the unit test `a_prefer_fallback_reports_fallback_direct`: a `prefer` decision with the verdict seeded `Down` returns `Dialled::Attempted { hop: FallbackDirect, .. }`; and `a_require_dial_reports_upstream` for a `require` decision through `upstream_answering(GRANTED)`
+- [x] write the rendering test `a_fallback_direct_line_renders_the_suffix` in `nhop/src/cli/mod.rs`, asserting the full expected line for an event with `decision: Upstream`, `class: Prefer`, `hop: Some(FallbackDirect)` in the shape of the example under "Event and log shape"; confirm `logs_renders_a_decision_line_as_text_and_leaves_the_rest_alone` and `logs_render_the_dial_time_of_a_line_that_carries_one` still pass with their expected strings byte-unchanged
+- [x] extend the serde-parity test in `nhop/src/logging.rs` (the one iterating `DecisionKind`, `RuleClass`, `HealthState`) to cover every `EffectiveHop` variant against `hop_name`
+- [x] run `mise run check` - must pass before task 6
 
 ### Task 6: Log verdict transitions with their cause and render them
 

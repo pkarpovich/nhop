@@ -613,6 +613,7 @@ mod tests {
             class: None,
             upstream: HealthState::Down,
             connect_ms: Some(1),
+            hop: Some(nhop_ipc::EffectiveHop::Direct),
             duration_ms: 3,
             error: None,
         }

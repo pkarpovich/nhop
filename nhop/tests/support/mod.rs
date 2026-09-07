@@ -12,7 +12,7 @@ use std::time::Duration;
 use nhop::daemon::{self, Daemon};
 use nhop::proxy::{Dialled, Listen, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleId};
-use nhop_ipc::{Command, Host, Paths, Port, Response, UpstreamAddr};
+use nhop_ipc::{Command, EffectiveHop, Host, Paths, Port, Response, UpstreamAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -410,7 +410,12 @@ impl NextHop for StubHop {
             .lock()
             .unwrap()
             .push((host.clone(), port, decision));
-        Box::pin(async move { Dialled::Attempted(TcpStream::connect(self.target).await) })
+        Box::pin(async move {
+            Dialled::Attempted {
+                hop: EffectiveHop::Direct,
+                next: TcpStream::connect(self.target).await,
+            }
+        })
     }
 }
 
@@ -455,7 +460,10 @@ impl NextHop for DownHop {
                 Refusal::BeforeDialling => Dialled::Refused(refused),
                 Refusal::AfterDialling(took) => {
                     tokio::time::sleep(took).await;
-                    Dialled::Attempted(Err(refused))
+                    Dialled::Attempted {
+                        hop: EffectiveHop::Upstream,
+                        next: Err(refused),
+                    }
                 }
             }
         })

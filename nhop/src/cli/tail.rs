@@ -109,6 +109,7 @@ mod tests {
             class: None,
             upstream: HealthState::Up,
             connect_ms: None,
+            hop: None,
             duration_ms: 9,
             error: None,
         }

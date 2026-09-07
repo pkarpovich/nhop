@@ -38,6 +38,22 @@ pub enum DecisionKind {
     Upstream,
 }
 
+/// Which way the bytes of a connection actually travelled.
+///
+/// [`DecisionKind`] says what the ruleset asked for; this says what the dial did with it, which is
+/// the same thing only when nothing fell back. There is no refused variant: an event with no dial
+/// time already says no dial was made, and a second spelling of that fact could disagree with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveHop {
+    /// Dialled straight to the destination, as the decision asked.
+    Direct,
+    /// Dialled through the upstream proxy, as the decision asked.
+    Upstream,
+    /// A `prefer` rule that asked for the upstream and took the direct route instead.
+    FallbackDirect,
+}
+
 /// Verdict on whether the upstream is usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,12 +192,19 @@ pub struct EventView {
     pub upstream: HealthState,
     /// How long the dial phase took, absent when no dial was attempted.
     ///
-    /// A `require` rule refused while the verdict is down, and a request for the front end's own
+    /// A `require` rule refused with no upstream configured, and a request for the front end's own
     /// listening address, never touch the network, so they report nothing; a dial that was made
     /// reports its time whether or not it produced a connection.
     /// Absent as well on a line written before the field existed.
     #[serde(default)]
     pub connect_ms: Option<u64>,
+    /// Which way the connection actually went, absent when no dial was made.
+    ///
+    /// A `require` rule refused with no upstream configured, and a request for the front end's own
+    /// listening address, never reach a dial site, so there is no path to report.
+    /// Absent as well on a line written before the field existed.
+    #[serde(default)]
+    pub hop: Option<EffectiveHop>,
     /// How long the connection lasted.
     pub duration_ms: u64,
     /// Why the connection ended badly, absent when it did not.
@@ -239,6 +262,7 @@ mod tests {
             class: Some(RuleClass::Require),
             upstream: HealthState::Up,
             connect_ms: Some(37),
+            hop: Some(EffectiveHop::Upstream),
             duration_ms: 1_204,
             error: None,
         }
@@ -269,7 +293,25 @@ mod tests {
 
         let mut expected = routed();
         expected.connect_ms = None;
+        expected.hop = None;
         assert_eq!(event, expected);
+    }
+
+    #[test]
+    fn an_effective_hop_round_trips() {
+        let event = routed();
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(wire.contains(r#""hop":"upstream""#), "{wire}");
+        assert_eq!(serde_json::from_str::<EventView>(&wire).unwrap(), event);
+    }
+
+    #[test]
+    fn an_absent_effective_hop_round_trips() {
+        let mut event = routed();
+        event.hop = None;
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(wire.contains(r#""hop":null"#), "{wire}");
+        assert_eq!(serde_json::from_str::<EventView>(&wire).unwrap(), event);
     }
 
     #[test]
@@ -286,6 +328,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&LoadOutcome::TimedOut).unwrap(),
             r#""timed_out""#
+        );
+        assert_eq!(
+            serde_json::to_string(&EffectiveHop::FallbackDirect).unwrap(),
+            r#""fallback_direct""#
         );
     }
 }

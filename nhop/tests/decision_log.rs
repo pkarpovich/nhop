@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use nhop::logging::{self, LoggedDecision};
-use nhop_ipc::{DecisionKind, EventView, HealthState, Host, Paths, Port};
+use nhop_ipc::{DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -98,6 +98,7 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
             class,
             upstream,
             connect_ms,
+            hop,
             duration_ms,
             error,
         } = event;
@@ -112,6 +113,7 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
             panic!("a direct connection dialled, so its dial time must be recorded");
         };
         assert!(connect_ms <= duration_ms, "{connect_ms} > {duration_ms}");
+        assert_eq!(hop, Some(EffectiveHop::Direct));
         assert_eq!(error, None);
     }
     assert_eq!(origin.connections(), 2);

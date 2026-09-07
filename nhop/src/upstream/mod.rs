@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
-use nhop_ipc::{HealthState, Host, Port, RuleClass};
+use nhop_ipc::{EffectiveHop, HealthState, Host, Port, RuleClass};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -164,9 +164,15 @@ impl UpstreamHop {
     async fn routed(&self, host: &Host, port: Port, class: RuleClass, rule: RuleId) -> Dialled {
         let upstream = self.upstream.snapshot();
         match class {
-            RuleClass::Never => Dialled::Attempted(direct(host, port).await),
+            RuleClass::Never => Dialled::Attempted {
+                hop: EffectiveHop::Direct,
+                next: direct(host, port).await,
+            },
             RuleClass::Require => self.required(host, port, rule, upstream).await,
-            RuleClass::Prefer => Dialled::Attempted(self.preferred(host, port, upstream).await),
+            RuleClass::Prefer => {
+                let (hop, next) = self.preferred(host, port, upstream).await;
+                Dialled::Attempted { hop, next }
+            }
         }
     }
 
@@ -191,22 +197,24 @@ impl UpstreamHop {
         if upstream == NO_UPSTREAM {
             return Dialled::Refused(UpstreamDown::new(upstream, rule).into());
         }
-        Dialled::Attempted(
-            match through(host, port, upstream, UpstreamBudget::Require).await {
-                Ok(next) => {
-                    self.observed(upstream, HealthState::Up);
-                    Ok(next)
-                }
-                Err(DialFailure::Destination(failure)) => {
-                    self.observed(upstream, HealthState::Up);
-                    Err(failure)
-                }
-                Err(DialFailure::Upstream(_failure)) => {
-                    self.observed(upstream, HealthState::Down);
-                    Err(UpstreamDown::new(upstream, rule).into())
-                }
-            },
-        )
+        let next = match through(host, port, upstream, UpstreamBudget::Require).await {
+            Ok(next) => {
+                self.observed(upstream, HealthState::Up);
+                Ok(next)
+            }
+            Err(DialFailure::Destination(failure)) => {
+                self.observed(upstream, HealthState::Up);
+                Err(failure)
+            }
+            Err(DialFailure::Upstream(_failure)) => {
+                self.observed(upstream, HealthState::Down);
+                Err(UpstreamDown::new(upstream, rule).into())
+            }
+        };
+        Dialled::Attempted {
+            hop: EffectiveHop::Upstream,
+            next,
+        }
     }
 
     /// Records what one real dial saw about the upstream it was made against.
@@ -226,26 +234,31 @@ impl UpstreamHop {
         self.health.set(state);
     }
 
+    /// Dials a `prefer` destination, reporting which of its two routes carried the connection.
+    ///
+    /// Every path that ends at [`direct`] reports [`EffectiveHop::FallbackDirect`], because from
+    /// the client's side those connections are indistinguishable from an upstream one and the log
+    /// is the only place the difference can be seen.
     async fn preferred(
         &self,
         host: &Host,
         port: Port,
         upstream: SocketAddr,
-    ) -> io::Result<TcpStream> {
+    ) -> (EffectiveHop, io::Result<TcpStream>) {
         match self.health.state() {
-            HealthState::Down => direct(host, port).await,
+            HealthState::Down => (EffectiveHop::FallbackDirect, direct(host, port).await),
             HealthState::Up => match through(host, port, upstream, UpstreamBudget::Prefer).await {
                 Ok(next) => {
                     self.observed(upstream, HealthState::Up);
-                    Ok(next)
+                    (EffectiveHop::Upstream, Ok(next))
                 }
                 Err(DialFailure::Destination(_failure)) => {
                     self.observed(upstream, HealthState::Up);
-                    direct(host, port).await
+                    (EffectiveHop::FallbackDirect, direct(host, port).await)
                 }
                 Err(DialFailure::Upstream(_failure)) => {
                     self.observed(upstream, HealthState::Down);
-                    direct(host, port).await
+                    (EffectiveHop::FallbackDirect, direct(host, port).await)
                 }
             },
         }
@@ -270,8 +283,14 @@ impl NextHop for UpstreamHop {
     ) -> Pin<Box<dyn Future<Output = Dialled> + Send + 'a>> {
         Box::pin(async move {
             match decision {
-                Decision::Direct => Dialled::Attempted(direct(host, port).await),
-                Decision::Never { rule: _ } => Dialled::Attempted(direct(host, port).await),
+                Decision::Direct => Dialled::Attempted {
+                    hop: EffectiveHop::Direct,
+                    next: direct(host, port).await,
+                },
+                Decision::Never { rule: _ } => Dialled::Attempted {
+                    hop: EffectiveHop::Direct,
+                    next: direct(host, port).await,
+                },
                 Decision::Upstream { class, rule } => self.routed(host, port, class, rule).await,
             }
         })
@@ -535,7 +554,7 @@ mod tests {
     ) -> io::Result<TcpStream> {
         match hop.dial(host, port, decision).await {
             Dialled::Refused(failure) => Err(failure),
-            Dialled::Attempted(next) => next,
+            Dialled::Attempted { hop: _, next } => next,
         }
     }
 
@@ -714,7 +733,7 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Require, 4))
             .await;
 
-        let Dialled::Attempted(next) = dialled else {
+        let Dialled::Attempted { hop: _, next } = dialled else {
             panic!("a configured upstream is dialled whatever the verdict says");
         };
         let failure = next.unwrap_err();
@@ -750,7 +769,7 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Require, 4))
             .await;
 
-        let Dialled::Attempted(next) = dialled else {
+        let Dialled::Attempted { hop: _, next } = dialled else {
             panic!("a dial that reached the network must be reported as attempted");
         };
         let failure = next.unwrap_err();
@@ -758,6 +777,42 @@ mod tests {
             UpstreamDown::carried_by(&failure).is_some(),
             "the client still sees the upstream-down surface: {failure}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_prefer_fallback_reports_fallback_direct() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(closed_port().await, HealthState::Down, PATIENT);
+
+        let dialled = hop
+            .dial(&host, port, upstream_decision(RuleClass::Prefer, 7))
+            .await;
+
+        let Dialled::Attempted { hop, next } = dialled else {
+            panic!("a prefer decision dials whichever route it takes");
+        };
+        let _next = next.unwrap();
+        assert_eq!(hop, EffectiveHop::FallbackDirect);
+    }
+
+    #[tokio::test]
+    async fn a_require_dial_reports_upstream() {
+        let (_listener, host, port) = destination().await;
+        let upstream = hop(
+            upstream_answering(GRANTED).await,
+            HealthState::Down,
+            PATIENT,
+        );
+
+        let dialled = upstream
+            .dial(&host, port, upstream_decision(RuleClass::Require, 7))
+            .await;
+
+        let Dialled::Attempted { hop, next } = dialled else {
+            panic!("a configured upstream is dialled whatever the verdict says");
+        };
+        let _next = next.unwrap();
+        assert_eq!(hop, EffectiveHop::Upstream);
     }
 
     #[tokio::test]
