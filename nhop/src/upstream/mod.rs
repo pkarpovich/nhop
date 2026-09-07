@@ -18,8 +18,48 @@ use crate::daemon::state::{LOAD_TIMEOUT, LiveUpstream};
 use crate::proxy::{Dialled, NO_UPSTREAM, NextHop, UpstreamDown};
 use crate::rules::{Decision, RuleId};
 
-/// How long a dial through the upstream may take before it counts as a failure.
-pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a `prefer` dial through the upstream may take before it counts as a failure.
+///
+/// A `prefer` dial has a direct route waiting behind it, so the budget is not "how long may this
+/// connection take" but "how long is it worth waiting before taking the route we already have".
+/// Two seconds is that answer: long enough that a healthy upstream is never given up on, short
+/// enough that the fallback is not felt as a hang.
+pub const PREFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a `require` dial through the upstream may take before it counts as a failure.
+///
+/// A `require` destination has no direct route behind it, so this budget is the whole connection's
+/// patience rather than a decision point: giving up early does not reach the destination faster, it
+/// only fails sooner. Ten seconds covers the deepest stalls seen when the upstream host is merely
+/// starved rather than gone - a degraded upstream answered ICMP in up to ten seconds while still
+/// serving SOCKS - and it caps the one case that costs a full wait, an upstream whose SYNs queue
+/// behind an ARP that never answers, measured at the full budget for the first minute after the
+/// machine goes down.
+///
+/// It is a compile-time constant like every other timing constant here: the value is a property of
+/// how long a person will wait for a page, not of a deployment.
+pub const REQUIRE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one dial through the upstream may take, chosen by the class of the rule that sent it.
+///
+/// The asymmetry is the point: `prefer` is timing how long to wait before taking the direct route
+/// it already has, `require` is timing how long a user will wait for the only route there is.
+#[derive(Debug, Clone, Copy)]
+pub enum UpstreamBudget {
+    /// The budget for a dial with a direct route waiting behind it, [`PREFER_CONNECT_TIMEOUT`].
+    Prefer,
+    /// The budget for a dial with no fallback, [`REQUIRE_CONNECT_TIMEOUT`].
+    Require,
+}
+
+impl UpstreamBudget {
+    fn allowance(self) -> Duration {
+        match self {
+            Self::Prefer => PREFER_CONNECT_TIMEOUT,
+            Self::Require => REQUIRE_CONNECT_TIMEOUT,
+        }
+    }
+}
 
 /// How long the patrol waits between probes, in either verdict state.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
@@ -142,14 +182,16 @@ impl UpstreamHop {
     ) -> Dialled {
         match self.health.state() {
             HealthState::Down => Dialled::Refused(UpstreamDown::new(upstream, rule).into()),
-            HealthState::Up => Dialled::Attempted(match through(host, port, upstream).await {
-                Ok(next) => Ok(next),
-                Err(DialFailure::Destination(failure)) => Err(failure),
-                Err(DialFailure::Upstream(_failure)) => {
-                    self.health.set(HealthState::Down);
-                    Err(UpstreamDown::new(upstream, rule).into())
-                }
-            }),
+            HealthState::Up => Dialled::Attempted(
+                match through(host, port, upstream, UpstreamBudget::Require).await {
+                    Ok(next) => Ok(next),
+                    Err(DialFailure::Destination(failure)) => Err(failure),
+                    Err(DialFailure::Upstream(_failure)) => {
+                        self.health.set(HealthState::Down);
+                        Err(UpstreamDown::new(upstream, rule).into())
+                    }
+                },
+            ),
         }
     }
 
@@ -161,7 +203,7 @@ impl UpstreamHop {
     ) -> io::Result<TcpStream> {
         match self.health.state() {
             HealthState::Down => direct(host, port).await,
-            HealthState::Up => match through(host, port, upstream).await {
+            HealthState::Up => match through(host, port, upstream, UpstreamBudget::Prefer).await {
                 Ok(next) => Ok(next),
                 Err(DialFailure::Destination(_failure)) => direct(host, port).await,
                 Err(DialFailure::Upstream(_failure)) => {
@@ -236,16 +278,22 @@ async fn direct(host: &Host, port: Port) -> io::Result<TcpStream> {
     Ok(dialled)
 }
 
-async fn through(host: &Host, port: Port, upstream: SocketAddr) -> Result<TcpStream, DialFailure> {
+async fn through(
+    host: &Host,
+    port: Port,
+    upstream: SocketAddr,
+    budget: UpstreamBudget,
+) -> Result<TcpStream, DialFailure> {
     let Host(host) = host;
     let Port(port) = port;
+    let budget = budget.allowance();
     let dialling = Socks5Stream::connect(upstream, (host.as_str(), port));
-    let Ok(dialled) = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, dialling).await else {
+    let Ok(dialled) = tokio::time::timeout(budget, dialling).await else {
         return Err(DialFailure::Upstream(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "the upstream {upstream} did not answer within {}s",
-                UPSTREAM_CONNECT_TIMEOUT.as_secs()
+                budget.as_secs()
             ),
         )));
     };
@@ -465,6 +513,21 @@ mod tests {
         listener.local_addr().unwrap()
     }
 
+    async fn black_hole() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
     async fn upstream_answering(reply: [u8; 10]) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -524,9 +587,49 @@ mod tests {
         let (_listener, host, port) = destination().await;
         let upstream = upstream_answering(GRANTED).await;
 
-        let dialled = through(&host, port, upstream).await.unwrap();
+        let dialled = through(&host, port, upstream, UpstreamBudget::Prefer)
+            .await
+            .unwrap();
 
         armed_keepalive(&dialled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prefer_budget_gives_up_at_the_prefer_timeout() {
+        let (_listener, host, port) = destination().await;
+        let upstream = black_hole().await;
+        let started = tokio::time::Instant::now();
+
+        let failure = through(&host, port, upstream, UpstreamBudget::Prefer)
+            .await
+            .unwrap_err();
+
+        assert_eq!(started.elapsed(), PREFER_CONNECT_TIMEOUT);
+        match failure {
+            DialFailure::Upstream(_failure) => (),
+            DialFailure::Destination(answered) => {
+                panic!("a black hole answers nothing, got {answered}")
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_require_budget_gives_up_at_the_require_timeout() {
+        let (_listener, host, port) = destination().await;
+        let upstream = black_hole().await;
+        let started = tokio::time::Instant::now();
+
+        let failure = through(&host, port, upstream, UpstreamBudget::Require)
+            .await
+            .unwrap_err();
+
+        assert_eq!(started.elapsed(), REQUIRE_CONNECT_TIMEOUT);
+        match failure {
+            DialFailure::Upstream(_failure) => (),
+            DialFailure::Destination(answered) => {
+                panic!("a black hole answers nothing, got {answered}")
+            }
+        }
     }
 
     #[tokio::test]

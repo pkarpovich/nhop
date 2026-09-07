@@ -207,17 +207,17 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 - Modify: `nhop/src/upstream/mod.rs`
 - Modify: `nhop/tests/upstream_dialer.rs`
 
-- [ ] add `tokio = { workspace = true, features = ["test-util"] }` under `[dev-dependencies]` in `nhop/Cargo.toml` - `test-util` is not in the workspace feature list, so `tokio::time::pause` does not compile without it; dev-only keeps the paused clock out of the shipped binary
-- [ ] rename `UPSTREAM_CONNECT_TIMEOUT` to `PREFER_CONNECT_TIMEOUT`, keeping 2 s, and document that it is the budget for a dial that has a direct route waiting behind it
-- [ ] add `REQUIRE_CONNECT_TIMEOUT` at 10 s, documenting why a class with no fallback is given a longer one, that it caps the powered-off-upstream window measured in the Accepted trade-off, and why it is not configurable
-- [ ] add the `UpstreamBudget` enum with `Prefer` and `Require`, and a private method turning it into its `Duration`
-- [ ] give `through()` a fourth parameter of type `UpstreamBudget` and apply the matching duration in its `tokio::time::timeout`; the timeout error text names the budget's seconds as it does today. `required()` passes `Require`, `preferred()` passes `Prefer`. This changes the `require` dial budget to 10 s in this task; the verdict gate on `require` stays until Task 2
-- [ ] re-aim `a_dial_to_a_black_holed_upstream_fails_within_three_seconds` (`nhop/tests/upstream_dialer.rs:388`) at `prefer(0)` so it keeps pinning the 2 s budget - its `require` counterpart is written in Task 4
-- [ ] update the existing `through()` unit test (`an_upstream_socket_carries_keepalive_through_into_inner`) to pass a budget
-- [ ] add a unit helper `black_hole()` beside `closed_port()` that binds a `TcpListener` on port 0, spawns a task holding every accepted stream unanswered, and returns the address
-- [ ] write the unit test `a_prefer_budget_gives_up_at_the_prefer_timeout`: `#[tokio::test(start_paused = true)]`, `through()` against `black_hole()` with `UpstreamBudget::Prefer` returns `DialFailure::Upstream` and `tokio::time::Instant` advanced by exactly `PREFER_CONNECT_TIMEOUT`
-- [ ] write the unit test `a_require_budget_gives_up_at_the_require_timeout`: same shape with `UpstreamBudget::Require`, advanced by exactly `REQUIRE_CONNECT_TIMEOUT`
-- [ ] run `mise run check` - must pass before task 2
+- [x] add `tokio = { workspace = true, features = ["test-util"] }` under `[dev-dependencies]` in `nhop/Cargo.toml` - `test-util` is not in the workspace feature list, so `tokio::time::pause` does not compile without it; dev-only keeps the paused clock out of the shipped binary
+- [x] rename `UPSTREAM_CONNECT_TIMEOUT` to `PREFER_CONNECT_TIMEOUT`, keeping 2 s, and document that it is the budget for a dial that has a direct route waiting behind it
+- [x] add `REQUIRE_CONNECT_TIMEOUT` at 10 s, documenting why a class with no fallback is given a longer one, that it caps the powered-off-upstream window measured in the Accepted trade-off, and why it is not configurable
+- [x] add the `UpstreamBudget` enum with `Prefer` and `Require`, and a private method turning it into its `Duration`
+- [x] give `through()` a fourth parameter of type `UpstreamBudget` and apply the matching duration in its `tokio::time::timeout`; the timeout error text names the budget's seconds as it does today. `required()` passes `Require`, `preferred()` passes `Prefer`. This changes the `require` dial budget to 10 s in this task; the verdict gate on `require` stays until Task 2
+- [x] re-aim `a_dial_to_a_black_holed_upstream_fails_within_three_seconds` (`nhop/tests/upstream_dialer.rs:388`) at `prefer(0)` so it keeps pinning the 2 s budget - its `require` counterpart is written in Task 4
+- [x] update the existing `through()` unit test (`an_upstream_socket_carries_keepalive_through_into_inner`) to pass a budget
+- [x] add a unit helper `black_hole()` beside `closed_port()` that binds a `TcpListener` on port 0, spawns a task holding every accepted stream unanswered, and returns the address
+- [x] write the unit test `a_prefer_budget_gives_up_at_the_prefer_timeout`: `#[tokio::test(start_paused = true)]`, `through()` against `black_hole()` with `UpstreamBudget::Prefer` returns `DialFailure::Upstream` and `tokio::time::Instant` advanced by exactly `PREFER_CONNECT_TIMEOUT`
+- [x] write the unit test `a_require_budget_gives_up_at_the_require_timeout`: same shape with `UpstreamBudget::Require`, advanced by exactly `REQUIRE_CONNECT_TIMEOUT`
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: `require` dials whenever an upstream is configured
 

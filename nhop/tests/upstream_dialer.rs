@@ -386,19 +386,16 @@ async fn a_sequence_banked_against_one_upstream_is_not_closed_by_the_next() {
 
 #[tokio::test]
 async fn a_dial_to_a_black_holed_upstream_fails_within_three_seconds() {
+    let origin = StubOrigin::start().await;
     let blackhole: SocketAddr = "192.0.2.1:1080".parse().unwrap();
     let hop = hop(blackhole, HealthState::Up);
+    let (host, port) = named(origin.addr());
     let started = Instant::now();
 
-    let failure = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
-        .await
-        .unwrap_err();
+    let dialled = dial(&hop, &host, port, prefer(0)).await.unwrap();
 
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(3), "waited {waited:?}");
-    assert!(
-        UpstreamDown::carried_by(&failure).is_some(),
-        "{failure} must carry the upstream-down surface"
-    );
+    assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
     assert_eq!(hop.health().state(), HealthState::Down);
 }
