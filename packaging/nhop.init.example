@@ -21,8 +21,10 @@ nhop upstream socks5://192.0.2.10:1080  # replace
 nhop never suffix example-router.test  # replace
 nhop never cidr 198.51.100.0/24  # replace
 
-# require - must traverse the upstream. With the upstream down these fail at once: 502 on the HTTP
-# front end, reply 0x04 on the SOCKS5 one. Use it for what only exists behind the upstream.
+# require - must traverse the upstream. It is dialled whatever the health verdict says, giving up
+# after 10 s; only an upstream that is not configured at all is refused without a dial. A dial that
+# fails is 502 on the HTTP front end, reply 0x04 on the SOCKS5 one. Use it for what only exists
+# behind the upstream - an upstream that is merely slow still serves it, at the cost of waiting.
 nhop require suffix internal.example.com  # replace
 nhop require cidr 192.0.2.0/24  # replace
 nhop require keyword corp-only  # replace

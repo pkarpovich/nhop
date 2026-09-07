@@ -11,7 +11,7 @@ use crate::cli::Exit;
 use crate::cli::system_proxy::{NetworkService, ProxyFailure, SystemProxy};
 use crate::daemon::state::BindState;
 use crate::proxy::{Listen, NO_UPSTREAM};
-use crate::upstream::{Health, UPSTREAM_CONNECT_TIMEOUT};
+use crate::upstream::{Health, PREFER_CONNECT_TIMEOUT};
 
 /// Detail a check carries when nothing ran it.
 const NOT_CHECKED: &str = "not checked, the daemon did not answer";
@@ -275,12 +275,12 @@ pub async fn upstream_reachable(
     } = health;
     let state = verdict_name(state);
     let dialling = TcpStream::connect(upstream);
-    let Ok(dialled) = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, dialling).await else {
+    let Ok(dialled) = tokio::time::timeout(PREFER_CONNECT_TIMEOUT, dialling).await else {
         return Finding::failed(
             Check::UpstreamReachable,
             format!(
                 "{name} did not answer within {}s, the verdict is {state}",
-                UPSTREAM_CONNECT_TIMEOUT.as_secs()
+                PREFER_CONNECT_TIMEOUT.as_secs()
             ),
         );
     };

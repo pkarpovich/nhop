@@ -3,10 +3,15 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use nhop_ipc::{DecisionKind, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp};
+use nhop_ipc::{
+    DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp,
+};
+use serde::Deserialize;
 use tracing::Subscriber;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::EnvFilter;
+
+use crate::upstream::VerdictCause;
 
 /// Number of daily log files kept, the one being written included.
 pub const KEPT_FILES: usize = 7;
@@ -70,6 +75,7 @@ pub fn decision(event: &EventView) {
         class,
         upstream,
         connect_ms,
+        hop,
         duration_ms,
         error,
     } = event;
@@ -83,6 +89,7 @@ pub fn decision(event: &EventView) {
         class = class.map(class_name),
         upstream = health_name(*upstream),
         connect_ms = *connect_ms,
+        hop = hop.map(hop_name),
         duration_ms = *duration_ms,
         error = error.as_deref(),
     );
@@ -185,20 +192,58 @@ pub struct LoggedDecision {
     pub event: EventView,
 }
 
-/// Reads back the decision a log line records, absent when it records anything else.
-pub fn logged(line: &str) -> Option<LoggedDecision> {
+/// One verdict turnover read back out of the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedVerdict {
+    pub at: Timestamp,
+    pub from: HealthState,
+    pub to: HealthState,
+    pub cause: VerdictCause,
+}
+
+/// One record of the log that says something a reader can be shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Logged {
+    /// A connection the ruleset routed.
+    Decision(LoggedDecision),
+    /// A turnover of the upstream verdict.
+    Verdict(LoggedVerdict),
+}
+
+#[derive(Debug, Deserialize)]
+struct VerdictFields {
+    verdict_from: HealthState,
+    verdict_to: HealthState,
+    cause: VerdictCause,
+}
+
+/// Reads back what a log line records, absent when it records something with no rendering.
+///
+/// A decision is tried first: its required fields make a verdict line fail to parse as one.
+pub fn logged(line: &str) -> Option<Logged> {
     let Ok(line) = serde_json::from_str::<serde_json::Value>(line) else {
         return None;
     };
     let at = stamped_value(&line)?;
+    let at = Timestamp(at);
     let fields = line.get(FIELDS_KEY)?;
-    let Ok(event) = serde_json::from_value::<EventView>(fields.clone()) else {
+    if let Ok(event) = serde_json::from_value::<EventView>(fields.clone()) {
+        return Some(Logged::Decision(LoggedDecision { at, event }));
+    }
+    let Ok(verdict) = serde_json::from_value::<VerdictFields>(fields.clone()) else {
         return None;
     };
-    Some(LoggedDecision {
-        at: Timestamp(at),
-        event,
-    })
+    let VerdictFields {
+        verdict_from,
+        verdict_to,
+        cause,
+    } = verdict;
+    Some(Logged::Verdict(LoggedVerdict {
+        at,
+        from: verdict_from,
+        to: verdict_to,
+        cause,
+    }))
 }
 
 fn stamped(line: &str) -> Option<SystemTime> {
@@ -241,10 +286,25 @@ fn class_name(class: RuleClass) -> &'static str {
     }
 }
 
-fn health_name(health: HealthState) -> &'static str {
+fn hop_name(hop: EffectiveHop) -> &'static str {
+    match hop {
+        EffectiveHop::Direct => "direct",
+        EffectiveHop::Upstream => "upstream",
+        EffectiveHop::FallbackDirect => "fallback_direct",
+    }
+}
+
+pub(crate) fn health_name(health: HealthState) -> &'static str {
     match health {
         HealthState::Up => "up",
         HealthState::Down => "down",
+    }
+}
+
+pub(crate) fn cause_name(cause: VerdictCause) -> &'static str {
+    match cause {
+        VerdictCause::Probe => "probe",
+        VerdictCause::Dial => "dial",
     }
 }
 
@@ -264,6 +324,7 @@ mod tests {
         class: Option<RuleClass>,
         upstream: HealthState,
         connect_ms: Option<u64>,
+        hop: Option<EffectiveHop>,
         duration_ms: u64,
         error: Option<String>,
     }
@@ -283,6 +344,7 @@ mod tests {
             class: Some(RuleClass::Require),
             upstream: HealthState::Up,
             connect_ms: Some(2),
+            hop: Some(EffectiveHop::Upstream),
             duration_ms: 17,
             error: Some("reset by peer".to_owned()),
         }
@@ -297,6 +359,7 @@ mod tests {
             class: None,
             upstream: HealthState::Down,
             connect_ms: None,
+            hop: None,
             duration_ms: 4,
             error: None,
         }
@@ -345,6 +408,7 @@ mod tests {
             class,
             upstream,
             connect_ms,
+            hop,
             duration_ms,
             error,
         } = matched();
@@ -358,6 +422,7 @@ mod tests {
                 class,
                 upstream,
                 connect_ms,
+                hop,
                 duration_ms,
                 error,
             }
@@ -365,6 +430,7 @@ mod tests {
         let absent = fields_of(&lines[1]);
         assert_eq!(absent.rule_index, None);
         assert_eq!(absent.connect_ms, None);
+        assert_eq!(absent.hop, None);
         assert_eq!(absent.class, None);
         assert_eq!(absent.error, None);
     }
@@ -375,7 +441,7 @@ mod tests {
 
         let lines = emit(&paths, &[matched()]);
 
-        let Some(LoggedDecision { at: _, event }) = logged(&lines[0]) else {
+        let Some(Logged::Decision(LoggedDecision { at: _, event })) = logged(&lines[0]) else {
             panic!("a decision line must read back as a decision: {}", lines[0]);
         };
         assert_eq!(event, matched());
@@ -455,6 +521,30 @@ mod tests {
     }
 
     #[test]
+    fn logged_tells_a_decision_a_verdict_and_noise_apart() {
+        let decision = stamp("2026-09-03T19:28:45Z", "api.example.com");
+        let verdict = r#"{"timestamp":"2026-09-03T19:28:46Z","level":"INFO","fields":{"verdict_from":"up","verdict_to":"down","cause":"dial"},"target":"nhop::upstream::health"}"#;
+        let noise =
+            r#"{"timestamp":"2026-09-03T19:28:47Z","level":"INFO","fields":{"message":"hello"}}"#;
+
+        let Some(Logged::Decision(LoggedDecision { at: _, event })) = logged(&decision) else {
+            panic!("a decision line must read back as a decision: {decision}");
+        };
+        let Host(host) = event.host;
+        assert_eq!(host, "api.example.com");
+        assert_eq!(
+            logged(verdict),
+            Some(Logged::Verdict(LoggedVerdict {
+                at: Timestamp(humantime::parse_rfc3339("2026-09-03T19:28:46Z").unwrap()),
+                from: HealthState::Up,
+                to: HealthState::Down,
+                cause: VerdictCause::Dial,
+            }))
+        );
+        assert_eq!(logged(noise), None);
+    }
+
+    #[test]
     fn a_file_is_read_from_the_offset_the_previous_read_ended_at() {
         let (_home, paths) = temp_paths();
         let file = paths.state_dir().unwrap().join("nhop.log.2026-08-03");
@@ -516,6 +606,23 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&health).unwrap(),
                 format!("\"{}\"", health_name(health))
+            );
+        }
+        let hops = [
+            EffectiveHop::Direct,
+            EffectiveHop::Upstream,
+            EffectiveHop::FallbackDirect,
+        ];
+        for hop in hops {
+            assert_eq!(
+                serde_json::to_string(&hop).unwrap(),
+                format!("\"{}\"", hop_name(hop))
+            );
+        }
+        for cause in [VerdictCause::Probe, VerdictCause::Dial] {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{}\"", cause_name(cause))
             );
         }
     }

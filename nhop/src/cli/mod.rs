@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use argh::{EarlyExit, FromArgs};
 use nhop_ipc::{
-    CheckView, Command, DecisionKind, DecisionView, ErrKind, EventView, HealthState, Host,
-    LOAD_ID_ENV, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response, RuleClass,
+    CheckView, Command, DecisionKind, DecisionView, EffectiveHop, ErrKind, EventView, HealthState,
+    Host, LOAD_ID_ENV, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response, RuleClass,
     RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView, Timestamp,
     UpstreamAddr,
 };
@@ -26,7 +26,8 @@ use crate::cli::system_proxy::{
     Invocation, NetworkService, Networksetup, Privilege, SystemProxyReader,
 };
 use crate::daemon::{self, StartFailure};
-use crate::logging::{self, LoggedDecision, Window};
+use crate::logging::{self, Logged, LoggedDecision, LoggedVerdict, Window};
+use crate::upstream::VerdictCause;
 
 const BINARY: &str = "nhop";
 
@@ -221,7 +222,7 @@ enum Subcommand {
 struct Start {}
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
-/// route matching destinations through the upstream, failing when it is down
+/// route matching destinations through the upstream, dialled even while it is down
 #[argh(subcommand, name = "require")]
 struct Require {
     /// what the rule matches on: suffix, cidr, port or keyword
@@ -712,13 +713,36 @@ fn print_from(
 }
 
 fn render_log(line: &str, out: &mut dyn Write) -> io::Result<()> {
-    let Some(LoggedDecision { at, event }) = logging::logged(line) else {
+    let Some(logged) = logging::logged(line) else {
         return writeln!(out, "{line}");
     };
+    match logged {
+        Logged::Decision(LoggedDecision { at, event }) => {
+            let Timestamp(at) = at;
+            write!(out, "{}  ", humantime::format_rfc3339_seconds(at))?;
+            render_event(&event, out);
+            Ok(())
+        }
+        Logged::Verdict(verdict) => render_verdict(&verdict, out),
+    }
+}
+
+fn render_verdict(verdict: &LoggedVerdict, out: &mut dyn Write) -> io::Result<()> {
+    let LoggedVerdict {
+        at,
+        from,
+        to,
+        cause,
+    } = verdict;
     let Timestamp(at) = at;
-    write!(out, "{}  ", humantime::format_rfc3339_seconds(at))?;
-    render_event(&event, out);
-    Ok(())
+    writeln!(
+        out,
+        "{}  verdict {} -> {}  ({})",
+        humantime::format_rfc3339_seconds(*at),
+        health_name(*from),
+        health_name(*to),
+        cause_name(*cause)
+    )
 }
 
 fn unreadable_log(file: &Path, err: &mut dyn Write) -> Exit {
@@ -917,6 +941,7 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         class,
         upstream,
         connect_ms,
+        hop,
         duration_ms,
         error,
     } = event;
@@ -932,11 +957,27 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
     };
     let _ = writeln!(
         out,
-        "{host}:{port}  {} via {}  upstream {}  {duration_ms}ms{dialled}  {error}",
+        "{host}:{port}  {} via {}{}  upstream {}  {duration_ms}ms{dialled}  {error}",
         decision_name(*decision),
         rule_name(*rule_index, *class),
+        fallen_back(*hop),
         health_name(*upstream)
     );
+}
+
+/// Returns the suffix marking a connection that asked for the upstream and went direct.
+///
+/// Only the fallback is spelled out: a hop that did what the decision said adds nothing a reader
+/// cannot already see in the decision column.
+fn fallen_back(hop: Option<EffectiveHop>) -> &'static str {
+    let Some(hop) = hop else {
+        return "";
+    };
+    match hop {
+        EffectiveHop::Direct => "",
+        EffectiveHop::Upstream => "",
+        EffectiveHop::FallbackDirect => " -> direct",
+    }
 }
 
 fn class_name(class: RuleClass) -> &'static str {
@@ -968,6 +1009,13 @@ fn health_name(health: HealthState) -> &'static str {
     match health {
         HealthState::Up => "up",
         HealthState::Down => "down",
+    }
+}
+
+fn cause_name(cause: VerdictCause) -> &'static str {
+    match cause {
+        VerdictCause::Probe => "probe",
+        VerdictCause::Dial => "dial",
     }
 }
 
@@ -1717,6 +1765,40 @@ mod tests {
             Some(
                 "2026-08-03T10:00:00Z  api.example.com:443  upstream via rule 2 (require)  upstream up  1204ms (dial 37ms)  -"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_direct_line_renders_the_suffix() {
+        let (_home, paths) = temp_paths();
+        let fell_back = r#"{"timestamp":"2026-09-03T19:53:11Z","level":"INFO","fields":{"host":"teams.microsoft.com","port":443,"decision":"upstream","rule_index":19,"class":"prefer","upstream":"down","connect_ms":12,"hop":"fallback_direct","duration_ms":431,"error":"upstream down"},"target":"nhop::proxy"}"#;
+        write_log(&paths, "2026-09-03", &[fell_back.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some(
+                "2026-09-03T19:53:11Z  teams.microsoft.com:443  upstream via rule 19 (prefer) -> direct  upstream down  431ms (dial 12ms)  upstream down"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_renders_a_verdict_line() {
+        let (_home, paths) = temp_paths();
+        let turnover = r#"{"timestamp":"2026-09-03T19:28:46Z","level":"INFO","fields":{"verdict_from":"up","verdict_to":"down","cause":"dial"},"target":"nhop::upstream::health"}"#;
+        write_log(&paths, "2026-09-03", &[turnover.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some("2026-09-03T19:28:46Z  verdict up -> down  (dial)")
         );
     }
 

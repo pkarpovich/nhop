@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use nhop::daemon::state::LiveUpstream;
 use nhop::proxy::{Dialled, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleClass, RuleId};
-use nhop::upstream::{HealthHandle, PROBE_INTERVAL, PROBE_TIMEOUT, UpstreamHop};
+use nhop::upstream::{
+    HealthHandle, PREFER_CONNECT_TIMEOUT, PROBE_INTERVAL, PROBE_TIMEOUT, REQUIRE_CONNECT_TIMEOUT,
+    UpstreamHop,
+};
 use nhop_ipc::{HealthState, Host, Port};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -27,7 +30,7 @@ fn published(upstream: SocketAddr) -> LiveUpstream {
 
 fn verdict(state: HealthState) -> HealthHandle {
     let health = HealthHandle::default();
-    health.set(state);
+    health.seed(state);
     health
 }
 
@@ -47,7 +50,7 @@ async fn dial(
 ) -> io::Result<TcpStream> {
     match hop.dial(host, port, decision).await {
         Dialled::Refused(failure) => Err(failure),
-        Dialled::Attempted(next) => next,
+        Dialled::Attempted { hop: _, next } => next,
     }
 }
 
@@ -103,7 +106,7 @@ async fn a_prefer_rule_reaches_the_destination_while_the_upstream_is_closed() {
 }
 
 #[tokio::test]
-async fn a_require_rule_is_refused_while_the_upstream_is_closed() {
+async fn a_require_rule_fails_while_the_upstream_is_closed() {
     let origin = StubOrigin::start().await;
     let upstream = closed_port().await;
     let hop = hop(upstream, HealthState::Up);
@@ -112,7 +115,7 @@ async fn a_require_rule_is_refused_while_the_upstream_is_closed() {
     let failure = dial(&hop, &host, port, require(2)).await.unwrap_err();
 
     let Some(down) = UpstreamDown::carried_by(&failure) else {
-        panic!("a require rule must be refused with the upstream-down surface: {failure}");
+        panic!("a require rule must fail with the upstream-down surface: {failure}");
     };
     assert_eq!(
         down.to_string(),
@@ -164,20 +167,25 @@ async fn a_prefer_rule_travels_through_the_upstream_while_the_verdict_is_up() {
 }
 
 #[tokio::test]
-async fn no_client_dial_reaches_the_upstream_while_the_verdict_is_down() {
+async fn a_require_dial_reaches_the_upstream_while_the_verdict_is_down() {
     let stub = StubSocks5::start().await;
     let origin = StubOrigin::start().await;
     let hop = hop(stub.addr(), HealthState::Down);
     let (host, port) = named(origin.addr());
 
-    let refused = hop.dial(&host, port, require(0)).await;
-    let dialled = dial(&hop, &host, port, prefer(1)).await.unwrap();
+    let preferred = dial(&hop, &host, port, prefer(1)).await.unwrap();
+    let required = dial(&hop, &host, port, require(0)).await.unwrap();
 
-    let Dialled::Refused(_refusal) = refused else {
-        panic!("a require rule must be refused before the network");
-    };
-    assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
-    assert_eq!(stub.client_dials(), Vec::new());
+    assert_eq!(required.peer_addr().unwrap(), stub.addr());
+    assert_eq!(preferred.peer_addr().unwrap(), origin.addr());
+    assert_eq!(
+        stub.client_dials(),
+        vec![SocksRequest {
+            atyp: 0x01,
+            host: origin.addr().ip().to_string(),
+            port: origin.addr().port(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -385,20 +393,83 @@ async fn a_sequence_banked_against_one_upstream_is_not_closed_by_the_next() {
 }
 
 #[tokio::test]
-async fn a_dial_to_a_black_holed_upstream_fails_within_three_seconds() {
+async fn a_prefer_dial_leaves_a_black_holed_upstream_within_three_seconds() {
+    let origin = StubOrigin::start().await;
     let blackhole: SocketAddr = "192.0.2.1:1080".parse().unwrap();
     let hop = hop(blackhole, HealthState::Up);
+    let (host, port) = named(origin.addr());
     let started = Instant::now();
 
-    let failure = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
-        .await
-        .unwrap_err();
+    let dialled = dial(&hop, &host, port, prefer(0)).await.unwrap();
 
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+    assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
+    assert_eq!(hop.health().state(), HealthState::Down);
+}
+
+#[tokio::test]
+async fn a_require_dial_is_served_by_a_slow_upstream() {
+    let stub = StubSocks5::answering(Answers::Slow(Duration::from_secs(3))).await;
+    let hop = hop(stub.addr(), HealthState::Down);
+
+    let dialled = dial(&hop, &Host("example.com".to_owned()), Port(443), require(3))
+        .await
+        .unwrap();
+
+    assert_eq!(dialled.peer_addr().unwrap(), stub.addr());
+    assert_eq!(
+        stub.client_dials(),
+        vec![SocksRequest {
+            atyp: 0x03,
+            host: "example.com".to_owned(),
+            port: 443,
+        }]
+    );
+    assert_eq!(hop.health().state(), HealthState::Up);
+}
+
+#[tokio::test]
+async fn a_prefer_dial_leaves_a_slow_upstream_for_the_direct_route() {
+    let stub = StubSocks5::answering(Answers::Slow(Duration::from_secs(3))).await;
+    let origin = StubOrigin::start().await;
+    let hop = hop(stub.addr(), HealthState::Up);
+    let (host, port) = named(origin.addr());
+    let started = Instant::now();
+
+    let dialled = dial(&hop, &host, port, prefer(4)).await.unwrap();
+
+    let waited = started.elapsed();
+    assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
+    assert!(
+        waited >= PREFER_CONNECT_TIMEOUT,
+        "the direct route is taken only once the prefer budget is spent: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(3),
+        "a prefer dial must not wait out an upstream slower than its budget: {waited:?}"
+    );
+    assert_eq!(hop.health().state(), HealthState::Down);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_require_dial_into_a_black_hole_costs_the_require_budget() {
+    let stub = StubSocks5::answering(Answers::Never).await;
+    let hop = hop(stub.addr(), HealthState::Down);
+    let started = tokio::time::Instant::now();
+
+    let dialled = hop
+        .dial(&Host("example.com".to_owned()), Port(443), require(5))
+        .await;
+
+    let Dialled::Attempted { hop: _, next } = dialled else {
+        panic!("a configured upstream must be dialled whatever the verdict says");
+    };
+    let failure = next.unwrap_err();
     assert!(
         UpstreamDown::carried_by(&failure).is_some(),
         "{failure} must carry the upstream-down surface"
     );
+    assert_eq!(started.elapsed(), REQUIRE_CONNECT_TIMEOUT);
     assert_eq!(hop.health().state(), HealthState::Down);
 }
