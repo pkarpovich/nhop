@@ -3,7 +3,7 @@ mod support;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use nhop::logging::{self, LoggedDecision};
+use nhop::logging::{self, Logged, LoggedDecision};
 use nhop_ipc::{DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -61,7 +61,7 @@ async fn await_decisions(paths: &Paths, wanted: usize) -> Vec<LoggedDecision> {
         for file in logging::files(paths).unwrap() {
             let (lines, _offset) = logging::read_from(&file, 0).unwrap();
             for line in lines {
-                let Some(decision) = logging::logged(&line) else {
+                let Some(Logged::Decision(decision)) = logging::logged(&line) else {
                     panic!("the log must hold decisions only: {line}");
                 };
                 decisions.push(decision);

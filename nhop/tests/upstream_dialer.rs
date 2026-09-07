@@ -30,7 +30,7 @@ fn published(upstream: SocketAddr) -> LiveUpstream {
 
 fn verdict(state: HealthState) -> HealthHandle {
     let health = HealthHandle::default();
-    health.set(state);
+    health.seed(state);
     health
 }
 

@@ -223,7 +223,7 @@ async fn require_reaches_upstream() {
     let origin = StubOrigin::start().await;
     let upstream = StubSocks5::start().await;
     let daemon = TestDaemon::start(&paths, upstream.addr()).await;
-    daemon.state().live().health().set(HealthState::Up);
+    daemon.state().live().health().seed(HealthState::Up);
     add_rule(&daemon, RuleClass::Require, origin.addr()).await;
     let mut decisions = daemon.state().live().events().subscribe();
 
@@ -254,7 +254,7 @@ async fn prefer_reaches_upstream() {
     let origin = StubOrigin::start().await;
     let upstream = StubSocks5::start().await;
     let daemon = TestDaemon::start(&paths, upstream.addr()).await;
-    daemon.state().live().health().set(HealthState::Up);
+    daemon.state().live().health().seed(HealthState::Up);
     add_rule(&daemon, RuleClass::Prefer, origin.addr()).await;
     let mut decisions = daemon.state().live().events().subscribe();
 

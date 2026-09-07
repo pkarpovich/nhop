@@ -26,7 +26,8 @@ use crate::cli::system_proxy::{
     Invocation, NetworkService, Networksetup, Privilege, SystemProxyReader,
 };
 use crate::daemon::{self, StartFailure};
-use crate::logging::{self, LoggedDecision, Window};
+use crate::logging::{self, Logged, LoggedDecision, LoggedVerdict, Window};
+use crate::upstream::VerdictCause;
 
 const BINARY: &str = "nhop";
 
@@ -712,13 +713,36 @@ fn print_from(
 }
 
 fn render_log(line: &str, out: &mut dyn Write) -> io::Result<()> {
-    let Some(LoggedDecision { at, event }) = logging::logged(line) else {
+    let Some(logged) = logging::logged(line) else {
         return writeln!(out, "{line}");
     };
+    match logged {
+        Logged::Decision(LoggedDecision { at, event }) => {
+            let Timestamp(at) = at;
+            write!(out, "{}  ", humantime::format_rfc3339_seconds(at))?;
+            render_event(&event, out);
+            Ok(())
+        }
+        Logged::Verdict(verdict) => render_verdict(&verdict, out),
+    }
+}
+
+fn render_verdict(verdict: &LoggedVerdict, out: &mut dyn Write) -> io::Result<()> {
+    let LoggedVerdict {
+        at,
+        from,
+        to,
+        cause,
+    } = verdict;
     let Timestamp(at) = at;
-    write!(out, "{}  ", humantime::format_rfc3339_seconds(at))?;
-    render_event(&event, out);
-    Ok(())
+    writeln!(
+        out,
+        "{}  verdict {} -> {}  ({})",
+        humantime::format_rfc3339_seconds(*at),
+        health_name(*from),
+        health_name(*to),
+        cause_name(*cause)
+    )
 }
 
 fn unreadable_log(file: &Path, err: &mut dyn Write) -> Exit {
@@ -985,6 +1009,13 @@ fn health_name(health: HealthState) -> &'static str {
     match health {
         HealthState::Up => "up",
         HealthState::Down => "down",
+    }
+}
+
+fn cause_name(cause: VerdictCause) -> &'static str {
+    match cause {
+        VerdictCause::Probe => "probe",
+        VerdictCause::Dial => "dial",
     }
 }
 
@@ -1752,6 +1783,22 @@ mod tests {
             Some(
                 "2026-09-03T19:53:11Z  teams.microsoft.com:443  upstream via rule 19 (prefer) -> direct  upstream down  431ms (dial 12ms)  upstream down"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_renders_a_verdict_line() {
+        let (_home, paths) = temp_paths();
+        let turnover = r#"{"timestamp":"2026-09-03T19:28:46Z","level":"INFO","fields":{"verdict_from":"up","verdict_to":"down","cause":"dial"},"target":"nhop::upstream::health"}"#;
+        write_log(&paths, "2026-09-03", &[turnover.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some("2026-09-03T19:28:46Z  verdict up -> down  (dial)")
         );
     }
 

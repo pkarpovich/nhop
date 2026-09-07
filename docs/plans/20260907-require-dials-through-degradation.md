@@ -294,15 +294,15 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 - Modify: `nhop/tests/upstream_dialer.rs`
 - Modify: `nhop/tests/acceptance.rs`
 
-- [ ] add `VerdictCause` with `Probe` and `Dial` in `nhop/src/upstream/health.rs`, deriving `Serialize`/`Deserialize` with `#[serde(rename_all = "snake_case")]` alongside the usual traits
-- [ ] give `HealthHandle::set` a second parameter of type `VerdictCause`. Keep the `rcu` closure pure - no logging inside it, it may be retried and its result discarded. Bind the value `rcu` returns (`let previous = ...`), and after it commits compare the previous state with `state`; on a turnover emit exactly one `tracing::info!` record with the three fields `verdict_from`, `verdict_to`, `cause` as `snake_case` names
-- [ ] add `HealthHandle::seed(state)` that sets the verdict with no cause and no log line, for tests that establish a starting verdict rather than observe one
-- [ ] give `observed()` (Task 3) a `VerdictCause` argument; the three production `set` callers pass `Dial` from `required()`/`preferred()` and `Probe` from the patrol's `settle`. Point the seeding sites at `seed`: the unit helper `hop()` in `nhop/src/upstream/mod.rs`, `verdict()` in `nhop/tests/upstream_dialer.rs`, both calls in `nhop/tests/acceptance.rs`, and the unit tests in `health.rs`
-- [ ] add `LoggedVerdict` and the `Logged` enum to `logging.rs`, turn `logged()` into `Option<Logged>` with the parse order fixed under "Event and log shape", and update `render_log` in `nhop/src/cli/mod.rs` to keep echoing the raw line for `None` and to render a verdict as the literal format given there
-- [ ] write the unit test `a_repeated_verdict_emits_no_line` and `a_turnover_emits_one_line_with_its_cause` in `health.rs`, capturing records with a subscriber scoped by `tracing::subscriber::with_default`; the second asserts exactly one record with `verdict_from`, `verdict_to`, `cause`
-- [ ] write the unit test `logged_tells_a_decision_a_verdict_and_noise_apart` in `logging.rs`: one line of each kind, the right variant for the first two, `None` for the third
-- [ ] write the rendering test `logs_renders_a_verdict_line` in `nhop/src/cli/mod.rs` asserting `2026-09-03T19:28:46Z  verdict up -> down  (dial)` byte for byte, and extend the serde-parity test to `VerdictCause`
-- [ ] run `mise run check` - must pass before task 7
+- [x] add `VerdictCause` with `Probe` and `Dial` in `nhop/src/upstream/health.rs`, deriving `Serialize`/`Deserialize` with `#[serde(rename_all = "snake_case")]` alongside the usual traits
+- [x] give `HealthHandle::set` a second parameter of type `VerdictCause`. Keep the `rcu` closure pure - no logging inside it, it may be retried and its result discarded. Bind the value `rcu` returns (`let previous = ...`), and after it commits compare the previous state with `state`; on a turnover emit exactly one `tracing::info!` record with the three fields `verdict_from`, `verdict_to`, `cause` as `snake_case` names
+- [x] add `HealthHandle::seed(state)` that sets the verdict with no cause and no log line, for tests that establish a starting verdict rather than observe one
+- [x] give `observed()` (Task 3) a `VerdictCause` argument; the three production `set` callers pass `Dial` from `required()`/`preferred()` and `Probe` from the patrol's `settle`. Point the seeding sites at `seed`: the unit helper `hop()` in `nhop/src/upstream/mod.rs`, `verdict()` in `nhop/tests/upstream_dialer.rs`, both calls in `nhop/tests/acceptance.rs`, and the unit tests in `health.rs`
+- [x] add `LoggedVerdict` and the `Logged` enum to `logging.rs`, turn `logged()` into `Option<Logged>` with the parse order fixed under "Event and log shape", and update `render_log` in `nhop/src/cli/mod.rs` to keep echoing the raw line for `None` and to render a verdict as the literal format given there
+- [x] write the unit test `a_repeated_verdict_emits_no_line` and `a_turnover_emits_one_line_with_its_cause` in `health.rs`, capturing records with a subscriber scoped by `tracing::subscriber::with_default`; the second asserts exactly one record with `verdict_from`, `verdict_to`, `cause`
+- [x] write the unit test `logged_tells_a_decision_a_verdict_and_noise_apart` in `logging.rs`: one line of each kind, the right variant for the first two, `None` for the third
+- [x] write the rendering test `logs_renders_a_verdict_line` in `nhop/src/cli/mod.rs` asserting `2026-09-03T19:28:46Z  verdict up -> down  (dial)` byte for byte, and extend the serde-parity test to `VerdictCause`
+- [x] run `mise run check` - must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 

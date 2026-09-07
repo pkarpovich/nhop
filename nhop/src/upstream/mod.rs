@@ -1,6 +1,6 @@
 mod health;
 
-pub use health::{Health, HealthHandle};
+pub use health::{Health, HealthHandle, VerdictCause};
 
 use std::future::Future;
 use std::io;
@@ -199,15 +199,15 @@ impl UpstreamHop {
         }
         let next = match through(host, port, upstream, UpstreamBudget::Require).await {
             Ok(next) => {
-                self.observed(upstream, HealthState::Up);
+                self.observed(upstream, HealthState::Up, VerdictCause::Dial);
                 Ok(next)
             }
             Err(DialFailure::Destination(failure)) => {
-                self.observed(upstream, HealthState::Up);
+                self.observed(upstream, HealthState::Up, VerdictCause::Dial);
                 Err(failure)
             }
             Err(DialFailure::Upstream(_failure)) => {
-                self.observed(upstream, HealthState::Down);
+                self.observed(upstream, HealthState::Down, VerdictCause::Dial);
                 Err(UpstreamDown::new(upstream, rule).into())
             }
         };
@@ -227,11 +227,11 @@ impl UpstreamHop {
     /// The write is guarded by the address the dial went to, the same guard [`Pending`] gives a
     /// probe sequence. A dial that started before a reload and lands after it has observed an
     /// upstream nobody routes to any more, and must not judge the one that replaced it.
-    fn observed(&self, dialled: SocketAddr, state: HealthState) {
+    fn observed(&self, dialled: SocketAddr, state: HealthState, cause: VerdictCause) {
         if self.upstream.snapshot() != dialled {
             return;
         }
-        self.health.set(state);
+        self.health.set(state, cause);
     }
 
     /// Dials a `prefer` destination, reporting which of its two routes carried the connection.
@@ -249,15 +249,15 @@ impl UpstreamHop {
             HealthState::Down => (EffectiveHop::FallbackDirect, direct(host, port).await),
             HealthState::Up => match through(host, port, upstream, UpstreamBudget::Prefer).await {
                 Ok(next) => {
-                    self.observed(upstream, HealthState::Up);
+                    self.observed(upstream, HealthState::Up, VerdictCause::Dial);
                     (EffectiveHop::Upstream, Ok(next))
                 }
                 Err(DialFailure::Destination(_failure)) => {
-                    self.observed(upstream, HealthState::Up);
+                    self.observed(upstream, HealthState::Up, VerdictCause::Dial);
                     (EffectiveHop::FallbackDirect, direct(host, port).await)
                 }
                 Err(DialFailure::Upstream(_failure)) => {
-                    self.observed(upstream, HealthState::Down);
+                    self.observed(upstream, HealthState::Down, VerdictCause::Dial);
                     (EffectiveHop::FallbackDirect, direct(host, port).await)
                 }
             },
@@ -491,7 +491,7 @@ fn advance(
         }) => target == seen && probed == addr,
     };
     if confirms {
-        health.set(seen);
+        health.set(seen, VerdictCause::Probe);
         return None;
     }
     Some(Pending { target: seen, addr })
@@ -535,7 +535,7 @@ mod tests {
         let published = LiveUpstream::default();
         published.publish(upstream);
         let health = HealthHandle::default();
-        health.set(state);
+        health.seed(state);
         UpstreamHop::start(published, health, interval, PATIENT)
     }
 
@@ -907,15 +907,15 @@ mod tests {
         let published = LiveUpstream::default();
         published.publish(before);
         let health = HealthHandle::default();
-        health.set(HealthState::Down);
+        health.seed(HealthState::Down);
         let hop = UpstreamHop::start(published.clone(), health, PATIENT, PATIENT);
         published.publish(after);
 
-        hop.observed(before, HealthState::Up);
+        hop.observed(before, HealthState::Up, VerdictCause::Dial);
 
         assert_eq!(hop.health().state(), HealthState::Down);
 
-        hop.observed(after, HealthState::Up);
+        hop.observed(after, HealthState::Up, VerdictCause::Dial);
 
         assert_eq!(hop.health().state(), HealthState::Up);
     }

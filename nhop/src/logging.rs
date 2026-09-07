@@ -6,9 +6,12 @@ use std::time::{Duration, SystemTime};
 use nhop_ipc::{
     DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp,
 };
+use serde::Deserialize;
 use tracing::Subscriber;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::EnvFilter;
+
+use crate::upstream::VerdictCause;
 
 /// Number of daily log files kept, the one being written included.
 pub const KEPT_FILES: usize = 7;
@@ -189,20 +192,58 @@ pub struct LoggedDecision {
     pub event: EventView,
 }
 
-/// Reads back the decision a log line records, absent when it records anything else.
-pub fn logged(line: &str) -> Option<LoggedDecision> {
+/// One verdict turnover read back out of the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedVerdict {
+    pub at: Timestamp,
+    pub from: HealthState,
+    pub to: HealthState,
+    pub cause: VerdictCause,
+}
+
+/// One record of the log that says something a reader can be shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Logged {
+    /// A connection the ruleset routed.
+    Decision(LoggedDecision),
+    /// A turnover of the upstream verdict.
+    Verdict(LoggedVerdict),
+}
+
+#[derive(Debug, Deserialize)]
+struct VerdictFields {
+    verdict_from: HealthState,
+    verdict_to: HealthState,
+    cause: VerdictCause,
+}
+
+/// Reads back what a log line records, absent when it records something with no rendering.
+///
+/// A decision is tried first: its required fields make a verdict line fail to parse as one.
+pub fn logged(line: &str) -> Option<Logged> {
     let Ok(line) = serde_json::from_str::<serde_json::Value>(line) else {
         return None;
     };
     let at = stamped_value(&line)?;
+    let at = Timestamp(at);
     let fields = line.get(FIELDS_KEY)?;
-    let Ok(event) = serde_json::from_value::<EventView>(fields.clone()) else {
+    if let Ok(event) = serde_json::from_value::<EventView>(fields.clone()) {
+        return Some(Logged::Decision(LoggedDecision { at, event }));
+    }
+    let Ok(verdict) = serde_json::from_value::<VerdictFields>(fields.clone()) else {
         return None;
     };
-    Some(LoggedDecision {
-        at: Timestamp(at),
-        event,
-    })
+    let VerdictFields {
+        verdict_from,
+        verdict_to,
+        cause,
+    } = verdict;
+    Some(Logged::Verdict(LoggedVerdict {
+        at,
+        from: verdict_from,
+        to: verdict_to,
+        cause,
+    }))
 }
 
 fn stamped(line: &str) -> Option<SystemTime> {
@@ -253,10 +294,17 @@ fn hop_name(hop: EffectiveHop) -> &'static str {
     }
 }
 
-fn health_name(health: HealthState) -> &'static str {
+pub(crate) fn health_name(health: HealthState) -> &'static str {
     match health {
         HealthState::Up => "up",
         HealthState::Down => "down",
+    }
+}
+
+pub(crate) fn cause_name(cause: VerdictCause) -> &'static str {
+    match cause {
+        VerdictCause::Probe => "probe",
+        VerdictCause::Dial => "dial",
     }
 }
 
@@ -393,7 +441,7 @@ mod tests {
 
         let lines = emit(&paths, &[matched()]);
 
-        let Some(LoggedDecision { at: _, event }) = logged(&lines[0]) else {
+        let Some(Logged::Decision(LoggedDecision { at: _, event })) = logged(&lines[0]) else {
             panic!("a decision line must read back as a decision: {}", lines[0]);
         };
         assert_eq!(event, matched());
@@ -473,6 +521,30 @@ mod tests {
     }
 
     #[test]
+    fn logged_tells_a_decision_a_verdict_and_noise_apart() {
+        let decision = stamp("2026-09-03T19:28:45Z", "api.example.com");
+        let verdict = r#"{"timestamp":"2026-09-03T19:28:46Z","level":"INFO","fields":{"verdict_from":"up","verdict_to":"down","cause":"dial"},"target":"nhop::upstream::health"}"#;
+        let noise =
+            r#"{"timestamp":"2026-09-03T19:28:47Z","level":"INFO","fields":{"message":"hello"}}"#;
+
+        let Some(Logged::Decision(LoggedDecision { at: _, event })) = logged(&decision) else {
+            panic!("a decision line must read back as a decision: {decision}");
+        };
+        let Host(host) = event.host;
+        assert_eq!(host, "api.example.com");
+        assert_eq!(
+            logged(verdict),
+            Some(Logged::Verdict(LoggedVerdict {
+                at: Timestamp(humantime::parse_rfc3339("2026-09-03T19:28:46Z").unwrap()),
+                from: HealthState::Up,
+                to: HealthState::Down,
+                cause: VerdictCause::Dial,
+            }))
+        );
+        assert_eq!(logged(noise), None);
+    }
+
+    #[test]
     fn a_file_is_read_from_the_offset_the_previous_read_ended_at() {
         let (_home, paths) = temp_paths();
         let file = paths.state_dir().unwrap().join("nhop.log.2026-08-03");
@@ -545,6 +617,12 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&hop).unwrap(),
                 format!("\"{}\"", hop_name(hop))
+            );
+        }
+        for cause in [VerdictCause::Probe, VerdictCause::Dial] {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{}\"", cause_name(cause))
             );
         }
     }
