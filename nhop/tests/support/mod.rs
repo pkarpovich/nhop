@@ -224,6 +224,11 @@ pub enum Answers {
     /// Every connection is accepted and left without a reply, so the caller waits out its own
     /// timeout instead of being refused - a powered-off host that black-holes rather than RSTs.
     Never,
+    /// Every connection is answered, this long after it arrived - an upstream that is alive and
+    /// serving but has been pushed past the `prefer` budget, which is the shape the degraded VM
+    /// took. Each connection is delayed on its own task, so the accept loop never blocks and the
+    /// delay reaches health probes as well, exactly as a starved host delays everything.
+    Slow(Duration),
 }
 
 /// SOCKS5 upstream that records every request and echoes the payload that follows.
@@ -275,6 +280,12 @@ impl StubSocks5 {
                             });
                         }
                         Answers::Never => held.push(stream),
+                        Answers::Slow(delay) => {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _served = socks5(stream, requests).await;
+                            });
+                        }
                     }
                 }
             }

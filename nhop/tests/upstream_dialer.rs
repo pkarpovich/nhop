@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use nhop::daemon::state::LiveUpstream;
 use nhop::proxy::{Dialled, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleClass, RuleId};
-use nhop::upstream::{HealthHandle, PROBE_INTERVAL, PROBE_TIMEOUT, UpstreamHop};
+use nhop::upstream::{
+    HealthHandle, PREFER_CONNECT_TIMEOUT, PROBE_INTERVAL, PROBE_TIMEOUT, REQUIRE_CONNECT_TIMEOUT,
+    UpstreamHop,
+};
 use nhop_ipc::{HealthState, Host, Port};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -402,5 +405,71 @@ async fn a_dial_to_a_black_holed_upstream_fails_within_three_seconds() {
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(3), "waited {waited:?}");
     assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
+    assert_eq!(hop.health().state(), HealthState::Down);
+}
+
+#[tokio::test]
+async fn a_require_dial_is_served_by_a_slow_upstream() {
+    let stub = StubSocks5::answering(Answers::Slow(Duration::from_secs(3))).await;
+    let hop = hop(stub.addr(), HealthState::Down);
+
+    let dialled = dial(&hop, &Host("example.com".to_owned()), Port(443), require(3))
+        .await
+        .unwrap();
+
+    assert_eq!(dialled.peer_addr().unwrap(), stub.addr());
+    assert_eq!(
+        stub.client_dials(),
+        vec![SocksRequest {
+            atyp: 0x03,
+            host: "example.com".to_owned(),
+            port: 443,
+        }]
+    );
+    assert_eq!(hop.health().state(), HealthState::Up);
+}
+
+#[tokio::test]
+async fn a_prefer_dial_leaves_a_slow_upstream_for_the_direct_route() {
+    let stub = StubSocks5::answering(Answers::Slow(Duration::from_secs(3))).await;
+    let origin = StubOrigin::start().await;
+    let hop = hop(stub.addr(), HealthState::Up);
+    let (host, port) = named(origin.addr());
+    let started = Instant::now();
+
+    let dialled = dial(&hop, &host, port, prefer(4)).await.unwrap();
+
+    let waited = started.elapsed();
+    assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
+    assert!(
+        waited >= PREFER_CONNECT_TIMEOUT,
+        "the direct route is taken only once the prefer budget is spent: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(3),
+        "a prefer dial must not wait out an upstream slower than its budget: {waited:?}"
+    );
+    assert_eq!(hop.health().state(), HealthState::Down);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_require_dial_into_a_black_hole_costs_the_require_budget() {
+    let stub = StubSocks5::answering(Answers::Never).await;
+    let hop = hop(stub.addr(), HealthState::Down);
+    let started = tokio::time::Instant::now();
+
+    let dialled = hop
+        .dial(&Host("example.com".to_owned()), Port(443), require(5))
+        .await;
+
+    let Dialled::Attempted(next) = dialled else {
+        panic!("a configured upstream must be dialled whatever the verdict says");
+    };
+    let failure = next.unwrap_err();
+    assert!(
+        UpstreamDown::carried_by(&failure).is_some(),
+        "{failure} must carry the upstream-down surface"
+    );
+    assert_eq!(started.elapsed(), REQUIRE_CONNECT_TIMEOUT);
     assert_eq!(hop.health().state(), HealthState::Down);
 }
