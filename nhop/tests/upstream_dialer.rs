@@ -170,8 +170,8 @@ async fn a_require_dial_reaches_the_upstream_while_the_verdict_is_down() {
     let hop = hop(stub.addr(), HealthState::Down);
     let (host, port) = named(origin.addr());
 
-    let required = dial(&hop, &host, port, require(0)).await.unwrap();
     let preferred = dial(&hop, &host, port, prefer(1)).await.unwrap();
+    let required = dial(&hop, &host, port, require(0)).await.unwrap();
 
     assert_eq!(required.peer_addr().unwrap(), stub.addr());
     assert_eq!(preferred.peer_addr().unwrap(), origin.addr());

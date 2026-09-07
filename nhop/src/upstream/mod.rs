@@ -193,14 +193,37 @@ impl UpstreamHop {
         }
         Dialled::Attempted(
             match through(host, port, upstream, UpstreamBudget::Require).await {
-                Ok(next) => Ok(next),
-                Err(DialFailure::Destination(failure)) => Err(failure),
+                Ok(next) => {
+                    self.observed(upstream, HealthState::Up);
+                    Ok(next)
+                }
+                Err(DialFailure::Destination(failure)) => {
+                    self.observed(upstream, HealthState::Up);
+                    Err(failure)
+                }
                 Err(DialFailure::Upstream(_failure)) => {
-                    self.health.set(HealthState::Down);
+                    self.observed(upstream, HealthState::Down);
                     Err(UpstreamDown::new(upstream, rule).into())
                 }
             },
         )
+    }
+
+    /// Records what one real dial saw about the upstream it was made against.
+    ///
+    /// A connection, or a SOCKS reply about the destination, proves the upstream is serving - the
+    /// split [`failed_dial`] already draws - so both move the verdict up at once instead of waiting
+    /// out the patrol's two-probe hysteresis. The evidence is symmetric with the failure that
+    /// already flips it down on one dial: a user paid for it either way.
+    ///
+    /// The write is guarded by the address the dial went to, the same guard [`Pending`] gives a
+    /// probe sequence. A dial that started before a reload and lands after it has observed an
+    /// upstream nobody routes to any more, and must not judge the one that replaced it.
+    fn observed(&self, dialled: SocketAddr, state: HealthState) {
+        if self.upstream.snapshot() != dialled {
+            return;
+        }
+        self.health.set(state);
     }
 
     async fn preferred(
@@ -212,10 +235,16 @@ impl UpstreamHop {
         match self.health.state() {
             HealthState::Down => direct(host, port).await,
             HealthState::Up => match through(host, port, upstream, UpstreamBudget::Prefer).await {
-                Ok(next) => Ok(next),
-                Err(DialFailure::Destination(_failure)) => direct(host, port).await,
+                Ok(next) => {
+                    self.observed(upstream, HealthState::Up);
+                    Ok(next)
+                }
+                Err(DialFailure::Destination(_failure)) => {
+                    self.observed(upstream, HealthState::Up);
+                    direct(host, port).await
+                }
                 Err(DialFailure::Upstream(_failure)) => {
-                    self.health.set(HealthState::Down);
+                    self.observed(upstream, HealthState::Down);
                     direct(host, port).await
                 }
             },
@@ -772,6 +801,67 @@ mod tests {
             UpstreamDown::carried_by(&failure).is_none(),
             "a refused destination is not the upstream being down: {failure}"
         );
+        assert_eq!(hop.health().state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_require_dial_that_connects_flips_the_verdict_up() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(
+            upstream_answering(GRANTED).await,
+            HealthState::Down,
+            PATIENT,
+        );
+        let settled = hop.health().changed_at();
+
+        let _dialled = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 5))
+            .await
+            .unwrap();
+
+        assert_eq!(hop.health().state(), HealthState::Up);
+        assert!(
+            hop.health().changed_at() > settled,
+            "a dial that connects turns the verdict over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_refusal_flips_the_verdict_up() {
+        let (_listener, host, port) = destination().await;
+        let hop = hop(
+            upstream_answering(REFUSED).await,
+            HealthState::Down,
+            PATIENT,
+        );
+
+        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 5))
+            .await
+            .unwrap_err();
+
+        assert!(
+            UpstreamDown::carried_by(&failure).is_none(),
+            "an upstream that answered about the destination is serving: {failure}"
+        );
+        assert_eq!(hop.health().state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_dial_landing_after_a_reload_leaves_the_new_verdict_alone() {
+        let before = closed_port().await;
+        let after = closed_port().await;
+        let published = LiveUpstream::default();
+        published.publish(before);
+        let health = HealthHandle::default();
+        health.set(HealthState::Down);
+        let hop = UpstreamHop::start(published.clone(), health, PATIENT, PATIENT);
+        published.publish(after);
+
+        hop.observed(before, HealthState::Up);
+
+        assert_eq!(hop.health().state(), HealthState::Down);
+
+        hop.observed(after, HealthState::Up);
+
         assert_eq!(hop.health().state(), HealthState::Up);
     }
 

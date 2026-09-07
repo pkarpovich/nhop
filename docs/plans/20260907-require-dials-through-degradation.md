@@ -239,13 +239,14 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 **Files:**
 - Modify: `nhop/src/upstream/mod.rs`
 
-- [ ] add the private method `observed(&self, dialled: SocketAddr, state: HealthState)` on `UpstreamHop`, writing through `HealthHandle::set` only when `self.upstream.snapshot()` equals `dialled`
-- [ ] route both existing `self.health.set(HealthState::Down)` calls in `required()` and `preferred()` through it
-- [ ] call it with `Up` on a successful dial and on a `DialFailure::Destination`, in both `required()` and `preferred()`, documenting on the method that a SOCKS reply about a destination proves the upstream is serving - the invariant `failed_dial` already encodes
-- [ ] write the unit test `a_require_dial_that_connects_flips_the_verdict_up`: hop built with `PATIENT` for both interval and confirm delay (the first patrol probe still goes out immediately, so the stub will see it - isolation comes from the confirm delay, which keeps any probe sequence from closing), verdict seeded `Down`, a `require` dial through `upstream_answering(GRANTED)` succeeds, then `health.state()` is `Up` and `changed_at` moved
-- [ ] write the unit test `a_destination_refusal_flips_the_verdict_up`: same construction, upstream answering `REFUSED`; the dial fails with a non-`UpstreamDown` error and the verdict is `Up`
-- [ ] write the unit test `a_dial_landing_after_a_reload_leaves_the_new_verdict_alone`, exercising `observed()` directly: publish address A, seed `Down`, publish address B, call `observed(A, Up)` - still `Down`; call `observed(B, Up)` - now `Up`
-- [ ] run `mise run check` - must pass before task 4
+- [x] add the private method `observed(&self, dialled: SocketAddr, state: HealthState)` on `UpstreamHop`, writing through `HealthHandle::set` only when `self.upstream.snapshot()` equals `dialled`
+- [x] route both existing `self.health.set(HealthState::Down)` calls in `required()` and `preferred()` through it
+- [x] call it with `Up` on a successful dial and on a `DialFailure::Destination`, in both `required()` and `preferred()`, documenting on the method that a SOCKS reply about a destination proves the upstream is serving - the invariant `failed_dial` already encodes
+- [x] write the unit test `a_require_dial_that_connects_flips_the_verdict_up`: hop built with `PATIENT` for both interval and confirm delay (the first patrol probe still goes out immediately, so the stub will see it - isolation comes from the confirm delay, which keeps any probe sequence from closing), verdict seeded `Down`, a `require` dial through `upstream_answering(GRANTED)` succeeds, then `health.state()` is `Up` and `changed_at` moved
+- [x] write the unit test `a_destination_refusal_flips_the_verdict_up`: same construction, upstream answering `REFUSED`; the dial fails with a non-`UpstreamDown` error and the verdict is `Up`
+- [x] write the unit test `a_dial_landing_after_a_reload_leaves_the_new_verdict_alone`, exercising `observed()` directly: publish address A, seed `Down`, publish address B, call `observed(A, Up)` - still `Down`; call `observed(B, Up)` - now `Up`
+- [x] run `mise run check` - must pass before task 4
++ [x] reorder the two dials in `a_require_dial_reaches_the_upstream_while_the_verdict_is_down` (`nhop/tests/upstream_dialer.rs`) so the `prefer` leg goes first: the `require` dial now flips the verdict `Up`, so a `prefer` dial issued after it would travel through the upstream instead of taking the direct route the test pins
 
 ### Task 4: Pin the incident with a stub that answers late
 
