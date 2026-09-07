@@ -225,14 +225,14 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 - Modify: `nhop/src/upstream/mod.rs`
 - Modify: `nhop/tests/upstream_dialer.rs`
 
-- [ ] rewrite `required()` so the pre-network refusal happens only when the published upstream equals `NO_UPSTREAM`, and every configured address is dialled through `through()` with `UpstreamBudget::Require` regardless of the verdict
-- [ ] keep the outcome mapping as it is today for a dial that was made: `Destination` failures surface as themselves, `Upstream` failures surface as `UpstreamDown` and set the verdict `Down`
-- [ ] update the doc comments on `required()` and on the `UpstreamHop` struct, which currently state that nothing is dialled while the verdict is down
-- [ ] replace `a_require_decision_fails_at_once_while_the_verdict_is_down` with `a_require_decision_dials_a_configured_upstream_while_the_verdict_is_down`: a `require` decision against `closed_port()` with the verdict seeded `Down` returns `Dialled::Attempted` whose error carries the `UpstreamDown` surface
-- [ ] rewrite `a_require_refusal_reports_that_nothing_was_dialled` to build the hop on `NO_UPSTREAM` instead of `closed_port()`, so the surviving refusal path stays pinned as `Dialled::Refused`
-- [ ] rewrite `no_client_dial_reaches_the_upstream_while_the_verdict_is_down` (`nhop/tests/upstream_dialer.rs:167`) into `a_require_dial_reaches_the_upstream_while_the_verdict_is_down`: verdict seeded `Down`, a `require` dial to a live `StubSocks5` succeeds and appears in `client_dials()`, while a `prefer` dial still reaches the `StubOrigin` directly and does not appear there
-- [ ] revisit `a_require_rule_is_refused_while_the_upstream_is_closed` (`:106`): if it asserts only the `UpstreamDown` error surface it stays as is; if it asserts `Dialled::Refused`, rename it to say the dial was attempted and assert `Dialled::Attempted`
-- [ ] run `mise run check` - must pass before task 3
+- [x] rewrite `required()` so the pre-network refusal happens only when the published upstream equals `NO_UPSTREAM`, and every configured address is dialled through `through()` with `UpstreamBudget::Require` regardless of the verdict
+- [x] keep the outcome mapping as it is today for a dial that was made: `Destination` failures surface as themselves, `Upstream` failures surface as `UpstreamDown` and set the verdict `Down`
+- [x] update the doc comments on `required()` and on the `UpstreamHop` struct, which currently state that nothing is dialled while the verdict is down
+- [x] replace `a_require_decision_fails_at_once_while_the_verdict_is_down` with `a_require_decision_dials_a_configured_upstream_while_the_verdict_is_down`: a `require` decision against `closed_port()` with the verdict seeded `Down` returns `Dialled::Attempted` whose error carries the `UpstreamDown` surface
+- [x] rewrite `a_require_refusal_reports_that_nothing_was_dialled` to build the hop on `NO_UPSTREAM` instead of `closed_port()`, so the surviving refusal path stays pinned as `Dialled::Refused`
+- [x] rewrite `no_client_dial_reaches_the_upstream_while_the_verdict_is_down` (`nhop/tests/upstream_dialer.rs:167`) into `a_require_dial_reaches_the_upstream_while_the_verdict_is_down`: verdict seeded `Down`, a `require` dial to a live `StubSocks5` succeeds and appears in `client_dials()`, while a `prefer` dial still reaches the `StubOrigin` directly and does not appear there
+- [x] revisit `a_require_rule_is_refused_while_the_upstream_is_closed` (`:106`): it asserts only the `UpstreamDown` error surface, so it stayed as is; if it asserts `Dialled::Refused`, rename it to say the dial was attempted and assert `Dialled::Attempted`
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: A real dial moves the verdict, guarded by the address it was made against
 

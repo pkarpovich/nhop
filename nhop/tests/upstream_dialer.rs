@@ -164,20 +164,25 @@ async fn a_prefer_rule_travels_through_the_upstream_while_the_verdict_is_up() {
 }
 
 #[tokio::test]
-async fn no_client_dial_reaches_the_upstream_while_the_verdict_is_down() {
+async fn a_require_dial_reaches_the_upstream_while_the_verdict_is_down() {
     let stub = StubSocks5::start().await;
     let origin = StubOrigin::start().await;
     let hop = hop(stub.addr(), HealthState::Down);
     let (host, port) = named(origin.addr());
 
-    let refused = hop.dial(&host, port, require(0)).await;
-    let dialled = dial(&hop, &host, port, prefer(1)).await.unwrap();
+    let required = dial(&hop, &host, port, require(0)).await.unwrap();
+    let preferred = dial(&hop, &host, port, prefer(1)).await.unwrap();
 
-    let Dialled::Refused(_refusal) = refused else {
-        panic!("a require rule must be refused before the network");
-    };
-    assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
-    assert_eq!(stub.client_dials(), Vec::new());
+    assert_eq!(required.peer_addr().unwrap(), stub.addr());
+    assert_eq!(preferred.peer_addr().unwrap(), origin.addr());
+    assert_eq!(
+        stub.client_dials(),
+        vec![SocksRequest {
+            atyp: 0x01,
+            host: origin.addr().ip().to_string(),
+            port: origin.addr().port(),
+        }]
+    );
 }
 
 #[tokio::test]

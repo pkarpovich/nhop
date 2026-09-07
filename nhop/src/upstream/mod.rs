@@ -109,9 +109,11 @@ pub const KEEPALIVE_RETRIES: u32 = 4;
 
 /// Next hop that sends `require` and `prefer` traffic through the SOCKS5 upstream.
 ///
-/// While the verdict is [`HealthState::Down`] nothing is dialled through the upstream: `prefer`
-/// goes direct at once and `require` fails at once, so a powered-off upstream costs a decision
-/// rather than a connect timeout per connection.
+/// The verdict routes `prefer` only: while it is [`HealthState::Down`] a `prefer` destination goes
+/// direct at once rather than paying a connect timeout for a route it does not need. `require` has
+/// no direct route to fall back to, so it dials every configured address whatever the verdict says
+/// and gives up only at [`REQUIRE_CONNECT_TIMEOUT`]; a refusal there would turn an upstream that is
+/// merely slow into one that is dead.
 #[derive(Debug)]
 pub struct UpstreamHop {
     upstream: LiveUpstream,
@@ -168,7 +170,13 @@ impl UpstreamHop {
         }
     }
 
-    /// Dials a `require` destination, refusing before the network while the verdict is down.
+    /// Dials a `require` destination, refusing before the network only with no upstream configured.
+    ///
+    /// [`NO_UPSTREAM`] is a configuration absence rather than a health judgment - port zero cannot
+    /// be dialled - so it is the one address turned away without a socket. Every configured address
+    /// is dialled whatever the verdict says, because a `require` destination has no direct route to
+    /// be spared for: refusing early only fails sooner, and during an upstream that was slow rather
+    /// than gone it failed everything the upstream could still have served.
     ///
     /// The refusal and a dial that failed upstream-side carry the same [`UpstreamDown`] surface on
     /// purpose - a `require` rule has one meaning for the client either way - so the two are told
@@ -180,19 +188,19 @@ impl UpstreamHop {
         rule: RuleId,
         upstream: SocketAddr,
     ) -> Dialled {
-        match self.health.state() {
-            HealthState::Down => Dialled::Refused(UpstreamDown::new(upstream, rule).into()),
-            HealthState::Up => Dialled::Attempted(
-                match through(host, port, upstream, UpstreamBudget::Require).await {
-                    Ok(next) => Ok(next),
-                    Err(DialFailure::Destination(failure)) => Err(failure),
-                    Err(DialFailure::Upstream(_failure)) => {
-                        self.health.set(HealthState::Down);
-                        Err(UpstreamDown::new(upstream, rule).into())
-                    }
-                },
-            ),
+        if upstream == NO_UPSTREAM {
+            return Dialled::Refused(UpstreamDown::new(upstream, rule).into());
         }
+        Dialled::Attempted(
+            match through(host, port, upstream, UpstreamBudget::Require).await {
+                Ok(next) => Ok(next),
+                Err(DialFailure::Destination(failure)) => Err(failure),
+                Err(DialFailure::Upstream(_failure)) => {
+                    self.health.set(HealthState::Down);
+                    Err(UpstreamDown::new(upstream, rule).into())
+                }
+            },
+        )
     }
 
     async fn preferred(
@@ -668,17 +676,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_require_decision_fails_at_once_while_the_verdict_is_down() {
+    async fn a_require_decision_dials_a_configured_upstream_while_the_verdict_is_down() {
         let (_listener, host, port) = destination().await;
         let upstream = closed_port().await;
         let hop = hop(upstream, HealthState::Down, PATIENT);
 
-        let failure = dial(&hop, &host, port, upstream_decision(RuleClass::Require, 4))
-            .await
-            .unwrap_err();
+        let dialled = hop
+            .dial(&host, port, upstream_decision(RuleClass::Require, 4))
+            .await;
 
+        let Dialled::Attempted(next) = dialled else {
+            panic!("a configured upstream is dialled whatever the verdict says");
+        };
+        let failure = next.unwrap_err();
         let Some(down) = UpstreamDown::carried_by(&failure) else {
-            panic!("a require rule must be refused with the upstream-down surface: {failure}");
+            panic!("a require rule must fail with the upstream-down surface: {failure}");
         };
         assert_eq!(
             down.to_string(),
@@ -689,14 +701,14 @@ mod tests {
     #[tokio::test]
     async fn a_require_refusal_reports_that_nothing_was_dialled() {
         let (_listener, host, port) = destination().await;
-        let hop = hop(closed_port().await, HealthState::Down, PATIENT);
+        let hop = hop(NO_UPSTREAM, HealthState::Down, PATIENT);
 
         let dialled = hop
             .dial(&host, port, upstream_decision(RuleClass::Require, 4))
             .await;
 
         let Dialled::Refused(_refusal) = dialled else {
-            panic!("a require rule refused while down never touched the network");
+            panic!("a require rule with no upstream configured never touched the network");
         };
     }
 
