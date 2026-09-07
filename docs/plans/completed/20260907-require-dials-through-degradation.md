@@ -322,13 +322,13 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 - Modify: `CLAUDE.md`
 - Modify: `docs/plans/20260907-require-dials-through-degradation.md`
 
-- [ ] in `README.md` "## Rule classes", rewrite the `require` bullet that says the connection fails at once when the upstream is down: it now dials and fails after the require budget, except with no upstream configured; state both budgets by name and value
-- [ ] in `README.md` "## Commands" (the `nhop require` / `nhop prefer` table rows) and "## Shape" (the three-class summary), align the one-line descriptions with the same change
-- [ ] in `README.md` "## The upstream verdict", add what the verdict now governs - `prefer` reads it, `require` only writes it - that a real dial moves it in both directions while probes still need the two-probe hysteresis, the measured dead-upstream costs from the Accepted trade-off table, and the verdict line `nhop logs` prints with its literal format
-- [ ] in `README.md` "## Rule classes", under `prefer`, document the ` -> direct` suffix with the example line from "Event and log shape"
-- [ ] in `CLAUDE.md`, update the invariant "Only an upstream failure flips the health verdict down" to state the symmetric half (a connection or a destination reply from a real dial flips it up at once, address-guarded), and the `Dialled` invariant to say the effective path travels with it
-- [ ] in `CLAUDE.md`, add an invariant that `require` is gated only by the absence of an upstream, with one line on why the verdict gate was removed, so a future change does not restore it
-- [ ] move this plan to `docs/plans/completed/`
+- [x] in `README.md` "## Rule classes", rewrite the `require` bullet that says the connection fails at once when the upstream is down: it now dials and fails after the require budget, except with no upstream configured; state both budgets by name and value
+- [x] in `README.md` "## Commands" (the `nhop require` / `nhop prefer` table rows) and "## Shape" (the three-class summary), align the one-line descriptions with the same change
+- [x] in `README.md` "## The upstream verdict", add what the verdict now governs - `prefer` reads it, `require` only writes it - that a real dial moves it in both directions while probes still need the two-probe hysteresis, the measured dead-upstream costs from the Accepted trade-off table, and the verdict line `nhop logs` prints with its literal format
+- [x] in `README.md` "## Rule classes", under `prefer`, document the ` -> direct` suffix with the example line from "Event and log shape"
+- [x] in `CLAUDE.md`, update the invariant "Only an upstream failure flips the health verdict down" to state the symmetric half (a connection or a destination reply from a real dial flips it up at once, address-guarded), and the `Dialled` invariant to say the effective path travels with it
+- [x] in `CLAUDE.md`, add an invariant that `require` is gated only by the absence of an upstream, with one line on why the verdict gate was removed, so a future change does not restore it
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

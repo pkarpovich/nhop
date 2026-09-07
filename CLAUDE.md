@@ -54,8 +54,22 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   it and streams from the fan-out.
 - **`cli::Exit` owns the exit-code table**, `of_err`/`of_unreachable`/`of_start`
   are the only ways into it.
-- **Only an upstream failure flips the health verdict down.** A SOCKS reply
-  about a destination proves the upstream is serving (`upstream/mod.rs`).
+- **Only an upstream failure flips the health verdict down, and the same dial
+  flips it up.** A SOCKS reply about a destination proves the upstream is
+  serving, so a connection through it and a `Destination` failure both write
+  `Up` at once, with no hysteresis - the symmetric half of one failure writing
+  `Down`. Every write from a real dial goes through `UpstreamHop::observed`,
+  which re-reads the published upstream and drops the write unless it still
+  names the address that dial was made against, so a dial landing after a reload
+  cannot move the new upstream's verdict (`upstream/mod.rs`).
+- **`require` is gated only by the absence of an upstream.** `required()`
+  refuses before the network when the published address is `NO_UPSTREAM` and
+  dials every configured one, whatever the verdict says, at
+  `REQUIRE_CONNECT_TIMEOUT` rather than `PREFER_CONNECT_TIMEOUT`. The verdict
+  gate that used to sit there was removed because a refusal only saves a dial
+  timeout when the upstream is dead, and an upstream that was merely slow had
+  every `require` destination refused for hours it could have served. `prefer`
+  keeps its gate: fast fallback to the direct route is its purpose.
 - **The prober patrols both verdict states with two-probe hysteresis.** `patrol`
   probes from startup on, Up and Down alike. A probe contradicting the live
   verdict only opens a pending sequence recording the state it aims at and the
@@ -81,11 +95,15 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   `NextHop::dial` returns `Dialled` - `Refused` for a `require` rule turned away
   before any socket, `Attempted` for anything that reached the network - because
   both carry the same `UpstreamDown` surface and an instant failure times the
-  same as a refusal. The front end folds it with `Dialled::timed(elapsed)` into
-  `Connect`, which `Routed::dialled` records as `connect_ms`. Deriving the
-  distinction from the error, or from re-reading the health verdict after the
-  call, is banned: the first mislabels a two-second failing dial as "nothing
-  dialled", the second races the patrol.
+  same as a refusal. `Attempted` also carries the `EffectiveHop` the dial site
+  produced - `Direct`, `Upstream` or `FallbackDirect` - so the path the bytes
+  actually took travels with the dial instead of being re-derived from the
+  decision, which cannot see a `prefer` rule that fell back. The front end folds
+  both with `Dialled::timed(elapsed)` into `Connect`, which `Routed::dialled`
+  records as `connect_ms` and `hop`. Deriving the distinction from the error, or
+  from re-reading the health verdict after the call, is banned: the first
+  mislabels a two-second failing dial as "nothing dialled", the second races the
+  patrol.
 
 ## Tests
 

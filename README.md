@@ -15,8 +15,9 @@ presence; everything is driven from the CLI.
   talking to it over a unix socket
 - config is an executable script at `~/.config/nhop/init` that calls the CLI,
   so it can be fish, loops and all
-- three rule classes: `require` (must go through the upstream, error if it is
-  down), `prefer` (try the upstream, fall back to a direct connection) and
+- three rule classes: `require` (must go through the upstream, dialled whatever
+  the health verdict says, error when it cannot be reached), `prefer` (try the
+  upstream while the verdict is up, fall back to a direct connection) and
   `never` (always direct, matched before every other rule)
 - listens for HTTP CONNECT and SOCKS5 on the ports the previous setup used, so
   clients pinned to them need no reconfiguration
@@ -33,8 +34,8 @@ reads macOS rather than the daemon and prints three fixed lines.
 | Command | What it does |
 |---|---|
 | `nhop start` | runs the daemon in the foreground until it is signalled |
-| `nhop require <kind> <value>` | adds a rule that must traverse the upstream |
-| `nhop prefer <kind> <value>` | adds a rule that tries the upstream, direct when it is down |
+| `nhop require <kind> <value>` | adds a rule that must traverse the upstream, dialled even while it is down |
+| `nhop prefer <kind> <value>` | adds a rule that tries the upstream, direct when the verdict is down |
 | `nhop never <kind> <value>` | adds a rule that is always dialled directly |
 | `nhop upstream socks5://<ip>:<port>` | points the router at its one SOCKS5 upstream |
 | `nhop listen <http addr> <socks addr>` | moves the two front ends |
@@ -72,11 +73,27 @@ nhop <require|prefer|never> <suffix|cidr|port|keyword> <value>
 
 The three classes differ only in what happens when the upstream is down:
 
-- `require` - must traverse the upstream. With the upstream down the connection
-  fails at once: `502 Bad Gateway` on the HTTP front end, reply `0x04` on the
-  SOCKS5 one, exit 3 from the CLI. For what only exists behind the upstream.
+- `require` - must traverse the upstream. The health verdict does not gate it:
+  every configured upstream address is dialled whatever the verdict says, with a
+  budget of `REQUIRE_CONNECT_TIMEOUT`, 10 seconds. Only an upstream that is not
+  configured at all is refused before the network. When the dial does fail the
+  connection fails the same way it always has: `502 Bad Gateway` on the HTTP
+  front end, reply `0x04` on the SOCKS5 one, exit 3 from the CLI. For what only
+  exists behind the upstream - an upstream that is merely slow still serves it,
+  at the cost of waiting.
 - `prefer` - tries the upstream and falls back to a direct connection when it is
-  down. For public services routed through the upstream only for traffic volume.
+  down. It is the class that reads the verdict, and its dial budget is
+  `PREFER_CONNECT_TIMEOUT`, 2 seconds, because a fast fallback to the direct
+  route it already has is the whole point. For public services routed through
+  the upstream only for traffic volume.
+
+  A connection that asked for the upstream and went direct anyway is marked in
+  the log with a ` -> direct` suffix on the rule, so the silent fallback is
+  visible:
+
+  ```
+  2026-09-03T19:53:11Z  teams.microsoft.com:443  upstream via rule 19 (prefer) -> direct  upstream down  431ms (dial 12ms)  -
+  ```
 - `never` - always dialled directly, and matched before every other rule.
 
 That split is why nothing has to be toggled when the upstream goes away: bulk
@@ -153,7 +170,10 @@ The client half is loopback and gets nothing - loopback cannot die silently.
 
 ## The upstream verdict
 
-`up` or `down`, and everything `require` and `prefer` do hangs off it. A prober
+`up` or `down`. `prefer` reads it - that is the whole of what it routes, the
+choice between the upstream and the direct route waiting behind it. `require`
+only writes it: it dials every configured address regardless, so its dials are
+evidence about the upstream rather than something the verdict may veto. A prober
 patrols the upstream every 5 seconds in **both** states, starting with a probe
 as soon as the daemon has an upstream address rather than after a first
 interval, so a proxy that went away is found by the prober and not by whichever
@@ -164,14 +184,42 @@ pending sequence, and a confirming probe a second later has to agree before the
 verdict changes; anything else discards the sequence - a probe agreeing with the
 current verdict, or a verdict moved by another path. That hysteresis is why one
 missed probe against a momentarily loaded proxy, a transient loss or the instant
-after the Mac wakes does not hard-refuse `require` traffic with 502, and why one
-stray answer while the proxy host boots does not declare the upstream alive. It
-is paid for in seconds: a verdict change lands within the probe interval plus
+after the Mac wakes does not send `prefer` traffic direct, and why one stray
+answer while the proxy host boots does not declare the upstream alive. It is
+paid for in seconds: a verdict change lands within the probe interval plus
 the confirm delay plus two probe timeouts - about ten seconds against a host
 that black-holes, closer to six against one that refuses fast.
 
-A failed connection is not a probe. It is evidence a user already paid for, so
-it still flips the verdict down immediately, on one failure.
+A real dial is not a probe. It is evidence a user already paid for, so it moves
+the verdict at once in both directions and without hysteresis: an upstream-side
+failure flips it down on that one failure, and a connection through the
+upstream, or a SOCKS reply about the destination that proves the upstream is
+serving, flips it up. Both writes are guarded by the address they were made
+against, so a dial that started before a reload and lands after it cannot move
+the verdict of an upstream it never touched.
+
+Every turnover is written to the log as a line of its own, whichever path caused
+it:
+
+```
+2026-09-03T19:28:46Z  verdict up -> down  (dial)
+```
+
+The cause is `dial` or `probe`. In `--json` the same record is three fields,
+`verdict_from`, `verdict_to` and `cause`.
+
+Because `require` no longer refuses on the verdict, a genuinely dead upstream
+costs one dial per connection instead of an instant refusal. Measured against
+the real upstream host:
+
+| Upstream state | Cost of one `require` dial |
+|---|---|
+| host up, proxy not started | about 1 s - the SYN is answered and refused |
+| host powered off, first ~50 s | the full 10 s budget: the SYN queues behind an ARP that never answers and the kernel never fails the connect on its own |
+| host powered off, afterwards | under 30 ms, until the kernel re-probes the neighbour and the 10 s window briefly returns |
+
+That is the price of serving a slow upstream instead of declaring it dead:
+without dialling, "off" and "stalled" are indistinguishable.
 
 ## Init file
 
@@ -483,14 +531,16 @@ nhop logs --since 1h --json |
 ```
 
 Every decision event carries `host`, `port`, `decision`, `rule_index`, `class`,
-`upstream` (the health verdict at the time), `connect_ms`, `duration_ms` and
-`error`. The two timings answer different questions: `connect_ms` is the dial
+`upstream` (the health verdict at the time), `connect_ms`, `hop` (`direct`,
+`upstream` or `fallback_direct`, the way the bytes actually went), `duration_ms`
+and `error`. The two timings answer different questions: `connect_ms` is the dial
 alone, `duration_ms` the whole connection, so "slow to reach" and "held open for
 an hour" stop looking alike. `connect_ms` is absent only when nothing was
-dialled - a `require` refusal while the upstream is down, or a request for the
-front end's own listening address - and present on a failed dial as well, so an attempt that cost two seconds before failing is still
-visible. The plain text form of `logs` and `tail` carries it too, as a
-`(dial 37ms)` suffix on the lifetime. Hostnames and ports only - no request
+dialled - a `require` destination with no upstream configured, or a request for
+the front end's own listening address, the same two cases that leave `hop`
+absent - and present on a failed dial as well, so an attempt that cost two
+seconds before failing is still visible. The plain text form of `logs` and
+`tail` carries it too, as a `(dial 37ms)` suffix on the lifetime. Hostnames and ports only - no request
 bodies, headers or credentials are ever logged.
 
 The first line of a run is not a decision but the open-file limit the daemon
@@ -520,7 +570,7 @@ previous ruleset is still the one serving traffic.
 if nhop doctor >/dev/null
     echo "routing is healthy"
 else if test $status -eq 3
-    echo "the upstream is down - require rules will fail, prefer rules go direct"
+    echo "the upstream is down - require rules still dial it, prefer rules go direct"
 end
 ```
 
