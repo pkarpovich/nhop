@@ -106,7 +106,7 @@ async fn a_prefer_rule_reaches_the_destination_while_the_upstream_is_closed() {
 }
 
 #[tokio::test]
-async fn a_require_rule_is_refused_while_the_upstream_is_closed() {
+async fn a_require_rule_fails_while_the_upstream_is_closed() {
     let origin = StubOrigin::start().await;
     let upstream = closed_port().await;
     let hop = hop(upstream, HealthState::Up);
@@ -115,7 +115,7 @@ async fn a_require_rule_is_refused_while_the_upstream_is_closed() {
     let failure = dial(&hop, &host, port, require(2)).await.unwrap_err();
 
     let Some(down) = UpstreamDown::carried_by(&failure) else {
-        panic!("a require rule must be refused with the upstream-down surface: {failure}");
+        panic!("a require rule must fail with the upstream-down surface: {failure}");
     };
     assert_eq!(
         down.to_string(),
@@ -393,7 +393,7 @@ async fn a_sequence_banked_against_one_upstream_is_not_closed_by_the_next() {
 }
 
 #[tokio::test]
-async fn a_dial_to_a_black_holed_upstream_fails_within_three_seconds() {
+async fn a_prefer_dial_leaves_a_black_holed_upstream_within_three_seconds() {
     let origin = StubOrigin::start().await;
     let blackhole: SocketAddr = "192.0.2.1:1080".parse().unwrap();
     let hop = hop(blackhole, HealthState::Up);

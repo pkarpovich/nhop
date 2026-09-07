@@ -46,8 +46,9 @@ impl Default for Health {
 
 /// Verdict on the upstream, shared by the state task, the dialer and every connection.
 ///
-/// A daemon starts [`HealthState::Down`], so nothing is dialled through an upstream that has not
-/// answered anything yet.
+/// A daemon starts [`HealthState::Down`], so no `prefer` destination is sent through an upstream
+/// that has not answered anything yet. A `require` destination is dialled from that cold verdict,
+/// since it has no direct route to be spared for.
 #[derive(Debug, Clone)]
 pub struct HealthHandle(Arc<ArcSwap<Health>>);
 

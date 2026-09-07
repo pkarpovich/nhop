@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dial_that_was_made_reports_its_time_and_a_refusal_reports_none() {
+    async fn a_dial_that_was_made_reports_its_time_and_hop_and_a_refusal_reports_neither() {
         let events = EventTx::default();
         let mut queue = events.subscribe();
         let ctx = ConnCtx {
@@ -722,14 +722,18 @@ mod tests {
         let mut attempted = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
         attempted.dialled(Connect::Attempted {
             took: Duration::from_millis(41),
-            hop: EffectiveHop::Direct,
+            hop: EffectiveHop::FallbackDirect,
         });
         attempted.ended(None);
         let mut refused = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
         refused.dialled(Connect::Refused);
         refused.ended(None);
 
-        assert_eq!(queue.try_recv().unwrap().connect_ms, Some(41));
-        assert_eq!(queue.try_recv().unwrap().connect_ms, None);
+        let attempted = queue.try_recv().unwrap();
+        let refused = queue.try_recv().unwrap();
+        assert_eq!(attempted.connect_ms, Some(41));
+        assert_eq!(attempted.hop, Some(EffectiveHop::FallbackDirect));
+        assert_eq!(refused.connect_ms, None);
+        assert_eq!(refused.hop, None);
     }
 }

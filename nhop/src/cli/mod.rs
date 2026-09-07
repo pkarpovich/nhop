@@ -222,7 +222,7 @@ enum Subcommand {
 struct Start {}
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
-/// route matching destinations through the upstream, failing when it is down
+/// route matching destinations through the upstream, dialled even while it is down
 #[argh(subcommand, name = "require")]
 struct Require {
     /// what the rule matches on: suffix, cidr, port or keyword

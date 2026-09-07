@@ -206,7 +206,8 @@ it:
 ```
 
 The cause is `dial` or `probe`. In `--json` the same record is three fields,
-`verdict_from`, `verdict_to` and `cause`.
+`verdict_from`, `verdict_to` and `cause`. It is a log record only - `nhop tail`
+streams routing decisions and never carries it.
 
 Because `require` no longer refuses on the verdict, a genuinely dead upstream
 costs one dial per connection instead of an instant refusal. Measured against
@@ -289,8 +290,9 @@ end
 The split is the whole point. `warehouse.corp.dundermifflin.com` is `require`
 because it does not exist outside the VPN; `dundermifflin.com` is `prefer`
 because it is a public website that merely ought to be reached from a corporate
-address. With the VM shut down for the weekend the first fails immediately and
-the second still loads, and no rule had to be edited to get there.
+address. With the VM shut down for the weekend the first fails - after a dial
+that costs up to the 10 second `require` budget, not instantly - and the second
+still loads, and no rule had to be edited to get there.
 
 Check any of it without opening a connection. Rules are numbered from zero in
 declaration order:
@@ -474,8 +476,10 @@ guessing:
 - **Exit codes carry meaning** - 0 success, 2 nothing there, 3 upstream down, 4
   malformed arguments, 1 everything else. A script can branch without reading a
   message.
-- **The log is JSON lines**, one object per routing decision, so `jq` answers
-  questions the tool has no command for.
+- **The log is JSON lines**, one object per record - routing decisions, upstream
+  verdict turnovers and the startup open-file limit - so `jq` answers questions
+  the tool has no command for. Filter on the fields you want rather than reading
+  every line as a decision.
 - **No interactive prompts anywhere.** Every command either acts or fails with a
   message. Nothing waits on a human.
 

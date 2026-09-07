@@ -206,6 +206,7 @@ impl UpstreamHop {
                 self.observed(upstream, HealthState::Up, VerdictCause::Dial);
                 Err(failure)
             }
+            Err(DialFailure::Unsent(failure)) => Err(failure),
             Err(DialFailure::Upstream(_failure)) => {
                 self.observed(upstream, HealthState::Down, VerdictCause::Dial);
                 Err(UpstreamDown::new(upstream, rule).into())
@@ -256,6 +257,9 @@ impl UpstreamHop {
                     self.observed(upstream, HealthState::Up, VerdictCause::Dial);
                     (EffectiveHop::FallbackDirect, direct(host, port).await)
                 }
+                Err(DialFailure::Unsent(_failure)) => {
+                    (EffectiveHop::FallbackDirect, direct(host, port).await)
+                }
                 Err(DialFailure::Upstream(_failure)) => {
                     self.observed(upstream, HealthState::Down, VerdictCause::Dial);
                     (EffectiveHop::FallbackDirect, direct(host, port).await)
@@ -272,6 +276,8 @@ enum DialFailure {
     Upstream(io::Error),
     /// The upstream answered about the destination, which says nothing about its own health.
     Destination(io::Error),
+    /// The dial never left this process, so it saw nothing about the upstream either way.
+    Unsent(io::Error),
 }
 
 impl NextHop for UpstreamHop {
@@ -374,6 +380,11 @@ async fn through(
 /// an auth method it cannot use and, on the reply path, for any status byte outside the 0x00..=0x08
 /// the RFC assigns. Real proxies do emit those - 3proxy answers 0x09 to a CONNECT aimed at its own
 /// listening address, which is exactly what the health probe asks for.
+///
+/// `InvalidTargetAddress` is neither: tokio-socks converts the target before it opens a socket, so
+/// a host past the 255-byte SOCKS5 domain limit - which a client can put in a `CONNECT` line - is
+/// rejected in this process with the upstream untouched. Reading that as a reply would let one
+/// request declare a dead upstream alive, so it writes no verdict at all.
 fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
     match failure {
         tokio_socks::Error::GeneralSocksServerFailure
@@ -384,9 +395,11 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
         | tokio_socks::Error::TtlExpired
         | tokio_socks::Error::AddressTypeNotSupported
         | tokio_socks::Error::CommandNotSupported
-        | tokio_socks::Error::UnknownAuthMethod
-        | tokio_socks::Error::InvalidTargetAddress(_) => {
+        | tokio_socks::Error::UnknownAuthMethod => {
             DialFailure::Destination(io::Error::other(failure))
+        }
+        tokio_socks::Error::InvalidTargetAddress(_) => {
+            DialFailure::Unsent(io::Error::other(failure))
         }
         tokio_socks::Error::Io(_)
         | tokio_socks::Error::ParseError(_)
@@ -499,9 +512,10 @@ fn advance(
 
 /// Asks the upstream to carry a connection to its own address, and reads the answer as a verdict.
 ///
-/// A reply about the destination counts as serving, and the probe is the only transition up: an
-/// upstream that refuses its own address - an `ssh -D` tunnel with nothing on that port, a ruleset
-/// denying loopback destinations - would otherwise never leave [`HealthState::Down`].
+/// A reply about the destination counts as serving, and the probe is the only transition up the
+/// daemon makes for itself: an upstream that refuses its own address - an `ssh -D` tunnel with
+/// nothing on that port, a ruleset denying loopback destinations - would otherwise wait on a real
+/// dial to leave [`HealthState::Down`], and a `prefer` rule never makes one while it is down.
 async fn probe(upstream: SocketAddr) -> HealthState {
     let handshake = Socks5Stream::connect(upstream, upstream);
     let Ok(reached) = tokio::time::timeout(PROBE_TIMEOUT, handshake).await else {
@@ -513,6 +527,7 @@ async fn probe(upstream: SocketAddr) -> HealthState {
     };
     match failure {
         DialFailure::Destination(_answered) => HealthState::Up,
+        DialFailure::Unsent(_local) => HealthState::Down,
         DialFailure::Upstream(_failure) => HealthState::Down,
     }
 }
@@ -666,6 +681,7 @@ mod tests {
             DialFailure::Destination(answered) => {
                 panic!("a black hole answers nothing, got {answered}")
             }
+            DialFailure::Unsent(local) => panic!("the dial was made, got {local}"),
         }
     }
 
@@ -685,6 +701,7 @@ mod tests {
             DialFailure::Destination(answered) => {
                 panic!("a black hole answers nothing, got {answered}")
             }
+            DialFailure::Unsent(local) => panic!("the dial was made, got {local}"),
         }
     }
 
@@ -816,6 +833,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prefer_dial_carried_by_the_upstream_reports_upstream() {
+        let (_listener, host, port) = destination().await;
+        let upstream = hop(upstream_answering(GRANTED).await, HealthState::Up, PATIENT);
+
+        let dialled = upstream
+            .dial(&host, port, upstream_decision(RuleClass::Prefer, 7))
+            .await;
+
+        let Dialled::Attempted { hop, next } = dialled else {
+            panic!("a prefer decision dials whichever route it takes");
+        };
+        let _next = next.unwrap();
+        assert_eq!(hop, EffectiveHop::Upstream);
+    }
+
+    #[tokio::test]
     async fn a_prefer_decision_goes_direct_at_once_while_the_verdict_is_down() {
         let (listener, host, port) = destination().await;
         let hop = hop(closed_port().await, HealthState::Down, PATIENT);
@@ -898,6 +931,35 @@ mod tests {
             "an upstream that answered about the destination is serving: {failure}"
         );
         assert_eq!(hop.health().state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_host_socks5_cannot_carry_leaves_the_verdict_where_it_was() {
+        let hop = hop(
+            upstream_answering(GRANTED).await,
+            HealthState::Down,
+            PATIENT,
+        );
+        let host = Host("a".repeat(256));
+
+        let failure = dial(
+            &hop,
+            &host,
+            Port(443),
+            upstream_decision(RuleClass::Require, 5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            UpstreamDown::carried_by(&failure).is_none(),
+            "a host past the SOCKS5 domain limit is the client's error, not the upstream's: {failure}"
+        );
+        assert_eq!(
+            hop.health().state(),
+            HealthState::Down,
+            "a dial rejected before any socket saw nothing about the upstream"
+        );
     }
 
     #[tokio::test]
