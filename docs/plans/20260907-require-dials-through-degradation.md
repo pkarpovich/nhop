@@ -306,14 +306,14 @@ That is the timestamp column exactly as decision lines print it, two spaces, the
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] `cargo test -p nhop a_require_dial_is_served_by_a_slow_upstream` passes - a `require` destination is served through an upstream slower than the `prefer` budget, from a `Down` verdict
-- [ ] `cargo test -p nhop a_require_refusal_reports_that_nothing_was_dialled` passes - `NO_UPSTREAM` is still refused before the network
-- [ ] `cargo test -p nhop a_prefer_dial_leaves_a_slow_upstream_for_the_direct_route` and `a_dial_to_a_black_holed_upstream_fails_within_three_seconds` pass - `prefer` still gives up on the upstream at its 2 s budget
-- [ ] `cargo test -p nhop a_dial_landing_after_a_reload_leaves_the_new_verdict_alone` passes - a dial landing after a reload cannot move the new upstream's verdict
-- [ ] `cargo test -p nhop a_require_dial_into_a_black_hole_costs_the_require_budget` passes - a dead upstream costs exactly the require budget and reports `Attempted`
-- [ ] `cargo test -p nhop a_fallback_direct_line_renders_the_suffix` and `a_prefer_fallback_reports_fallback_direct` pass - the log distinguishes a `prefer` connection that went direct
-- [ ] `cargo test -p nhop logs_renders_a_verdict_line` and `a_turnover_emits_one_line_with_its_cause` pass - verdict transitions are logged with their cause and rendered by `nhop logs`
-- [ ] run the full gate: `mise run check`
+- [x] `cargo test -p nhop a_require_dial_is_served_by_a_slow_upstream` passes - a `require` destination is served through an upstream slower than the `prefer` budget, from a `Down` verdict
+- [x] `cargo test -p nhop a_require_refusal_reports_that_nothing_was_dialled` passes - `NO_UPSTREAM` is still refused before the network
+- [x] `cargo test -p nhop a_prefer_dial_leaves_a_slow_upstream_for_the_direct_route` and `a_dial_to_a_black_holed_upstream_fails_within_three_seconds` pass - `prefer` still gives up on the upstream at its 2 s budget
+- [x] `cargo test -p nhop a_dial_landing_after_a_reload_leaves_the_new_verdict_alone` passes - a dial landing after a reload cannot move the new upstream's verdict
+- [x] `cargo test -p nhop a_require_dial_into_a_black_hole_costs_the_require_budget` passes - a dead upstream costs exactly the require budget and reports `Attempted`
+- [x] `cargo test -p nhop a_fallback_direct_line_renders_the_suffix` and `a_prefer_fallback_reports_fallback_direct` pass - the log distinguishes a `prefer` connection that went direct
+- [x] `cargo test -p nhop logs_renders_a_verdict_line` and `a_turnover_emits_one_line_with_its_cause` pass - verdict transitions are logged with their cause and rendered by `nhop logs`
+- [x] run the full gate: `mise run check`
 
 ### Task 8: Update documentation
 
