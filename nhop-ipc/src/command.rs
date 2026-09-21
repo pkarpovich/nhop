@@ -122,6 +122,17 @@ pub enum Command {
         /// Init run this command belongs to, absent outside a load.
         load: Option<LoadId>,
     },
+    /// `add_forward` - opens a local port whose every connection is routed to one destination.
+    AddForward {
+        /// Address the forward front end binds to.
+        listen: SocketAddr,
+        /// Destination host every connection is routed to.
+        host: Host,
+        /// Destination port every connection is routed to.
+        port: Port,
+        /// Init run this command belongs to, absent outside a load.
+        load: Option<LoadId>,
+    },
     /// `reload` - re-runs the init script, optionally from a different path.
     Reload {
         /// Script to run instead of the remembered one.
@@ -157,7 +168,7 @@ pub enum Response {
     /// `rules` - the live ruleset in declaration order.
     Rules(Vec<RuleView>),
     /// `status` - the daemon state snapshot.
-    Status(StatusView),
+    Status(Box<StatusView>),
     /// `decision` - where a destination would be routed.
     Decision(DecisionView),
     /// `doctor` - the diagnostic check results in a fixed order.
@@ -194,8 +205,8 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use crate::view::{
-        DecisionKind, HealthState, LastLoadView, LoadOutcome, RuleCountsView, SystemProxyView,
-        Timestamp,
+        DecisionKind, ForwardView, HealthState, LastLoadView, LoadOutcome, RuleCountsView,
+        SystemProxyView, Timestamp,
     };
 
     use super::*;
@@ -238,6 +249,12 @@ mod tests {
                 socks: "127.0.0.1:7891".parse().unwrap(),
                 load: Some(LoadId(2)),
             },
+            Command::AddForward {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                host: Host("api.example.com".to_owned()),
+                port: Port(9000),
+                load: Some(LoadId(3)),
+            },
             Command::Reload {
                 path: Some(PathBuf::from("/tmp/init")),
             },
@@ -262,6 +279,11 @@ mod tests {
             http_bound: true,
             socks_listen: "127.0.0.1:7891".parse().unwrap(),
             socks_bound: true,
+            forwards: vec![ForwardView {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                host: Host("api.example.com".to_owned()),
+                port: Port(9000),
+            }],
             upstream: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
             health: HealthState::Down,
             health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
@@ -293,7 +315,7 @@ mod tests {
                 kind: RuleKind::Suffix,
                 value: RuleValue("example.com".to_owned()),
             }]),
-            Response::Status(status_view()),
+            Response::Status(Box::new(status_view())),
             Response::Decision(DecisionView {
                 decision: DecisionKind::Upstream,
                 rule_index: Some(3),
@@ -340,6 +362,21 @@ mod tests {
             let back: Response = serde_json::from_str(&wire).unwrap();
             assert_eq!(response, back, "{wire}");
         }
+    }
+
+    #[test]
+    fn a_forward_command_spells_its_destination_as_the_wire_does() {
+        let wire = serde_json::to_string(&Command::AddForward {
+            listen: "127.0.0.1:19000".parse().unwrap(),
+            host: Host("api.example.com".to_owned()),
+            port: Port(9000),
+            load: None,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            r#"{"cmd":"add_forward","listen":"127.0.0.1:19000","host":"api.example.com","port":9000,"load":null}"#
+        );
     }
 
     #[test]

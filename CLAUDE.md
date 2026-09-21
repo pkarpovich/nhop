@@ -13,8 +13,9 @@ it is installed; this file is what a change to the code has to respect.
   dead code under `clippy -D warnings`.
   - `daemon/` - `state.rs` (the actor), `staging.rs` (a load in flight),
     `init_script.rs`, `ipc_server.rs`, `mod.rs` (start, listeners, pid lock)
-  - `proxy/` - `http.rs`, `socks5.rs` front ends, `mod.rs` (`ConnCtx`, `NextHop`,
-    `Dialled`, `Connect`, `Routed`, the decision fan-out)
+  - `proxy/` - `http.rs`, `socks5.rs`, `forward.rs` front ends, `mod.rs`
+    (`ConnCtx`, `NextHop`, `Dialled`, `Connect`, `Routed`, `Forwards`, the
+    decision fan-out)
   - `rules/`, `upstream/`, `cli/`, `logging.rs`
 
 ## Commands
@@ -104,6 +105,18 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   `127.0.0.1:7890`. It sits between the rule decision and the dial: after, so the
   decision that would have applied is still logged; before, so no descriptor is
   spent. Names are not resolved, leaving short forms like `127.1` a stated gap.
+- **A forward is a front end whose destination is a constant.** `forward::serve`
+  starts where the other two finish parsing - `decide`, `Routed::begun`, the
+  loop guard, `hop.dial`, `copy_bidirectional`, `Routed::ended` - and adds no
+  path of its own; a refused or failed dial closes the client, since no proxy
+  protocol is on the wire to answer with. Forwards are keyed by listening
+  address (`Forwards::push` refuses a duplicate) and travel with a load like
+  rules: `Staging` collects them, `commit` applies the whole set after the
+  listen rebind, and `Bound::rebind_forwards` binds every new address before
+  closing any old one. A held address that stays declared is not re-bound - its
+  accept task reads the destination from an `ArcSwap` and the reload stores a
+  new one - because `JoinHandle::abort` releases the old socket only when the
+  runtime next polls the task, after a synchronous re-bind would have failed.
 - **A dial reports whether it touched the network; nothing asks afterwards.**
   `NextHop::dial` returns `Dialled` - `Refused` for a `require` rule turned away
   before any socket, `Attempted` for anything that reached the network - because

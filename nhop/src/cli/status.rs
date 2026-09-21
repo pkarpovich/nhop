@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::cli::system_proxy::SystemProxy;
 use crate::daemon::state::BindState;
-use crate::proxy::Listen;
+use crate::proxy::{Forwards, Listen};
 use crate::upstream::Health;
 
 /// Everything `status` reports that the daemon knows without asking macOS.
@@ -17,6 +17,8 @@ pub struct DaemonStatus {
     pub listen: Listen,
     /// Whether the front ends hold those addresses.
     pub bound: BindState,
+    /// Forward front ends, in declaration order.
+    pub forwards: Forwards,
     /// Upstream as the init script wrote it, empty until one names it.
     pub upstream: UpstreamAddr,
     /// Verdict on the upstream and the instant it settled.
@@ -35,6 +37,7 @@ pub fn status_view(state: &DaemonStatus, proxy: &SystemProxy) -> StatusView {
         uptime_secs,
         listen,
         bound,
+        forwards,
         upstream,
         health,
         init_path,
@@ -49,6 +52,7 @@ pub fn status_view(state: &DaemonStatus, proxy: &SystemProxy) -> StatusView {
         http_bound: bound.is_bound(),
         socks_listen: *socks,
         socks_bound: bound.is_bound(),
+        forwards: forwards.views(),
         upstream: upstream.clone(),
         health: *state,
         health_changed_at: Timestamp(*changed_at),
@@ -71,11 +75,26 @@ pub fn status_json(state: &DaemonStatus, proxy: &SystemProxy) -> Value {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use nhop_ipc::{HealthState, LoadOutcome, SystemProxyView};
+    use nhop_ipc::{ForwardView, HealthState, Host, LoadOutcome, Port, SystemProxyView};
 
     use crate::cli::system_proxy::{ProxyEndpoint, parse};
+    use crate::proxy::{Forward, Target};
 
     use super::*;
+
+    fn forwards() -> Forwards {
+        let mut forwards = Forwards::default();
+        forwards
+            .push(Forward {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                target: Target {
+                    host: Host("api.example.com".to_owned()),
+                    port: Port(9000),
+                },
+            })
+            .unwrap();
+        forwards
+    }
 
     const GOLDEN: &str = include_str!("../../tests/golden/status.json");
 
@@ -92,6 +111,7 @@ mod tests {
                 socks: "127.0.0.1:7891".parse().unwrap(),
             },
             bound: BindState::Bound,
+            forwards: forwards(),
             upstream: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
             health: Health {
                 state: HealthState::Up,
@@ -137,6 +157,7 @@ mod tests {
             http_bound,
             socks_listen,
             socks_bound,
+            forwards,
             upstream,
             health,
             health_changed_at,
@@ -150,6 +171,14 @@ mod tests {
         assert_eq!(socks_listen, "127.0.0.1:7891".parse().unwrap());
         assert!(http_bound);
         assert!(socks_bound);
+        assert_eq!(
+            forwards,
+            vec![ForwardView {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                host: Host("api.example.com".to_owned()),
+                port: Port(9000),
+            }]
+        );
         assert_eq!(
             upstream,
             UpstreamAddr("socks5://192.0.2.10:1080".to_owned())

@@ -21,7 +21,10 @@ use crate::cli::system_proxy::{
 use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
 use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
-use crate::proxy::{ConnCtx, EventTx, InvalidUpstream, Listen, NO_UPSTREAM, Upstream};
+use crate::proxy::{
+    ConnCtx, DuplicateForward, EventTx, Forward, Forwards, InvalidUpstream, Listen, NO_UPSTREAM,
+    Upstream,
+};
 use crate::rules::{InvalidRule, Ruleset};
 use crate::upstream::HealthHandle;
 
@@ -297,6 +300,35 @@ struct Settled {
     message: Option<String>,
 }
 
+/// Listener a committing run could not open.
+#[derive(Debug)]
+enum CannotBind {
+    /// The protocol front ends could not be moved.
+    FrontEnds(io::Error),
+    /// A forward could not be bound.
+    Forward(io::Error),
+}
+
+impl CannotBind {
+    fn command(&self) -> FailedCommand {
+        match self {
+            Self::FrontEnds(_failure) => FailedCommand::SetListen,
+            Self::Forward(_failure) => FailedCommand::AddForward,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::FrontEnds(failure) => {
+                format!("the init script could not move the front ends: {failure}")
+            }
+            Self::Forward(failure) => {
+                format!("the init script could not open a forward: {failure}")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DaemonState {
     started: Instant,
@@ -305,6 +337,7 @@ struct DaemonState {
     frontends: Frontends,
     http_listen: SocketAddr,
     socks_listen: SocketAddr,
+    forwards: Forwards,
     upstream: UpstreamAddr,
     init_path: Option<PathBuf>,
     last_load: Option<LastLoadView>,
@@ -334,6 +367,7 @@ impl DaemonState {
             frontends,
             http_listen: http,
             socks_listen: socks,
+            forwards: Forwards::default(),
             upstream: UpstreamAddr(String::new()),
             init_path: None,
             last_load: None,
@@ -369,6 +403,19 @@ impl DaemonState {
             }
             Command::SetListen { http, socks, load } => {
                 let response = self.set_listen(Listen { http, socks }, load);
+                answer(reply, response);
+            }
+            Command::AddForward {
+                listen,
+                host,
+                port,
+                load,
+            } => {
+                let forward = Forward {
+                    listen,
+                    target: crate::proxy::Target { host, port },
+                };
+                let response = self.add_forward(forward, load);
                 answer(reply, response);
             }
             Command::Reload { path } => self.reload(path, reply),
@@ -488,6 +535,28 @@ impl DaemonState {
         }
     }
 
+    fn add_forward(&mut self, forward: Forward, load: Option<LoadId>) -> Response {
+        match self.target(load) {
+            Target::Refused(refusal) => *refusal,
+            Target::Staged => self.staged(|staged| {
+                let Err(failure) = staged.push_forward(forward) else {
+                    return Response::Ok;
+                };
+                duplicate(&failure)
+            }),
+            Target::Live => {
+                let mut forwards = self.forwards.clone();
+                if let Err(failure) = forwards.push(forward) {
+                    return duplicate(&failure);
+                }
+                let Err(failure) = self.rebind_forwards(&forwards) else {
+                    return Response::Ok;
+                };
+                unopenable(&failure)
+            }
+        }
+    }
+
     fn fail_staged(&mut self) {
         let Some(InFlight {
             id: _,
@@ -504,6 +573,11 @@ impl DaemonState {
         let Listen { http, socks } = self.frontends.rebind(listen)?;
         self.http_listen = http;
         self.socks_listen = socks;
+        Ok(())
+    }
+
+    fn rebind_forwards(&mut self, forwards: &Forwards) -> io::Result<()> {
+        self.forwards = self.frontends.rebind_forwards(forwards)?;
         Ok(())
     }
 
@@ -617,10 +691,8 @@ impl DaemonState {
                     };
                     return Settled {
                         outcome: LoadOutcome::Failed,
-                        command: Some(FailedCommand::SetListen.name().to_owned()),
-                        message: Some(format!(
-                            "the init script could not move the front ends: {failure}"
-                        )),
+                        command: Some(failure.command().name().to_owned()),
+                        message: Some(failure.message()),
                     };
                 };
                 Settled {
@@ -656,17 +728,21 @@ impl DaemonState {
         }
     }
 
-    fn commit(&mut self, staged: Staging) -> io::Result<()> {
+    fn commit(&mut self, staged: Staging) -> Result<(), CannotBind> {
         let Committed {
             rules,
             upstream,
             listen,
+            forwards,
         } = staged.commit();
-        let Some(listen) = listen else {
-            self.publish(rules, upstream);
-            return Ok(());
-        };
-        self.rebind(listen)?;
+        if let Some(listen) = listen
+            && let Err(failure) = self.rebind(listen)
+        {
+            return Err(CannotBind::FrontEnds(failure));
+        }
+        if let Err(failure) = self.rebind_forwards(&forwards) {
+            return Err(CannotBind::Forward(failure));
+        }
         self.publish(rules, upstream);
         Ok(())
     }
@@ -701,7 +777,7 @@ impl DaemonState {
     fn doctor(&self, reply: oneshot::Sender<Response>) {
         let mut findings = vec![
             doctor::daemon_reachable(&self.paths.socket_file()),
-            doctor::ports_bound(self.listen(), self.bind_state()),
+            doctor::ports_bound(self.listen(), &self.forwards, self.bind_state()),
             doctor::init_file(&self.paths.init_file()),
             doctor::last_load(self.last_load.as_ref()),
             doctor::log_writable(&self.paths.log_file()),
@@ -724,7 +800,10 @@ impl DaemonState {
         let reading = self.reading_proxy();
         tokio::spawn(async move {
             let proxy = reading.await.unwrap_or_default();
-            answer(reply, Response::Status(status_view(&status, &proxy)));
+            answer(
+                reply,
+                Response::Status(Box::new(status_view(&status, &proxy))),
+            );
         });
     }
 
@@ -747,6 +826,7 @@ impl DaemonState {
             uptime_secs: self.started.elapsed().as_secs(),
             listen: self.listen(),
             bound: self.bind_state(),
+            forwards: self.forwards.clone(),
             upstream: self.upstream.clone(),
             health: self.live.health().verdict(),
             init_path: self.init_path.clone(),
@@ -808,6 +888,20 @@ fn unbindable(failure: &io::Error) -> Response {
     }
 }
 
+fn unopenable(failure: &io::Error) -> Response {
+    Response::Err {
+        kind: ErrKind::Internal,
+        message: format!("cannot open the forward: {failure}"),
+    }
+}
+
+fn duplicate(failure: &DuplicateForward) -> Response {
+    Response::Err {
+        kind: ErrKind::InvalidArgs,
+        message: failure.to_string(),
+    }
+}
+
 fn streamed() -> Response {
     Response::Err {
         kind: ErrKind::Internal,
@@ -834,7 +928,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    use nhop_ipc::{DecisionKind, HealthState, RuleKind, RuleValue, StatusView, SystemProxyView};
+    use nhop_ipc::{
+        DecisionKind, ForwardView, HealthState, RuleKind, RuleValue, StatusView, SystemProxyView,
+    };
 
     use crate::cli::system_proxy::ProxyEndpoint;
     use crate::rules::{Decision, RuleId};
@@ -927,7 +1023,7 @@ mod tests {
         let Response::Status(status) = state.call(Command::Status).await else {
             panic!("status must answer with a status view");
         };
-        status
+        *status
     }
 
     #[tokio::test]
@@ -1367,6 +1463,146 @@ mod tests {
         assert_eq!(status_of(&state).await.rules.require, 0);
     }
 
+    fn add_forward_command(listen: &str, host: &str, load: Option<LoadId>) -> Command {
+        Command::AddForward {
+            listen: listen.parse().unwrap(),
+            host: Host(host.to_owned()),
+            port: Port(9000),
+            load,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forward_outside_a_run_is_recorded_at_once_and_a_duplicate_is_refused() {
+        let (_home, paths) = temp_paths();
+        let state = spawn(&paths, StateConfig::default());
+
+        assert_eq!(
+            state
+                .call(add_forward_command(
+                    "127.0.0.1:19000",
+                    "one.example.com",
+                    None
+                ))
+                .await,
+            Response::Ok
+        );
+        let refused = state
+            .call(add_forward_command(
+                "127.0.0.1:19000",
+                "two.example.com",
+                None,
+            ))
+            .await;
+
+        let Response::Err { kind, message } = refused else {
+            panic!("a second forward on the same address must be refused: {refused:?}");
+        };
+        assert_eq!(kind, ErrKind::InvalidArgs);
+        assert!(message.contains("127.0.0.1:19000"), "{message}");
+        assert_eq!(
+            status_of(&state).await.forwards,
+            vec![ForwardView {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                host: Host("one.example.com".to_owned()),
+                port: Port(9000),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_forwards_of_a_run_replace_the_held_ones_on_commit() {
+        let (home, paths) = temp_paths();
+        write_handshake_script(&paths, home.path(), 0);
+        let state = spawn(&paths, StateConfig::default());
+        state
+            .call(add_forward_command(
+                "127.0.0.1:19000",
+                "one.example.com",
+                None,
+            ))
+            .await;
+        let reloading = tokio::spawn({
+            let state = state.clone();
+            async move { state.call(Command::Reload { path: None }).await }
+        });
+
+        let id = await_load_id(home.path()).await;
+        assert_eq!(
+            state
+                .call(add_forward_command(
+                    "127.0.0.1:19001",
+                    "two.example.com",
+                    Some(id)
+                ))
+                .await,
+            Response::Ok
+        );
+        assert_eq!(status_of(&state).await.forwards.len(), 1);
+        release(home.path());
+        reloading.await.unwrap();
+
+        assert_eq!(
+            status_of(&state).await.forwards,
+            vec![ForwardView {
+                listen: "127.0.0.1:19001".parse().unwrap(),
+                host: Host("two.example.com".to_owned()),
+                port: Port(9000),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forward_declared_twice_fails_the_run_on_add_forward() {
+        let (home, paths) = temp_paths();
+        write_handshake_script(&paths, home.path(), 0);
+        let state = spawn(&paths, StateConfig::default());
+        let reloading = tokio::spawn({
+            let state = state.clone();
+            async move { state.call(Command::Reload { path: None }).await }
+        });
+
+        let id = await_load_id(home.path()).await;
+        state
+            .call(add_forward_command(
+                "127.0.0.1:19000",
+                "one.example.com",
+                Some(id),
+            ))
+            .await;
+        let refused = state
+            .call(add_forward_command(
+                "127.0.0.1:19000",
+                "two.example.com",
+                Some(id),
+            ))
+            .await;
+        release(home.path());
+
+        let Response::Err { kind, message: _ } = refused else {
+            panic!("a duplicate forward must be rejected: {refused:?}");
+        };
+        assert_eq!(kind, ErrKind::InvalidArgs);
+        let answer = reloading.await.unwrap();
+        let Response::Err { kind, message } = answer else {
+            panic!("a rejected command must fail the run: {answer:?}");
+        };
+        assert_eq!(kind, ErrKind::Internal);
+        assert!(message.contains("add_forward"), "{message}");
+        let status = status_of(&state).await;
+        assert_eq!(status.forwards, Vec::new());
+        let Some(LastLoadView {
+            at: _,
+            outcome,
+            command,
+        }) = status.last_load
+        else {
+            panic!("a finished run must be recorded");
+        };
+        assert_eq!(outcome, LoadOutcome::Failed);
+        assert_eq!(command, Some("add_forward".to_owned()));
+    }
+
     #[tokio::test]
     async fn a_malformed_value_outside_a_run_leaves_the_live_rules_alone() {
         let (_home, paths) = temp_paths();
@@ -1469,12 +1705,14 @@ mod tests {
         let Response::Status(status) = state.call(Command::Status).await else {
             panic!("status must answer with a status view");
         };
+        let status = *status;
         let StatusView {
             uptime_secs: _,
             http_listen,
             http_bound,
             socks_listen,
             socks_bound,
+            forwards,
             upstream,
             health,
             health_changed_at: _,
@@ -1487,6 +1725,7 @@ mod tests {
         assert_eq!(socks_listen, DEFAULT_SOCKS_LISTEN);
         assert!(!http_bound);
         assert!(!socks_bound);
+        assert_eq!(forwards, Vec::new());
         assert_eq!(upstream, UpstreamAddr(String::new()));
         assert_eq!(health, HealthState::Down);
         assert_eq!(init_path, None);

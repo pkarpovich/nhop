@@ -1,6 +1,6 @@
 use nhop_ipc::{LoadId, RuleClass, RuleKind, RuleValue};
 
-use crate::proxy::{Listen, Upstream};
+use crate::proxy::{DuplicateForward, Forward, Forwards, Listen, Upstream};
 use crate::rules::{InvalidRule, Ruleset};
 
 /// Command an init run was rejected on, named as it appears on the wire.
@@ -12,6 +12,8 @@ pub enum FailedCommand {
     SetUpstream,
     /// The front ends could not be moved to the address.
     SetListen,
+    /// The address was declared twice, or could not be bound.
+    AddForward,
 }
 
 impl FailedCommand {
@@ -21,6 +23,7 @@ impl FailedCommand {
             Self::AddRule => "add_rule",
             Self::SetUpstream => "set_upstream",
             Self::SetListen => "set_listen",
+            Self::AddForward => "add_forward",
         }
     }
 }
@@ -34,17 +37,21 @@ pub struct Committed {
     pub upstream: Option<Upstream>,
     /// Front-end addresses the run set, absent when it set none.
     pub listen: Option<Listen>,
+    /// Forwards the run declared, in declaration order.
+    pub forwards: Forwards,
 }
 
 /// What one init run has built so far.
 ///
-/// A run starts from nothing, so the init file always declares the whole rule set, and nothing it
-/// stages reaches traffic until [`Staging::commit`] is called on a run that exited zero.
+/// A run starts from nothing, so the init file always declares the whole rule set and the whole
+/// set of forwards, and nothing it stages reaches traffic until [`Staging::commit`] is called on
+/// a run that exited zero.
 #[derive(Debug, Default)]
 pub struct Staging {
     rules: Ruleset,
     upstream: Option<Upstream>,
     listen: Option<Listen>,
+    forwards: Forwards,
     failed: Option<FailedCommand>,
 }
 
@@ -83,6 +90,20 @@ impl Staging {
         self.listen = Some(listen);
     }
 
+    /// Appends a forward to the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DuplicateForward`] when the run already declares the address, and marks the run
+    /// as failed so that it is discarded even if the script goes on to exit zero.
+    pub fn push_forward(&mut self, forward: Forward) -> Result<(), DuplicateForward> {
+        let Err(failure) = self.forwards.push(forward) else {
+            return Ok(());
+        };
+        self.fail(FailedCommand::AddForward);
+        Err(failure)
+    }
+
     /// Returns the command the run was rejected on, absent while it is still viable.
     pub fn failure(&self) -> Option<FailedCommand> {
         self.failed
@@ -94,12 +115,14 @@ impl Staging {
             rules,
             upstream,
             listen,
+            forwards,
             failed: _,
         } = self;
         Committed {
             rules,
             upstream,
             listen,
+            forwards,
         }
     }
 
@@ -129,12 +152,23 @@ impl LoadIds {
 mod tests {
     use nhop_ipc::{Host, Port, UpstreamAddr};
 
+    use crate::proxy::Target;
     use crate::rules::{Decision, RuleId};
 
     use super::*;
 
     fn value(value: &str) -> RuleValue {
         RuleValue(value.to_owned())
+    }
+
+    fn forward(listen: &str, host: &str) -> Forward {
+        Forward {
+            listen: listen.parse().unwrap(),
+            target: Target {
+                host: Host(host.to_owned()),
+                port: Port(9000),
+            },
+        }
     }
 
     fn listen() -> Listen {
@@ -169,9 +203,11 @@ mod tests {
             rules,
             upstream,
             listen,
+            forwards,
         } = staging.commit();
 
         assert_eq!(rules.rules().len(), 2);
+        assert_eq!(forwards, Forwards::default());
         assert_eq!(
             rules.decide(&Host("example.com".to_owned()), Port(443)),
             Decision::Upstream {
@@ -223,10 +259,53 @@ mod tests {
             rules: _,
             upstream: staged_upstream,
             listen: staged,
+            forwards: _,
         } = staging.commit();
 
         assert_eq!(staged_upstream, Some(upstream("socks5://192.0.2.11:1080")));
         assert_eq!(staged, Some(listen()));
+    }
+
+    #[test]
+    fn staged_forwards_keep_their_declaration_order() {
+        let mut staging = Staging::default();
+        staging
+            .push_forward(forward("127.0.0.1:19000", "one.example.com"))
+            .unwrap();
+        staging
+            .push_forward(forward("127.0.0.1:19001", "two.example.com"))
+            .unwrap();
+
+        let Committed {
+            rules: _,
+            upstream: _,
+            listen: _,
+            forwards,
+        } = staging.commit();
+
+        assert_eq!(
+            forwards.as_slice(),
+            &[
+                forward("127.0.0.1:19000", "one.example.com"),
+                forward("127.0.0.1:19001", "two.example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forward_declared_twice_fails_the_run_on_add_forward() {
+        let mut staging = Staging::default();
+        staging
+            .push_forward(forward("127.0.0.1:19000", "one.example.com"))
+            .unwrap();
+
+        let refused = staging
+            .push_forward(forward("127.0.0.1:19000", "two.example.com"))
+            .unwrap_err();
+
+        assert!(refused.to_string().contains("127.0.0.1:19000"), "{refused}");
+        assert_eq!(staging.failure(), Some(FailedCommand::AddForward));
+        assert_eq!(FailedCommand::AddForward.name(), "add_forward");
     }
 
     #[test]

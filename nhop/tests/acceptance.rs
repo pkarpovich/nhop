@@ -177,7 +177,7 @@ async fn status_of(daemon: &TestDaemon) -> StatusView {
     let Response::Status(status) = answer else {
         panic!("status must answer with a status view: {answer:?}");
     };
-    status
+    *status
 }
 
 async fn diagnosed(paths: &Paths) -> Vec<CheckView> {
@@ -325,6 +325,7 @@ async fn require_fails_when_upstream_closed() {
         http_bound,
         socks_listen,
         socks_bound,
+        forwards: _,
         upstream: _,
         health: _,
         health_changed_at: _,
