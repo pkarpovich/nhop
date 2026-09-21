@@ -13,6 +13,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use fs2::FileExt;
 use nhop_ipc::{Command, Paths};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,7 +26,7 @@ use crate::daemon::state::{
     DEFAULT_HTTP_LISTEN, DEFAULT_SOCKS_LISTEN, LOAD_TIMEOUT, Live, StateConfig, StateHandle,
 };
 use crate::logging;
-use crate::proxy::{self, Listen, NextHop};
+use crate::proxy::{self, Forward, Forwards, Listen, NextHop, Target};
 use crate::upstream::{PROBE_CONFIRM_DELAY, PROBE_INTERVAL, UpstreamHop};
 
 /// Addresses both front ends bind until an init script moves them.
@@ -153,13 +154,35 @@ impl Drop for Accepting {
     }
 }
 
-/// The two listeners a running daemon accepts traffic on.
+/// One forward listener, and the destination its accept loop reads per connection.
+///
+/// The destination sits behind a swap rather than inside the task so that a reload re-pointing a
+/// held address keeps its listener: the old task releases its socket only once the runtime drops
+/// it, which is after the synchronous bind of a replacement would have failed.
+#[derive(Debug)]
+struct Forwarding {
+    accepting: Accepting,
+    target: Arc<ArcSwap<Target>>,
+}
+
+impl Forwarding {
+    fn forward(&self) -> Forward {
+        let Self { accepting, target } = self;
+        Forward {
+            listen: accepting.addr,
+            target: target.load().as_ref().clone(),
+        }
+    }
+}
+
+/// The listeners a running daemon accepts traffic on.
 #[derive(Debug)]
 pub struct Bound {
     live: Live,
     hop: Arc<dyn NextHop>,
     http: Accepting,
     socks: Accepting,
+    forwards: Vec<Forwarding>,
 }
 
 impl Bound {
@@ -180,17 +203,69 @@ impl Bound {
         Ok(self.listen())
     }
 
+    fn rebind_forwards(&mut self, wanted: &Forwards) -> io::Result<Forwards> {
+        let mut fresh = Vec::new();
+        for forward in wanted.as_slice() {
+            let Forward { listen, target } = forward;
+            if self.held(*listen) {
+                continue;
+            }
+            fresh.push((bind_tcp(*listen)?, target.clone()));
+        }
+        self.forwards.retain(|forwarding| {
+            let Forwarding {
+                accepting,
+                target: _,
+            } = forwarding;
+            wanted.target_of(accepting.addr).is_some()
+        });
+        for forwarding in &self.forwards {
+            let Forwarding { accepting, target } = forwarding;
+            let Some(wanted) = wanted.target_of(accepting.addr) else {
+                continue;
+            };
+            target.store(Arc::new(wanted.clone()));
+        }
+        for (listener, target) in fresh {
+            let forwarding = accept_forward(listener, target, self.live.clone(), self.hop.clone())?;
+            self.forwards.push(forwarding);
+        }
+        Ok(self.forwards())
+    }
+
+    fn held(&self, listen: SocketAddr) -> bool {
+        for forwarding in &self.forwards {
+            let Forwarding {
+                accepting,
+                target: _,
+            } = forwarding;
+            if accepting.addr == listen {
+                return true;
+            }
+        }
+        false
+    }
+
     fn listen(&self) -> Listen {
         let Self {
             live: _,
             hop: _,
             http,
             socks,
+            forwards: _,
         } = self;
         Listen {
             http: http.addr,
             socks: socks.addr,
         }
+    }
+
+    fn forwards(&self) -> Forwards {
+        let mut forwards = Forwards::default();
+        for forwarding in &self.forwards {
+            let _unique = forwards.push(forwarding.forward());
+        }
+        forwards
     }
 }
 
@@ -199,12 +274,12 @@ impl Bound {
 pub enum Frontends {
     /// Nothing is listening, so a load that moves the addresses only records them.
     Unbound,
-    /// Both front ends hold an address.
+    /// Both protocol front ends hold an address, and every declared forward does too.
     Bound(Bound),
 }
 
 impl Frontends {
-    /// Binds both front ends and starts accepting on them.
+    /// Binds both protocol front ends and starts accepting on them, with no forward yet.
     ///
     /// # Errors
     ///
@@ -222,10 +297,11 @@ impl Frontends {
             hop,
             http,
             socks,
+            forwards: Vec::new(),
         }))
     }
 
-    /// Returns the addresses the front ends hold, absent while nothing is bound.
+    /// Returns the addresses the protocol front ends hold, absent while nothing is bound.
     pub fn listening(&self) -> Option<Listen> {
         match self {
             Self::Unbound => None,
@@ -233,7 +309,7 @@ impl Frontends {
         }
     }
 
-    /// Moves both front ends, leaving the connections they already accepted alone.
+    /// Moves both protocol front ends, leaving the connections they already accepted alone.
     ///
     /// A front end already holding the requested address keeps its listener: binding a second
     /// socket to a live address fails, so an init script that re-declares the current addresses
@@ -248,6 +324,25 @@ impl Frontends {
         match self {
             Self::Unbound => Ok(listen),
             Self::Bound(bound) => bound.rebind(listen),
+        }
+    }
+
+    /// Makes the set of forward front ends match the declared one.
+    ///
+    /// Every address to open is bound before anything is closed, so a set that cannot be bound
+    /// leaves the held one serving. A held address that stays declared keeps its listener and
+    /// takes the newly declared destination; one no longer declared is closed, its accepted
+    /// connections left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] when an address cannot be bound, leaving the held set as it was.
+    ///
+    /// [`io::Error`]: std::io::Error
+    pub fn rebind_forwards(&mut self, wanted: &Forwards) -> io::Result<Forwards> {
+        match self {
+            Self::Unbound => Ok(wanted.clone()),
+            Self::Bound(bound) => bound.rebind_forwards(wanted),
         }
     }
 }
@@ -309,6 +404,35 @@ fn accept_socks(listener: TcpListener, live: Live, hop: Arc<dyn NextHop>) -> io:
         }
     });
     Ok(Accepting { addr, accepting })
+}
+
+fn accept_forward(
+    listener: TcpListener,
+    target: Target,
+    live: Live,
+    hop: Arc<dyn NextHop>,
+) -> io::Result<Forwarding> {
+    let addr = listener.local_addr()?;
+    let target = Arc::new(ArcSwap::from_pointee(target));
+    let accepting = tokio::spawn({
+        let target = target.clone();
+        async move {
+            loop {
+                let stream = next_client(&listener).await;
+                let ctx = live.accepted();
+                let hop = hop.clone();
+                let target = target.load_full();
+                tokio::spawn(async move {
+                    let _served =
+                        proxy::forward::serve(stream, ctx, hop.as_ref(), target.as_ref()).await;
+                });
+            }
+        }
+    });
+    Ok(Forwarding {
+        accepting: Accepting { addr, accepting },
+        target,
+    })
 }
 
 /// Binds both front ends before the init script runs, so no rule can land on an unbound port.
@@ -511,12 +635,14 @@ mod tests {
         let Response::Status(status) = answer else {
             panic!("status must answer with a status view: {answer:?}");
         };
+        let status = *status;
         let StatusView {
             uptime_secs: _,
             http_listen,
             http_bound,
             socks_listen,
             socks_bound,
+            forwards,
             upstream: _,
             health: _,
             health_changed_at: _,
@@ -528,6 +654,7 @@ mod tests {
         assert_eq!(rules.require, 0);
         assert_eq!(rules.prefer, 0);
         assert_eq!(rules.never, 0);
+        assert_eq!(forwards, Vec::new());
         assert_eq!(init_path, None);
         let Listen { http, socks } = daemon.listen();
         assert_eq!(http_listen, http);
@@ -551,6 +678,145 @@ mod tests {
         assert_ne!(socks.port(), 0);
 
         daemon.shutdown().await;
+    }
+
+    fn forward(listen: SocketAddr, host: &str, port: u16) -> Forward {
+        Forward {
+            listen,
+            target: Target {
+                host: Host(host.to_owned()),
+                port: Port(port),
+            },
+        }
+    }
+
+    fn forwards(declared: &[Forward]) -> Forwards {
+        let mut forwards = Forwards::default();
+        for forward in declared {
+            forwards.push(forward.clone()).unwrap();
+        }
+        forwards
+    }
+
+    async fn closed_port() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    fn bound_frontends() -> Frontends {
+        let live = Live::default();
+        let hop = Arc::new(UpstreamHop::start(
+            live.upstream().clone(),
+            live.health().clone(),
+            PROBE_INTERVAL,
+            PROBE_CONFIRM_DELAY,
+        ));
+        Frontends::bind(live, hop, ephemeral()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_declared_forward_is_bound_and_answers_a_connection() {
+        let mut frontends = bound_frontends();
+
+        let held = frontends
+            .rebind_forwards(&forwards(&[forward(
+                ephemeral().http,
+                "api.example.com",
+                9000,
+            )]))
+            .unwrap();
+
+        let [bound] = held.as_slice() else {
+            panic!("one forward must be held: {held:?}");
+        };
+        assert_ne!(bound.listen.port(), 0);
+        assert_eq!(bound.target.host, Host("api.example.com".to_owned()));
+        assert!(tokio::net::TcpStream::connect(bound.listen).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_held_forward_keeps_its_listener_and_takes_the_new_destination() {
+        let mut frontends = bound_frontends();
+        let held = frontends
+            .rebind_forwards(&forwards(&[forward(
+                ephemeral().http,
+                "one.example.com",
+                9000,
+            )]))
+            .unwrap();
+        let [bound] = held.as_slice() else {
+            panic!("one forward must be held: {held:?}");
+        };
+        let listen = bound.listen;
+
+        let held = frontends
+            .rebind_forwards(&forwards(&[forward(listen, "two.example.com", 9001)]))
+            .unwrap();
+
+        let [rebound] = held.as_slice() else {
+            panic!("one forward must be held: {held:?}");
+        };
+        assert_eq!(rebound.listen, listen);
+        assert_eq!(rebound.target.host, Host("two.example.com".to_owned()));
+        assert_eq!(rebound.target.port, Port(9001));
+        assert!(tokio::net::TcpStream::connect(listen).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_forward_no_longer_declared_is_closed() {
+        let mut frontends = bound_frontends();
+        let held = frontends
+            .rebind_forwards(&forwards(&[forward(
+                ephemeral().http,
+                "api.example.com",
+                9000,
+            )]))
+            .unwrap();
+        let [bound] = held.as_slice() else {
+            panic!("one forward must be held: {held:?}");
+        };
+        let listen = bound.listen;
+
+        let held = frontends.rebind_forwards(&Forwards::default()).unwrap();
+
+        assert_eq!(held, Forwards::default());
+        for _attempt in 0..PATIENCE {
+            if tokio::net::TcpStream::connect(listen).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the closed forward on {listen} still answers");
+    }
+
+    #[tokio::test]
+    async fn a_forward_that_cannot_be_bound_leaves_the_held_set_serving() {
+        let mut frontends = bound_frontends();
+        let held = frontends
+            .rebind_forwards(&forwards(&[forward(
+                ephemeral().http,
+                "api.example.com",
+                9000,
+            )]))
+            .unwrap();
+        let [bound] = held.as_slice() else {
+            panic!("one forward must be held: {held:?}");
+        };
+        let listen = bound.listen;
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = squatter.local_addr().unwrap();
+
+        let refused = frontends.rebind_forwards(&forwards(&[
+            forward(closed_port().await, "two.example.com", 9000),
+            forward(taken, "three.example.com", 9000),
+        ]));
+
+        assert!(refused.is_err());
+        let Frontends::Bound(bound) = &frontends else {
+            panic!("the front ends must stay bound");
+        };
+        assert_eq!(bound.forwards().as_slice().len(), 1);
+        assert!(tokio::net::TcpStream::connect(listen).await.is_ok());
     }
 
     #[tokio::test]

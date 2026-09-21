@@ -34,6 +34,10 @@ nhop require keyword corp-only  # replace
 nhop prefer suffix example.net  # replace
 nhop prefer port 8443  # replace
 
+# forward - a plain local port routed to one destination by the rules above, for a client that
+# speaks no proxy protocol. A bare port binds on 127.0.0.1.
+# nhop forward 19000 app.internal.example.com:9000
+
 # The init file is a program, so a rule set can be generated.
 for host in one.example.org two.example.org  # replace
     nhop prefer suffix $host

@@ -4,13 +4,15 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use nhop_ipc::{CheckView, HealthState, LastLoadView, LoadOutcome, Timestamp, UpstreamAddr};
+use nhop_ipc::{
+    CheckView, HealthState, Host, LastLoadView, LoadOutcome, Port, Timestamp, UpstreamAddr,
+};
 use tokio::net::TcpStream;
 
 use crate::cli::Exit;
 use crate::cli::system_proxy::{NetworkService, ProxyFailure, SystemProxy};
 use crate::daemon::state::BindState;
-use crate::proxy::{Listen, NO_UPSTREAM};
+use crate::proxy::{Forward, Forwards, Listen, NO_UPSTREAM, Target};
 use crate::upstream::{Health, PREFER_CONNECT_TIMEOUT};
 
 /// Detail a check carries when nothing ran it.
@@ -192,18 +194,32 @@ pub fn unreachable(failure: &str) -> Finding {
 }
 
 /// Reports whether the front ends hold the addresses they were given.
-pub fn ports_bound(listen: Listen, bound: BindState) -> Finding {
+pub fn ports_bound(listen: Listen, forwards: &Forwards, bound: BindState) -> Finding {
     let Listen { http, socks } = listen;
     match bound {
         BindState::Bound => Finding::passed(
             Check::PortsBound,
-            format!("http on {http}, socks5 on {socks}"),
+            format!("http on {http}, socks5 on {socks}{}", forwarded(forwards)),
         ),
         BindState::Unbound => Finding::failed(
             Check::PortsBound,
             format!("nothing is listening on {http} or {socks}, restart the daemon"),
         ),
     }
+}
+
+fn forwarded(forwards: &Forwards) -> String {
+    let mut detail = String::new();
+    for forward in forwards.as_slice() {
+        let Forward {
+            listen,
+            target: Target { host, port },
+        } = forward;
+        let Host(host) = host;
+        let Port(port) = port;
+        detail.push_str(&format!(", forward on {listen} to {host}:{port}"));
+    }
+    detail
 }
 
 /// Reports whether macOS sends traffic to the front ends this daemon holds.
@@ -540,16 +556,40 @@ mod tests {
 
     #[test]
     fn bound_front_ends_pass_and_unbound_ones_name_both_addresses() {
-        let bound = ports_bound(listen(), BindState::Bound);
+        let bound = ports_bound(listen(), &Forwards::default(), BindState::Bound);
         assert_eq!(bound.outcome, Outcome::Passed);
-        assert!(bound.detail.contains("127.0.0.1:7890"), "{}", bound.detail);
+        assert_eq!(
+            bound.detail,
+            "http on 127.0.0.1:7890, socks5 on 127.0.0.1:7891"
+        );
 
-        let unbound = ports_bound(listen(), BindState::Unbound);
+        let unbound = ports_bound(listen(), &Forwards::default(), BindState::Unbound);
         assert_eq!(unbound.outcome, Outcome::Failed);
         assert!(
             unbound.detail.contains("127.0.0.1:7891"),
             "{}",
             unbound.detail
+        );
+    }
+
+    #[test]
+    fn a_bound_forward_is_named_with_its_destination() {
+        let mut forwards = Forwards::default();
+        forwards
+            .push(Forward {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                target: Target {
+                    host: Host("api.example.com".to_owned()),
+                    port: Port(9000),
+                },
+            })
+            .unwrap();
+
+        let bound = ports_bound(listen(), &forwards, BindState::Bound);
+
+        assert_eq!(
+            bound.detail,
+            "http on 127.0.0.1:7890, socks5 on 127.0.0.1:7891, forward on 127.0.0.1:19000 to api.example.com:9000"
         );
     }
 

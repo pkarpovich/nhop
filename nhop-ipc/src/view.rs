@@ -124,6 +124,17 @@ pub struct RuleCountsView {
     pub never: u32,
 }
 
+/// One forward front end: a local port and the destination its every connection is routed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardView {
+    /// Address the forward front end holds.
+    pub listen: SocketAddr,
+    /// Destination host every connection is routed to.
+    pub host: Host,
+    /// Destination port every connection is routed to.
+    pub port: Port,
+}
+
 /// Proxy settings macOS reports for the configured network service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemProxyView {
@@ -148,6 +159,9 @@ pub struct StatusView {
     pub socks_listen: SocketAddr,
     /// Whether the SOCKS5 front end holds that address.
     pub socks_bound: bool,
+    /// Forward front ends, in declaration order; absent on a daemon older than the field.
+    #[serde(default)]
+    pub forwards: Vec<ForwardView>,
     /// Address of the upstream proxy.
     pub upstream: UpstreamAddr,
     /// Current upstream verdict.
@@ -266,6 +280,15 @@ mod tests {
             duration_ms: 1_204,
             error: None,
         }
+    }
+
+    #[test]
+    fn a_status_written_before_forwards_existed_reads_back_with_none() {
+        let wire = r#"{"uptime_secs":1,"http_listen":"127.0.0.1:7890","http_bound":true,"socks_listen":"127.0.0.1:7891","socks_bound":true,"upstream":"","health":"down","health_changed_at":"2026-02-02T02:40:00Z","init_path":null,"last_load":null,"rules":{"require":0,"prefer":0,"never":0},"system_proxy":{"http":null,"https":null,"socks":null}}"#;
+
+        let status: StatusView = serde_json::from_str(wire).unwrap();
+
+        assert_eq!(status.forwards, Vec::new());
     }
 
     #[test]

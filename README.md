@@ -21,12 +21,14 @@ presence; everything is driven from the CLI.
   `never` (always direct, matched before every other rule)
 - listens for HTTP CONNECT and SOCKS5 on the ports the previous setup used, so
   clients pinned to them need no reconfiguration
+- a `forward` opens a plain local port for one destination, so a client that
+  speaks no proxy protocol still goes through the same rules
 
 ## Commands
 
 `nhop start` is the daemon. Everything else connects to its socket, sends one
-command and exits. The rule verbs and `upstream`, `listen`, `on`, `off` and
-`reload` mutate the ruleset; `status`, `rules`, `test`, `logs`, `tail` and
+command and exits. The rule verbs and `upstream`, `listen`, `forward`, `on`,
+`off` and `reload` mutate the ruleset; `status`, `rules`, `test`, `logs`, `tail` and
 `doctor` read. Each of those six takes `--json` and then prints one JSON
 document on stdout and nothing else. `nhop proxy status` is the exception: it
 reads macOS rather than the daemon and prints three fixed lines.
@@ -39,10 +41,11 @@ reads macOS rather than the daemon and prints three fixed lines.
 | `nhop never <kind> <value>` | adds a rule that is always dialled directly |
 | `nhop upstream socks5://<ip>:<port>` | points the router at its one SOCKS5 upstream |
 | `nhop listen <http addr> <socks addr>` | moves the two front ends |
+| `nhop forward <addr or port> <host>:<port>` | opens a local port whose every connection is routed to that destination |
 | `nhop reload [path]` | re-runs the init script, or a different file and remembers it |
 | `nhop on` | re-runs the remembered init script |
 | `nhop off` | clears the live ruleset while both front ends keep listening |
-| `nhop status` | reports uptime, listeners, upstream health, last load, rule counts, system proxy |
+| `nhop status` | reports uptime, listeners, forwards, upstream health, last load, rule counts, system proxy |
 | `nhop rules` | lists the live ruleset in declaration order |
 | `nhop test <host>:<port>` | reports where a destination would be routed, without dialling it |
 | `nhop logs` | prints the daemon log; `-f` follows, `--since 15m` limits the window |
@@ -143,6 +146,38 @@ regardless. Two cases are deliberately out of scope: arriving on one front end
 and asking for the other one's port, which costs a single useless connection
 rather than a carousel, and short forms like `127.1` that only a resolver
 expands - names are not resolved on the hot path.
+
+## Forwards
+
+The two front ends learn the destination from the client: a `CONNECT` line, a
+SOCKS5 request. A forward is a third front end whose destination is fixed when
+it is declared:
+
+```fish
+nhop forward 19000 app.internal.example.com:9000
+nhop forward 127.0.0.1:19001 other.internal.example.com:9000
+```
+
+A bare port binds on `127.0.0.1`. Every connection accepted on the port is
+routed exactly as a SOCKS5 request for that destination would be - the same
+rule decision, the same dial, the same line in the log with the destination's
+name on it - so a `require` rule covering the host sends the port through the
+upstream with the name resolved there. The client connects to the local port as
+if it were the service itself, which is what a client that speaks no proxy
+protocol needs.
+
+Two things follow from having no proxy protocol on the connection. A dial that
+is refused or fails closes the client without an answer, because there is no
+reply to carry one; the reason is on the log line. And a client that verifies
+the name it dialled against what it is served sees the local address instead,
+so it has to be told the name it should expect.
+
+Forwards belong to the init file like rules do: a run declares the whole set,
+an address declared twice fails the run on `add_forward`, and a commit closes
+the ports the new set no longer names. A port that stays declared keeps its
+listener and takes the new destination, so a reload never closes a port it is
+about to reopen. `nhop off` leaves forwards bound, as it leaves the two front
+ends bound: with the rules cleared they dial their destination directly.
 
 ## Long-lived connections
 

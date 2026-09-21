@@ -1,8 +1,9 @@
-//! The two front ends, and the contract both `serve` functions share.
+//! The three front ends, and the contract every `serve` function shares.
 //!
 //! Each routes one connection with a [`ConnCtx`] and dials through a [`NextHop`], leaves exactly
 //! one log line once a decision is reached, and answers the client before returning a failure -
-//! a refused dial included.
+//! a refused dial included - where its protocol has an answer to give.
+pub mod forward;
 pub mod http;
 pub mod socks5;
 
@@ -14,7 +15,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nhop_ipc::{EffectiveHop, EventView, HealthState, Host, Port, UpstreamAddr};
+use nhop_ipc::{EffectiveHop, EventView, ForwardView, HealthState, Host, Port, UpstreamAddr};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -22,11 +23,103 @@ use crate::logging;
 use crate::rules::{Decision, NormalizedHost, RuleId, Ruleset};
 use crate::upstream::HealthHandle;
 
-/// Addresses the two front ends listen on.
+/// Addresses the two protocol front ends listen on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listen {
     pub http: SocketAddr,
     pub socks: SocketAddr,
+}
+
+/// Destination a forward front end routes every connection to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub host: Host,
+    pub port: Port,
+}
+
+/// One forward front end: a local address and the destination its every connection is routed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub listen: SocketAddr,
+    pub target: Target,
+}
+
+impl Forward {
+    /// Renders the forward the way the wire reports it.
+    pub fn view(&self) -> ForwardView {
+        let Self {
+            listen,
+            target: Target { host, port },
+        } = self;
+        ForwardView {
+            listen: *listen,
+            host: host.clone(),
+            port: *port,
+        }
+    }
+}
+
+/// Rejection of a forward on an address another forward of the same set already declares.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a forward already listens on {0}")]
+pub struct DuplicateForward(pub SocketAddr);
+
+/// Forward front ends in declaration order, one per listening address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forwards(Vec<Forward>);
+
+impl Forwards {
+    /// Appends a forward, refusing a second one on an address the set already declares.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DuplicateForward`] naming the address.
+    pub fn push(&mut self, forward: Forward) -> Result<(), DuplicateForward> {
+        let Self(forwards) = self;
+        let Forward { listen, target: _ } = &forward;
+        for declared in forwards.iter() {
+            let Forward {
+                listen: held,
+                target: _,
+            } = declared;
+            if held == listen {
+                return Err(DuplicateForward(*listen));
+            }
+        }
+        forwards.push(forward);
+        Ok(())
+    }
+
+    /// Returns the destination declared for an address, absent when the set declares none.
+    pub fn target_of(&self, listen: SocketAddr) -> Option<&Target> {
+        let Self(forwards) = self;
+        for forward in forwards {
+            let Forward {
+                listen: held,
+                target,
+            } = forward;
+            if *held == listen {
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    /// Returns the forwards in declaration order.
+    pub fn as_slice(&self) -> &[Forward] {
+        let Self(forwards) = self;
+        forwards
+    }
+
+    /// Renders the set the way the wire reports it.
+    pub fn views(&self) -> Vec<ForwardView> {
+        let Self(forwards) = self;
+        let mut views = Vec::with_capacity(forwards.len());
+        for forward in forwards {
+            views.push(forward.view());
+        }
+        views
+    }
 }
 
 /// Address published while no init script has named an upstream.
@@ -503,6 +596,71 @@ mod tests {
         assert!(failure.to_string().contains("vm.example.com"), "{failure}");
         assert!(upstream("").is_err());
         assert!(upstream("socks5://192.0.2.10").is_err());
+    }
+
+    fn forward(listen: &str, host: &str, port: u16) -> Forward {
+        Forward {
+            listen: listen.parse().unwrap(),
+            target: Target {
+                host: Host(host.to_owned()),
+                port: Port(port),
+            },
+        }
+    }
+
+    #[test]
+    fn forwards_keep_their_declaration_order_and_render_as_views() {
+        let mut forwards = Forwards::default();
+        forwards
+            .push(forward("127.0.0.1:19000", "one.example.com", 9000))
+            .unwrap();
+        forwards
+            .push(forward("127.0.0.1:19001", "two.example.com", 9000))
+            .unwrap();
+
+        assert_eq!(forwards.as_slice().len(), 2);
+        assert_eq!(
+            forwards.target_of("127.0.0.1:19001".parse().unwrap()),
+            Some(&Target {
+                host: Host("two.example.com".to_owned()),
+                port: Port(9000),
+            })
+        );
+        assert_eq!(forwards.target_of("127.0.0.1:19002".parse().unwrap()), None);
+        assert_eq!(
+            forwards.views(),
+            vec![
+                ForwardView {
+                    listen: "127.0.0.1:19000".parse().unwrap(),
+                    host: Host("one.example.com".to_owned()),
+                    port: Port(9000),
+                },
+                ForwardView {
+                    listen: "127.0.0.1:19001".parse().unwrap(),
+                    host: Host("two.example.com".to_owned()),
+                    port: Port(9000),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_forward_on_the_same_address_is_refused_and_the_first_kept() {
+        let mut forwards = Forwards::default();
+        forwards
+            .push(forward("127.0.0.1:19000", "one.example.com", 9000))
+            .unwrap();
+
+        let refused = forwards
+            .push(forward("127.0.0.1:19000", "two.example.com", 9000))
+            .unwrap_err();
+
+        assert_eq!(
+            refused,
+            DuplicateForward("127.0.0.1:19000".parse().unwrap())
+        );
+        assert!(refused.to_string().contains("127.0.0.1:19000"), "{refused}");
+        assert_eq!(forwards.as_slice().len(), 1);
     }
 
     fn loops(destination: &str, port: u16, listening: &str) -> bool {

@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use argh::{EarlyExit, FromArgs};
 use nhop_ipc::{
-    CheckView, Command, DecisionKind, DecisionView, EffectiveHop, ErrKind, EventView, HealthState,
-    Host, LOAD_ID_ENV, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response, RuleClass,
-    RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView, Timestamp,
-    UpstreamAddr,
+    CheckView, Command, DecisionKind, DecisionView, EffectiveHop, ErrKind, EventView, ForwardView,
+    HealthState, Host, LOAD_ID_ENV, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response,
+    RuleClass, RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView,
+    Timestamp, UpstreamAddr,
 };
 use serde::Serialize;
 
@@ -179,6 +179,18 @@ fn parse_upstream(addr: &str) -> Result<UpstreamAddr, String> {
     Ok(UpstreamAddr(addr.to_owned()))
 }
 
+fn parse_forward_listen(listen: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = listen.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let Ok(port) = listen.parse::<u16>() else {
+        return Err(format!(
+            "expected an address like 127.0.0.1:19000 or a bare port, got {listen:?}"
+        ));
+    };
+    Ok(SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port))
+}
+
 fn parse_since(window: &str) -> Result<Since, String> {
     let Ok(window) = humantime::parse_duration(window) else {
         return Err(format!(
@@ -204,6 +216,7 @@ enum Subcommand {
     Never(Never),
     Upstream(Upstream),
     Listen(Listen),
+    Forward(Forward),
     Reload(Reload),
     On(On),
     Off(Off),
@@ -276,6 +289,18 @@ struct Listen {
     /// address the SOCKS5 front end binds
     #[argh(positional)]
     socks: SocketAddr,
+}
+
+#[derive(FromArgs, Debug, PartialEq, Eq)]
+/// open a local port whose every connection is routed to one destination
+#[argh(subcommand, name = "forward")]
+struct Forward {
+    /// local address to listen on, as host:port, or a bare port on 127.0.0.1
+    #[argh(positional, from_str_fn(parse_forward_listen))]
+    listen: SocketAddr,
+    /// destination, as host:port
+    #[argh(positional)]
+    target: Destination,
 }
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
@@ -423,6 +448,18 @@ async fn dispatch(
             let command = Command::SetListen { http, socks, load };
             ask(paths, command, Output::Human, out, err).await
         }
+        Subcommand::Forward(Forward {
+            listen,
+            target: Destination { host, port },
+        }) => {
+            let command = Command::AddForward {
+                listen,
+                host,
+                port,
+                load,
+            };
+            ask(paths, command, Output::Human, out, err).await
+        }
         Subcommand::Reload(Reload { path }) => {
             let command = Command::Reload {
                 path: reload_path(path),
@@ -545,12 +582,14 @@ async fn listen_of(paths: &Paths, err: &mut dyn Write) -> Result<crate::proxy::L
     };
     match response {
         Response::Status(status) => {
+            let status = *status;
             let StatusView {
                 uptime_secs: _,
                 http_listen,
                 http_bound: _,
                 socks_listen,
                 socks_bound: _,
+                forwards: _,
                 upstream: _,
                 health: _,
                 health_changed_at: _,
@@ -862,6 +901,7 @@ fn render_status(status: &StatusView, out: &mut dyn Write) {
         http_bound,
         socks_listen,
         socks_bound,
+        forwards,
         upstream,
         health,
         health_changed_at,
@@ -890,6 +930,12 @@ fn render_status(status: &StatusView, out: &mut dyn Write) {
         "socks         {socks_listen} {}",
         bound_name(*socks_bound)
     );
+    for forward in forwards {
+        let ForwardView { listen, host, port } = forward;
+        let Host(host) = host;
+        let Port(port) = port;
+        let _ = writeln!(out, "forward       {listen} -> {host}:{port}");
+    }
     let _ = writeln!(
         out,
         "upstream      {upstream} {} since {changed_at}",
@@ -1169,6 +1215,26 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(&["forward", "127.0.0.1:19000", "api.example.com:9000"]),
+            Subcommand::Forward(Forward {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                target: Destination {
+                    host: Host("api.example.com".to_owned()),
+                    port: Port(9000),
+                },
+            })
+        );
+        assert_eq!(
+            parse(&["forward", "19000", "api.example.com:9000"]),
+            Subcommand::Forward(Forward {
+                listen: "127.0.0.1:19000".parse().unwrap(),
+                target: Destination {
+                    host: Host("api.example.com".to_owned()),
+                    port: Port(9000),
+                },
+            })
+        );
+        assert_eq!(
             parse(&["reload"]),
             Subcommand::Reload(Reload { path: None })
         );
@@ -1275,6 +1341,40 @@ mod tests {
         assert!("example.com:https".parse::<Destination>().is_err());
         assert!("example.com:70000".parse::<Destination>().is_err());
         assert!(":443".parse::<Destination>().is_err());
+    }
+
+    #[test]
+    fn a_forward_listen_address_that_is_neither_an_address_nor_a_port_is_refused() {
+        assert!(parse_forward_listen("eleven").is_err());
+        assert!(parse_forward_listen("70000").is_err());
+        assert!(parse_forward_listen("localhost:19000").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_forward_verb_outside_an_init_run_opens_the_port_and_status_lists_it() {
+        let (_home, paths, daemon) = running_daemon().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (exit, out, err) = invoke(
+            &paths,
+            &["forward", &listen.to_string(), "api.example.com:9000"],
+        )
+        .await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.is_empty(), "{err}");
+        let (exit, out, _err) = invoke(&paths, &["status"]).await;
+        assert_eq!(exit, Exit::Success);
+        assert!(
+            out.contains(&format!("forward       {listen} -> api.example.com:9000")),
+            "{out}"
+        );
+        assert!(tokio::net::TcpStream::connect(listen).await.is_ok());
+
+        daemon.shutdown().await;
     }
 
     #[tokio::test]

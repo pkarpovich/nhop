@@ -1,4 +1,11 @@
 {
+  "forwards": [
+    {
+      "host": "api.example.com",
+      "listen": "127.0.0.1:19000",
+      "port": 9000
+    }
+  ],
   "health": "up",
   "health_changed_at": "2026-02-02T02:40:00Z",
   "http_bound": true,
