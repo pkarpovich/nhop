@@ -35,6 +35,30 @@ pub const DEFAULT_LISTEN: Listen = Listen {
     socks: DEFAULT_SOCKS_LISTEN,
 };
 
+/// How the upstream patrol paces its probes and how long a returning upstream is held back.
+///
+/// Production runs at [`Pace::PRODUCTION`]; the fields are open so a test daemon can fail over and
+/// return within seconds instead of waiting out [`RETURN_HOLD`].
+#[derive(Debug, Clone, Copy)]
+pub struct Pace {
+    /// How long the patrol waits between rounds, [`PROBE_INTERVAL`] in production.
+    pub interval: Duration,
+    /// How long the patrol waits before a confirming probe, [`PROBE_CONFIRM_DELAY`] in production.
+    pub confirm_delay: Duration,
+    /// How long a higher-ranked upstream stays up before it takes traffic back, [`RETURN_HOLD`] in
+    /// production.
+    pub hold: Duration,
+}
+
+impl Pace {
+    /// The pace a running daemon keeps.
+    pub const PRODUCTION: Self = Self {
+        interval: PROBE_INTERVAL,
+        confirm_delay: PROBE_CONFIRM_DELAY,
+        hold: RETURN_HOLD,
+    };
+}
+
 /// How long a listener waits after a failed accept, so a lasting failure cannot spin its task.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -442,13 +466,13 @@ fn accept_forward(
 /// Returns [`io::Error`] when either address cannot be bound.
 ///
 /// [`io::Error`]: std::io::Error
-pub fn spawn_frontends(live: &Live, listen: Listen) -> io::Result<Frontends> {
-    let hop = UpstreamHop::start(
-        live.upstream().clone(),
-        PROBE_INTERVAL,
-        PROBE_CONFIRM_DELAY,
-        RETURN_HOLD,
-    );
+pub fn spawn_frontends(live: &Live, listen: Listen, pace: Pace) -> io::Result<Frontends> {
+    let Pace {
+        interval,
+        confirm_delay,
+        hold,
+    } = pace;
+    let hop = UpstreamHop::start(live.upstream().clone(), interval, confirm_delay, hold);
     Frontends::bind(live.clone(), Arc::new(hop), listen)
 }
 
@@ -514,11 +538,20 @@ pub fn start(paths: &Paths) -> Result<Daemon, StartFailure> {
 ///
 /// Returns [`StartFailure`] when another daemon is running or a listener cannot be bound.
 pub fn start_on(paths: &Paths, listen: Listen) -> Result<Daemon, StartFailure> {
+    start_paced(paths, listen, Pace::PRODUCTION)
+}
+
+/// Starts the daemon on `listen` with its upstream patrol and return hold at `pace`.
+///
+/// # Errors
+///
+/// Returns [`StartFailure`] when another daemon is running or a listener cannot be bound.
+pub fn start_paced(paths: &Paths, listen: Listen, pace: Pace) -> Result<Daemon, StartFailure> {
     let guard = InstanceGuard::acquire(paths)?;
     let socket_file = paths.socket_file();
     let listener = ipc_server::bind(&socket_file)?;
     let live = Live::default();
-    let frontends = spawn_frontends(&live, listen)?;
+    let frontends = spawn_frontends(&live, listen, pace)?;
     let listen = frontends.listening().unwrap_or(listen);
     let state = state::spawn(
         paths,

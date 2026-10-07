@@ -343,14 +343,19 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 **Files:**
 - Modify: `nhop/tests/support/mod.rs`
 - Create: `nhop/tests/upstream_fallback.rs`
+- Modify: `nhop/src/daemon/mod.rs`
 
-- [ ] give `StubSocks5` a way to stop accepting and start again on the same port (`stop()` closing the listener, `restart()` rebinding the recorded address), documented as the shape of an upstream host that is turned off and on
-- [ ] write `a_down_primary_hands_new_connections_to_the_fallback`: daemon with [P, F], short interval/confirm/hold, P stopped; a `require` connection is carried by F (`F.client_dials()`), its event has `via` F
-- [ ] write `a_primary_back_takes_new_connections_only_after_the_hold`: from the previous state restart P; a connection made before the hold elapses still goes to F; after the hold plus one probe cycle a new connection goes to P
-- [ ] write `an_open_connection_survives_a_switch`: open a relayed connection through F, let P come back and win selection, then exchange bytes over the open connection and assert the echo; assert F still holds it
-- [ ] write `the_log_records_each_switch_with_its_cause`: read the daemon's log after the scenario above and assert the switch records `P -> F (down)` and `F -> P (held)` in order
-- [ ] write `a_forward_port_follows_selection`: a `forward` port whose destination matches a `require` rule is carried by F while P is down
-- [ ] run `mise run check` - must pass before task 7
+- [x] give `StubSocks5` a way to stop accepting and start again on the same port (`stop()` closing the listener, `restart()` rebinding the recorded address), documented as the shape of an upstream host that is turned off and on
+- [x] write `a_down_primary_hands_new_connections_to_the_fallback`: daemon with [P, F], short interval/confirm/hold, P stopped; a `require` connection is carried by F (`F.client_dials()`), its event has `via` F
+- [x] write `a_primary_back_takes_new_connections_only_after_the_hold`: from the previous state restart P; a connection made before the hold elapses still goes to F; after the hold plus one probe cycle a new connection goes to P
+- [x] write `an_open_connection_survives_a_switch`: open a relayed connection through F, let P come back and win selection, then exchange bytes over the open connection and assert the echo; assert F still holds it
+- [x] write `the_log_records_each_switch_with_its_cause`: read the daemon's log after the scenario above and assert the switch records `P -> F (down)` and `F -> P (held)` in order
+- [x] write `a_forward_port_follows_selection`: a `forward` port whose destination matches a `require` rule is carried by F while P is down
+- [x] run `mise run check` - must pass before task 7
+- + note: a daemon needs a short interval, confirm delay and hold to fail over and return within seconds, so `daemon::Pace { interval, confirm_delay, hold }` (with `Pace::PRODUCTION`) now feeds `spawn_frontends`; `start_on` is `start_paced(paths, listen, Pace::PRODUCTION)`, and `TestDaemon::paced` is `TestDaemon::start` at a given pace. The tests run at 100 ms / 50 ms / 2 s
+- + note: every scenario goes through one helper, `failed_over`: [P, F] cold-start, P selected, P stopped, F selected. The log test then needs no extra setup to see `P -> F (down)`, since P really served before it went away. "Selected" is polled with `UpstreamEntries::selected(now, HOLD)` over the published snapshot, the same pure function the dial computes
+- + note: switch records are read as raw JSON fields (`upstream_from`, `upstream_to`, `switch_cause`) until Task 7 adds `Logged::Switch`
+- + note: the log test passed alone and lost records beside the other four. tracing-core caches callsite interest process-wide, and while exactly one dispatcher is registered it judges a callsite by the default of the thread that registers it, so a parallel test's daemon reaching the switch callsite first silenced it for good. `support::ScopedLog::install(paths)` installs the daemon's subscriber with `set_default` and keeps a silent `NoSubscriber` dispatch alive beside it, which makes every registration consult all live dispatchers
 
 ### Task 7: Status, doctor, test and logs
 
