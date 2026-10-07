@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
-use nhop_ipc::HealthState;
+use nhop_ipc::{HealthState, UpstreamAddr};
 use serde::{Deserialize, Serialize};
 
 use crate::logging::{cause_name, health_name};
@@ -66,19 +66,35 @@ impl Default for Health {
 /// A daemon starts [`HealthState::Down`], so no `prefer` destination is sent through an upstream
 /// that has not answered anything yet. A `require` destination is dialled from that cold verdict,
 /// since it has no direct route to be spared for.
-#[derive(Debug, Clone)]
-pub struct HealthHandle(Arc<ArcSwap<Health>>);
+#[derive(Debug, Clone, Default)]
+pub struct HealthHandle(Arc<Judged>);
 
-impl Default for HealthHandle {
-    fn default() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(Health::default())))
-    }
+/// The address a verdict is about, when it is about one, and the verdict itself.
+#[derive(Debug, Default)]
+struct Judged {
+    upstream: Option<UpstreamAddr>,
+    health: ArcSwap<Health>,
 }
 
 impl HealthHandle {
+    /// Returns a fresh [`HealthState::Down`] verdict on `upstream`, named on every turnover line.
+    ///
+    /// With several upstreams a turnover line that does not say which one turned over cannot be
+    /// read; a handle made by [`Default`] judges no particular address and its lines name none.
+    pub fn judging(upstream: UpstreamAddr) -> Self {
+        Self(Arc::new(Judged {
+            upstream: Some(upstream),
+            health: ArcSwap::default(),
+        }))
+    }
+
     /// Returns the verdict and the instant it settled.
     pub fn verdict(&self) -> Health {
-        let Self(health) = self;
+        let Self(judged) = self;
+        let Judged {
+            upstream: _,
+            health,
+        } = &**judged;
         **health.load()
     }
 
@@ -109,6 +125,9 @@ impl HealthHandle {
 
     /// Records one observation, stamping a turnover with `at` and logging a line only on a turnover.
     ///
+    /// The line carries `upstream` - the written address this handle judges, absent for a handle
+    /// judging none - beside `verdict_from`, `verdict_to` and `cause`.
+    ///
     /// The patrol stamps every write of one round with the instant the round started, so entries
     /// whose sequences close in the same round settle at the same instant and [`select`] breaks
     /// the tie by list order rather than by which probe happened to return first.
@@ -119,6 +138,11 @@ impl HealthHandle {
     /// [`select`]: crate::upstream::select
     pub fn set_at(&self, state: HealthState, cause: VerdictCause, at: SystemTime) {
         let previous = self.settle(state, at);
+        let Self(judged) = self;
+        let Judged {
+            upstream,
+            health: _,
+        } = &**judged;
         let Health {
             state: previous,
             changed_at: _,
@@ -127,6 +151,9 @@ impl HealthHandle {
             (HealthState::Up, HealthState::Up) | (HealthState::Down, HealthState::Down) => {}
             (HealthState::Up, HealthState::Down) | (HealthState::Down, HealthState::Up) => {
                 tracing::info!(
+                    upstream = upstream
+                        .as_ref()
+                        .map(|UpstreamAddr(upstream)| upstream.as_str()),
                     verdict_from = health_name(previous),
                     verdict_to = health_name(state),
                     cause = cause_name(cause),
@@ -148,13 +175,17 @@ impl HealthHandle {
     /// A reload keeps an entry's handle only while it keeps the address, so two handles that are
     /// the same judge one address published without a break in between.
     pub fn same(&self, other: &HealthHandle) -> bool {
-        let Self(health) = self;
+        let Self(judged) = self;
         let Self(other) = other;
-        Arc::ptr_eq(health, other)
+        Arc::ptr_eq(judged, other)
     }
 
     fn settle(&self, state: HealthState, at: SystemTime) -> Arc<Health> {
-        let Self(health) = self;
+        let Self(judged) = self;
+        let Judged {
+            upstream: _,
+            health,
+        } = &**judged;
         health.rcu(|settled| {
             let Health {
                 state: settled,
@@ -186,16 +217,24 @@ mod tests {
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct VerdictFields {
+        #[serde(default)]
+        upstream: Option<UpstreamAddr>,
         verdict_from: HealthState,
         verdict_to: HealthState,
         cause: VerdictCause,
     }
 
     fn recorded(observe: impl FnOnce(&HealthHandle)) -> Vec<VerdictFields> {
+        recorded_on(HealthHandle::default(), observe)
+    }
+
+    fn recorded_on(
+        health: HealthHandle,
+        observe: impl FnOnce(&HealthHandle),
+    ) -> Vec<VerdictFields> {
         let home = tempfile::tempdir().unwrap();
         let paths = Paths::from_home(home.path());
         let subscriber = logging::subscriber(&paths).unwrap();
-        let health = HealthHandle::default();
         tracing::subscriber::with_default(subscriber, || observe(&health));
         let mut records = Vec::new();
         for file in logging::files(&paths).unwrap() {
@@ -312,10 +351,37 @@ mod tests {
         assert_eq!(
             records,
             vec![VerdictFields {
+                upstream: None,
                 verdict_from: HealthState::Down,
                 verdict_to: HealthState::Up,
                 cause: VerdictCause::Dial,
             }]
         );
+    }
+
+    #[test]
+    fn a_turnover_names_the_upstream_it_judges() {
+        let judged = UpstreamAddr("socks5://192.0.2.11:1080".to_owned());
+
+        let records = recorded_on(HealthHandle::judging(judged.clone()), |health| {
+            health.set(HealthState::Up, VerdictCause::Probe);
+        });
+
+        assert_eq!(
+            records,
+            vec![VerdictFields {
+                upstream: Some(judged),
+                verdict_from: HealthState::Down,
+                verdict_to: HealthState::Up,
+                cause: VerdictCause::Probe,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_judging_handle_starts_down() {
+        let health = HealthHandle::judging(UpstreamAddr("socks5://192.0.2.11:1080".to_owned()));
+
+        assert_eq!(health.state(), HealthState::Down);
     }
 }

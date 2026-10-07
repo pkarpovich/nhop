@@ -211,7 +211,7 @@ mod tests {
 
     use crate::view::{
         DecisionKind, ForwardView, HealthState, LastLoadView, LoadOutcome, RuleCountsView,
-        SystemProxyView, Timestamp,
+        SystemProxyView, Timestamp, UpstreamView,
     };
 
     use super::*;
@@ -301,6 +301,20 @@ mod tests {
             upstream: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
             health: HealthState::Down,
             health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
+            upstreams: vec![
+                UpstreamView {
+                    addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                    health: HealthState::Down,
+                    health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
+                    selected: false,
+                },
+                UpstreamView {
+                    addr: UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    health: HealthState::Up,
+                    health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
+                    selected: true,
+                },
+            ],
             init_path: Some(PathBuf::from("/home/operator/.config/nhop/init")),
             last_load: Some(LastLoadView {
                 at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_001)),

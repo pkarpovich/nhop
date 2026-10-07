@@ -330,6 +330,7 @@ async fn require_fails_when_upstream_closed() {
         upstream: _,
         health: _,
         health_changed_at: _,
+        upstreams: _,
         init_path: _,
         last_load: _,
         rules,

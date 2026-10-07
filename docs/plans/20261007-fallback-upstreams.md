@@ -370,16 +370,19 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/cli/mod.rs`
 - Modify: `nhop/tests/golden/status.json`
 
-- [ ] add `UpstreamView` and `StatusView.upstreams` as specified in "Status shape"; fill them in the state task from the published list and `select`
-- [ ] render the per-entry status lines as specified in "Status shape", with no suffix for a one-entry list
-- [ ] change `doctor::upstream_reachable` as specified in "`doctor`"
-- [ ] change `decision_view` as specified in "`test` / `explain`"
-- [ ] add the `upstream` field to verdict records, `LoggedSwitch` and `Logged::Switch`, and both renderings from "Event and log shape"
-- [ ] write the status tests `status_lists_every_upstream_in_order`, `status_marks_the_selected_upstream` and `a_single_upstream_status_line_is_unchanged` (byte-for-byte today's line), and update the golden file
-- [ ] write the doctor tests `doctor_passes_while_any_upstream_answers` and `doctor_fails_when_no_upstream_answers`, both asserting the detail names every entry; confirm the acceptance test's seven check names are unchanged
-- [ ] write the test `test_reports_the_selected_upstream`
-- [ ] write the rendering tests `logs_renders_a_verdict_line_with_its_upstream`, `logs_renders_a_switch_line` and confirm `logs_renders_a_verdict_line` (no address) is byte-unchanged; extend the serde-parity test to `SwitchCause`
-- [ ] run `mise run check` - must pass before task 8
+- [x] add `UpstreamView` and `StatusView.upstreams` as specified in "Status shape"; fill them in the state task from the published list and `select`
+- [x] render the per-entry status lines as specified in "Status shape", with no suffix for a one-entry list
+- [x] change `doctor::upstream_reachable` as specified in "`doctor`"
+- [x] change `decision_view` as specified in "`test` / `explain`"
+- [x] add the `upstream` field to verdict records, `LoggedSwitch` and `Logged::Switch`, and both renderings from "Event and log shape"
+- [x] write the status tests `status_lists_every_upstream_in_order`, `status_marks_the_selected_upstream` and `a_single_upstream_status_line_is_unchanged` (byte-for-byte today's line), and update the golden file
+- [x] write the doctor tests `doctor_passes_while_any_upstream_answers` and `doctor_fails_when_no_upstream_answers`, both asserting the detail names every entry; confirm the acceptance test's seven check names are unchanged
+- [x] write the test `test_reports_the_selected_upstream`
+- [x] write the rendering tests `logs_renders_a_verdict_line_with_its_upstream`, `logs_renders_a_switch_line` and confirm `logs_renders_a_verdict_line` (no address) is byte-unchanged; extend the serde-parity test to `SwitchCause`
+- [x] run `mise run check` - must pass before task 8
+- + note: the verdict record's `upstream` comes from the handle itself: `HealthHandle` now wraps the written address it judges beside the verdict (`HealthHandle::judging`, used by `UpstreamEntries::adopted` for a fresh address), so `set_at` - the one place a turnover is seen - names it without a parameter. A `Default` handle judges no address and logs no `upstream` field, so `StubHop`, `DownHop` and an unconfigured daemon write the old shape. A handle kept across a reload keeps the written form of the address it was first created for
+- + note: `StateConfig` gained `hold` (`RETURN_HOLD` by default, `Pace::hold` from `start_paced`) so `status` and `test` select with the hold the dialer uses; `DaemonState::new` now takes the `StateConfig` whole. `UpstreamEntries::at(selected)` and `UpstreamEntries::required(selected)` (the selected entry, or the first while none is selected) are shared by `routed()` and `decision_view`, which takes `Option<&UpstreamAddr>` now
+- + note: `doctor::upstream_reachable(&UpstreamEntries)` spawns one TCP connect per entry; a one-entry list keeps today's detail word for word (`... answered on ..., the verdict is up`, `cannot reach ... on ...: ...`), two or more entries are joined with `; ` as `<addr> reachable, the verdict is up` / `<addr> unreachable, <reason>, the verdict is down`. `status` falls back to today's single line whenever `upstreams` has fewer than two entries, which covers an unconfigured daemon and a daemon older than the field. The extra tests `a_listed_status_prints_one_line_per_upstream_and_marks_the_selected_one`, `upstream_views_follow_the_list_and_mark_only_the_selected_entry`, `a_turnover_names_the_upstream_it_judges` and `logged_reads_the_upstream_of_a_verdict_and_both_sides_of_a_switch` pin the pieces; `upstream_fallback.rs` now reads switch records through `Logged::Switch`
 
 ### Task 8: Verify acceptance criteria
 

@@ -178,24 +178,14 @@ impl UpstreamHop {
         let entries = self.upstream.snapshot();
         let selected = entries.selected(SystemTime::now(), self.hold);
         self.selection.observe(&entries, selected);
-        let selected = match selected {
-            Some(index) => entries.as_slice().get(index),
-            None => None,
-        };
         match class {
             RuleClass::Never => Dialled::Attempted {
                 hop: EffectiveHop::Direct,
                 via: None,
                 next: direct(host, port).await,
             },
-            RuleClass::Require => {
-                let dialled = match selected {
-                    Some(entry) => Some(entry),
-                    None => entries.first(),
-                };
-                required(host, port, rule, dialled).await
-            }
-            RuleClass::Prefer => preferred(host, port, selected).await,
+            RuleClass::Require => required(host, port, rule, entries.required(selected)).await,
+            RuleClass::Prefer => preferred(host, port, entries.at(selected)).await,
         }
     }
 }

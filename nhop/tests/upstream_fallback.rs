@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use nhop::daemon::Pace;
-use nhop::logging;
+use nhop::logging::{self, Logged, LoggedSwitch};
+use nhop::upstream::SwitchCause;
 use nhop_ipc::{
     Command, EffectiveHop, EventView, ForwardView, Host, Paths, Port, Response, RuleClass,
     RuleKind, RuleValue, UpstreamAddr,
@@ -28,7 +29,6 @@ const PATIENCE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
 const GREETING: [u8; 3] = [0x05, 0x01, 0x00];
 const GRANTED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-const SWITCH_CAUSE: &str = "switch_cause";
 
 fn temp_paths() -> (TempDir, Paths) {
     let home = tempfile::tempdir().unwrap();
@@ -168,28 +168,19 @@ async fn forward(daemon: &TestDaemon, host: &str, port: u16) -> SocketAddr {
 /// One switch record of the log: the written addresses on either side and its cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Switched {
-    from: String,
-    to: String,
-    cause: String,
+    from: Option<UpstreamAddr>,
+    to: Option<UpstreamAddr>,
+    cause: SwitchCause,
 }
 
 impl Switched {
-    fn new(from: SocketAddr, to: SocketAddr, cause: &str) -> Self {
-        let UpstreamAddr(from) = written(from);
-        let UpstreamAddr(to) = written(to);
+    fn new(from: SocketAddr, to: SocketAddr, cause: SwitchCause) -> Self {
         Self {
-            from,
-            to,
-            cause: cause.to_owned(),
+            from: Some(written(from)),
+            to: Some(written(to)),
+            cause,
         }
     }
-}
-
-fn text(fields: &serde_json::Value, key: &str) -> String {
-    let Some(serde_json::Value::String(text)) = fields.get(key) else {
-        panic!("a switch record carries {key}: {fields}");
-    };
-    text.clone()
 }
 
 fn switches(paths: &Paths) -> Vec<Switched> {
@@ -197,18 +188,16 @@ fn switches(paths: &Paths) -> Vec<Switched> {
     for file in logging::files(paths).unwrap() {
         let (lines, _offset) = logging::read_from(&file, 0).unwrap();
         for line in lines {
-            let line: serde_json::Value = serde_json::from_str(&line).unwrap();
-            let Some(fields) = line.get("fields") else {
+            let Some(Logged::Switch(LoggedSwitch {
+                at: _,
+                from,
+                to,
+                cause,
+            })) = logging::logged(&line)
+            else {
                 continue;
             };
-            if fields.get(SWITCH_CAUSE).is_none() {
-                continue;
-            }
-            switches.push(Switched {
-                from: text(fields, "upstream_from"),
-                to: text(fields, "upstream_to"),
-                cause: text(fields, SWITCH_CAUSE),
-            });
+            switches.push(Switched { from, to, cause });
         }
     }
     switches
@@ -341,8 +330,8 @@ async fn the_log_records_each_switch_with_its_cause() {
     primary.restart().await;
     await_selected(&daemon, primary.addr()).await;
 
-    let left = Switched::new(primary.addr(), fallback.addr(), "down");
-    let returned = Switched::new(fallback.addr(), primary.addr(), "held");
+    let left = Switched::new(primary.addr(), fallback.addr(), SwitchCause::Down);
+    let returned = Switched::new(fallback.addr(), primary.addr(), SwitchCause::Held);
     let switches = await_switch(&paths, &returned).await;
 
     let mut since = Vec::new();

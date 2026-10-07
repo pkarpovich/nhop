@@ -17,4 +17,5 @@ pub use paths::{HomeNotFound, Paths};
 pub use view::{
     CheckView, DecisionKind, DecisionView, EffectiveHop, EventView, ForwardView, HealthState,
     LastLoadView, LoadOutcome, RuleCountsView, RuleView, StatusView, SystemProxyView, Timestamp,
+    UpstreamView,
 };

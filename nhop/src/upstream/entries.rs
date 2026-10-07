@@ -58,7 +58,7 @@ impl UpstreamEntries {
             }
             entries.push(UpstreamEntry {
                 upstream: upstream.clone(),
-                health: health.unwrap_or_default(),
+                health: health.unwrap_or_else(|| HealthHandle::judging(upstream.written().clone())),
             });
         }
         Self(entries)
@@ -74,6 +74,24 @@ impl UpstreamEntries {
     pub fn as_slice(&self) -> &[UpstreamEntry] {
         let Self(entries) = self;
         entries
+    }
+
+    /// Returns the entry at `selected`, absent when nothing is selected.
+    pub fn at(&self, selected: Option<usize>) -> Option<&UpstreamEntry> {
+        let Self(entries) = self;
+        entries.get(selected?)
+    }
+
+    /// Returns the entry a `require` dial goes through: the selected one, or the first while none
+    /// is selected, absent only while no upstream is configured.
+    ///
+    /// The first entry is the one the operator ranked first, and a dial through it that connects
+    /// turns it up at once, which makes it the selected entry for the connections after it.
+    pub fn required(&self, selected: Option<usize>) -> Option<&UpstreamEntry> {
+        let Some(entry) = self.at(selected) else {
+            return self.first();
+        };
+        Some(entry)
     }
 
     /// Returns the index of the entry new connections go through at `now`, absent while none is up.

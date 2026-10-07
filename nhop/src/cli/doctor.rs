@@ -12,8 +12,8 @@ use tokio::net::TcpStream;
 use crate::cli::Exit;
 use crate::cli::system_proxy::{NetworkService, ProxyFailure, SystemProxy};
 use crate::daemon::state::BindState;
-use crate::proxy::{Forward, Forwards, Listen, NO_UPSTREAM, Target};
-use crate::upstream::{Health, PREFER_CONNECT_TIMEOUT};
+use crate::proxy::{Forward, Forwards, Listen, Target};
+use crate::upstream::{PREFER_CONNECT_TIMEOUT, UpstreamEntries, UpstreamEntry};
 
 /// Detail a check carries when nothing ran it.
 const NOT_CHECKED: &str = "not checked, the daemon did not answer";
@@ -271,50 +271,123 @@ pub fn system_proxy(
     )
 }
 
-/// Reports whether the upstream answers, and names the Local Network denial macOS hides.
-pub async fn upstream_reachable(
-    written: &UpstreamAddr,
-    upstream: SocketAddr,
-    health: Health,
-) -> Finding {
-    let UpstreamAddr(name) = written;
-    if name.is_empty() || upstream == NO_UPSTREAM {
+/// Reports whether any upstream answers, naming every one of them and the Local Network denial
+/// macOS hides.
+///
+/// Every entry is dialled at once within [`PREFER_CONNECT_TIMEOUT`], so the check costs one budget
+/// however long the list is. It passes while at least one entry answers: a primary that is off
+/// while its fallback serves is the normal state of a list, not a fault to turn `doctor` red for.
+/// A one-entry list reports in the words a single upstream always did.
+pub async fn upstream_reachable(entries: &UpstreamEntries) -> Finding {
+    let mut dials = Vec::with_capacity(entries.as_slice().len());
+    for entry in entries.as_slice() {
+        let dial = tokio::spawn(reach(entry.upstream().socket()));
+        dials.push((entry.clone(), dial));
+    }
+    let mut reached = Vec::with_capacity(dials.len());
+    for (entry, dial) in dials {
+        let reach = match dial.await {
+            Ok(reach) => reach,
+            Err(failure) => Reach::Refused(io::Error::other(failure)),
+        };
+        reached.push((entry, reach));
+    }
+    let Some(((entry, reach), rest)) = reached.split_first() else {
         return Finding::failed(
             Check::UpstreamReachable,
             "no upstream is configured, name one with `nhop upstream socks5://<ip>:<port>`"
                 .to_owned(),
         );
+    };
+    if rest.is_empty() {
+        return alone(entry, reach);
     }
-    let Health {
-        state,
-        changed_at: _,
-    } = health;
-    let state = verdict_name(state);
+    let mut outcome = Outcome::Failed;
+    let mut described = Vec::with_capacity(reached.len());
+    for (entry, reach) in &reached {
+        match reach {
+            Reach::Answered => outcome = Outcome::Passed,
+            Reach::Silent | Reach::Refused(_) => {}
+        }
+        described.push(listed(entry, reach));
+    }
+    Finding {
+        check: Check::UpstreamReachable,
+        outcome,
+        detail: described.join("; "),
+    }
+}
+
+/// What one TCP connect to an upstream came back with.
+#[derive(Debug)]
+enum Reach {
+    Answered,
+    Silent,
+    Refused(io::Error),
+}
+
+async fn reach(upstream: SocketAddr) -> Reach {
     let dialling = TcpStream::connect(upstream);
     let Ok(dialled) = tokio::time::timeout(PREFER_CONNECT_TIMEOUT, dialling).await else {
-        return Finding::failed(
+        return Reach::Silent;
+    };
+    match dialled {
+        Ok(_stream) => Reach::Answered,
+        Err(failure) => Reach::Refused(failure),
+    }
+}
+
+fn alone(entry: &UpstreamEntry, reach: &Reach) -> Finding {
+    let UpstreamAddr(name) = entry.upstream().written();
+    let upstream = entry.upstream().socket();
+    let state = verdict_name(entry.health().state());
+    match reach {
+        Reach::Answered => Finding::passed(
+            Check::UpstreamReachable,
+            format!("{name} answered on {upstream}, the verdict is {state}"),
+        ),
+        Reach::Silent => Finding::failed(
             Check::UpstreamReachable,
             format!(
                 "{name} did not answer within {}s, the verdict is {state}",
                 PREFER_CONNECT_TIMEOUT.as_secs()
             ),
-        );
-    };
-    let Err(failure) = dialled else {
-        return Finding::passed(
-            Check::UpstreamReachable,
-            format!("{name} answered on {upstream}, the verdict is {state}"),
-        );
-    };
-    Finding::failed(Check::UpstreamReachable, refusal(name, upstream, &failure))
+        ),
+        Reach::Refused(failure) => {
+            Finding::failed(Check::UpstreamReachable, refusal(name, upstream, failure))
+        }
+    }
+}
+
+fn listed(entry: &UpstreamEntry, reach: &Reach) -> String {
+    let UpstreamAddr(name) = entry.upstream().written();
+    let state = verdict_name(entry.health().state());
+    match reach {
+        Reach::Answered => format!("{name} reachable, the verdict is {state}"),
+        Reach::Silent => format!(
+            "{name} unreachable, no answer within {}s, the verdict is {state}",
+            PREFER_CONNECT_TIMEOUT.as_secs()
+        ),
+        Reach::Refused(failure) => format!(
+            "{name} unreachable, {failure}{}, the verdict is {state}",
+            local_network(failure)
+        ),
+    }
 }
 
 fn refusal(name: &str, upstream: SocketAddr, failure: &io::Error) -> String {
+    format!(
+        "cannot reach {name} on {upstream}: {failure}{}",
+        local_network(failure)
+    )
+}
+
+fn local_network(failure: &io::Error) -> &'static str {
     match failure.kind() {
-        io::ErrorKind::HostUnreachable => format!(
-            "cannot reach {name} on {upstream}: {failure} - macOS reports a denied Local Network permission as a routing error, so grant nhop Local Network access in System Settings > Privacy & Security and check that the binary is signed"
-        ),
-        _ => format!("cannot reach {name} on {upstream}: {failure}"),
+        io::ErrorKind::HostUnreachable => {
+            " - macOS reports a denied Local Network permission as a routing error, so grant nhop Local Network access in System Settings > Privacy & Security and check that the binary is signed"
+        }
+        _ => "",
     }
 }
 
@@ -414,11 +487,12 @@ pub fn log_writable(log_file: &Path) -> Finding {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     use tokio::net::TcpListener;
 
     use crate::cli::system_proxy::ProxyEndpoint;
+    use crate::proxy::Upstreams;
 
     use super::*;
 
@@ -433,11 +507,21 @@ mod tests {
         NetworkService::default()
     }
 
-    fn settled() -> Health {
-        Health {
-            state: HealthState::Up,
-            changed_at: UNIX_EPOCH + Duration::from_secs(1_770_000_000),
+    fn listed(addrs: &[SocketAddr]) -> UpstreamEntries {
+        let Some((first, rest)) = addrs.split_first() else {
+            return UpstreamEntries::default();
+        };
+        let mut fallbacks = Vec::with_capacity(rest.len());
+        for addr in rest {
+            fallbacks.push(UpstreamAddr(format!("socks5://{addr}")));
         }
+        let upstreams = Upstreams::parse(UpstreamAddr(format!("socks5://{first}")), fallbacks);
+        UpstreamEntries::default().adopted(&upstreams.unwrap())
+    }
+
+    async fn closed_port() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
     }
 
     fn passing() -> Vec<Finding> {
@@ -649,24 +733,23 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let finding = upstream_reachable(&UpstreamAddr(addr.to_string()), addr, settled()).await;
+        let entries = listed(&[addr]);
+        entries.as_slice()[0].health().seed(HealthState::Up);
+
+        let finding = upstream_reachable(&entries).await;
 
         assert_eq!(finding.outcome, Outcome::Passed);
-        assert!(finding.detail.contains("up"), "{}", finding.detail);
+        assert_eq!(
+            finding.detail,
+            format!("socks5://{addr} answered on {addr}, the verdict is up")
+        );
     }
 
     #[tokio::test]
     async fn an_upstream_on_a_closed_port_fails_and_names_the_address() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let addr = closed_port().await;
 
-        let finding = upstream_reachable(
-            &UpstreamAddr(format!("socks5://{addr}")),
-            addr,
-            Health::default(),
-        )
-        .await;
+        let finding = upstream_reachable(&listed(&[addr])).await;
 
         assert_eq!(finding.outcome, Outcome::Failed);
         assert!(
@@ -678,12 +761,60 @@ mod tests {
 
     #[tokio::test]
     async fn an_unnamed_upstream_fails_without_dialling_anything() {
-        let finding =
-            upstream_reachable(&UpstreamAddr(String::new()), NO_UPSTREAM, Health::default()).await;
+        let finding = upstream_reachable(&UpstreamEntries::default()).await;
 
         assert_eq!(finding.outcome, Outcome::Failed);
         assert!(
             finding.detail.contains("nhop upstream"),
+            "{}",
+            finding.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_passes_while_any_upstream_answers() {
+        let primary = closed_port().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback = listener.local_addr().unwrap();
+        let entries = listed(&[primary, fallback]);
+        entries.as_slice()[1].health().seed(HealthState::Up);
+
+        let finding = upstream_reachable(&entries).await;
+
+        assert_eq!(finding.outcome, Outcome::Passed);
+        let (named_primary, named_fallback) = finding.detail.split_once("; ").unwrap();
+        assert!(
+            named_primary.starts_with(&format!("socks5://{primary} unreachable, ")),
+            "{}",
+            finding.detail
+        );
+        assert!(
+            named_primary.ends_with("the verdict is down"),
+            "{}",
+            finding.detail
+        );
+        assert_eq!(
+            named_fallback,
+            format!("socks5://{fallback} reachable, the verdict is up")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_fails_when_no_upstream_answers() {
+        let primary = closed_port().await;
+        let fallback = closed_port().await;
+
+        let finding = upstream_reachable(&listed(&[primary, fallback])).await;
+
+        assert_eq!(finding.outcome, Outcome::Failed);
+        let (named_primary, named_fallback) = finding.detail.split_once("; ").unwrap();
+        assert!(
+            named_primary.starts_with(&format!("socks5://{primary} unreachable, ")),
+            "{}",
+            finding.detail
+        );
+        assert!(
+            named_fallback.starts_with(&format!("socks5://{fallback} unreachable, ")),
             "{}",
             finding.detail
         );

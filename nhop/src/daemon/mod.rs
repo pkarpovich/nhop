@@ -553,6 +553,11 @@ pub fn start_paced(paths: &Paths, listen: Listen, pace: Pace) -> Result<Daemon, 
     let live = Live::default();
     let frontends = spawn_frontends(&live, listen, pace)?;
     let listen = frontends.listening().unwrap_or(listen);
+    let Pace {
+        interval: _,
+        confirm_delay: _,
+        hold,
+    } = pace;
     let state = state::spawn(
         paths,
         StateConfig {
@@ -561,6 +566,7 @@ pub fn start_paced(paths: &Paths, listen: Listen, pace: Pace) -> Result<Daemon, 
             listen,
             load_timeout: LOAD_TIMEOUT,
             proxy: Arc::new(Networksetup),
+            hold,
         },
     );
     let (shutdown, signalled) = oneshot::channel();
@@ -679,6 +685,7 @@ mod tests {
             upstream: _,
             health: _,
             health_changed_at: _,
+            upstreams: _,
             init_path,
             last_load: _,
             rules,

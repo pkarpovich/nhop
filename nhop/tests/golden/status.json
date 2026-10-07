@@ -29,5 +29,19 @@
     "socks": "127.0.0.1:7891"
   },
   "upstream": "socks5://192.0.2.10:1080",
+  "upstreams": [
+    {
+      "addr": "socks5://192.0.2.10:1080",
+      "health": "up",
+      "health_changed_at": "2026-02-02T02:40:00Z",
+      "selected": true
+    },
+    {
+      "addr": "socks5://192.0.2.11:1080",
+      "health": "down",
+      "health_changed_at": "2026-02-02T02:40:00Z",
+      "selected": false
+    }
+  ],
   "uptime_secs": 3600
 }

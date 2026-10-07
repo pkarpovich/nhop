@@ -135,6 +135,19 @@ pub struct ForwardView {
     pub port: Port,
 }
 
+/// One upstream of the configured list, with its own verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamView {
+    /// Address of the upstream as the init script wrote it.
+    pub addr: UpstreamAddr,
+    /// Current verdict on this upstream alone.
+    pub health: HealthState,
+    /// When this upstream's verdict last changed.
+    pub health_changed_at: Timestamp,
+    /// Whether new connections go through this upstream at the time of the snapshot.
+    pub selected: bool,
+}
+
 /// Proxy settings macOS reports for the configured network service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemProxyView {
@@ -162,12 +175,16 @@ pub struct StatusView {
     /// Forward front ends, in declaration order; absent on a daemon older than the field.
     #[serde(default)]
     pub forwards: Vec<ForwardView>,
-    /// Address of the upstream proxy.
+    /// Address of the first upstream of the list, the one preferred over every other.
     pub upstream: UpstreamAddr,
-    /// Current upstream verdict.
+    /// Current verdict on the first upstream.
     pub health: HealthState,
-    /// When the verdict last changed.
+    /// When the first upstream's verdict last changed.
     pub health_changed_at: Timestamp,
+    /// Every configured upstream in order of preference, empty until a load names one; absent on a
+    /// daemon older than the field.
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamView>,
     /// Init script the daemon remembers, absent until one is run.
     pub init_path: Option<PathBuf>,
     /// Result of the most recent run, absent until one finishes.
@@ -298,6 +315,7 @@ mod tests {
         let status: StatusView = serde_json::from_str(wire).unwrap();
 
         assert_eq!(status.forwards, Vec::new());
+        assert_eq!(status.upstreams, Vec::new());
     }
 
     #[test]
