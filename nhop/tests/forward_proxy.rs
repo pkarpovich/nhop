@@ -87,7 +87,7 @@ async fn next_decision(decisions: &mut mpsc::Receiver<EventView>) -> EventView {
 async fn a_forward_routes_its_destination_by_the_rules_through_the_upstream() {
     let (_home, paths) = temp_paths();
     let upstream = StubSocks5::start().await;
-    let daemon = TestDaemon::start(&paths, upstream.addr()).await;
+    let daemon = TestDaemon::start(&paths, &[upstream.addr()]).await;
     require_suffix(&daemon, "example.com").await;
     let listen = forward(&daemon, ephemeral(), "api.example.com", 9000).await;
     let mut decisions = daemon.state().live().events().subscribe();
@@ -119,7 +119,7 @@ async fn a_forward_with_no_matching_rule_dials_its_destination_directly() {
     let (_home, paths) = temp_paths();
     let upstream = StubSocks5::start().await;
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, upstream.addr()).await;
+    let daemon = TestDaemon::start(&paths, &[upstream.addr()]).await;
     let listen = forward(
         &daemon,
         ephemeral(),
@@ -141,7 +141,7 @@ async fn a_forward_with_no_matching_rule_dials_its_destination_directly() {
 async fn a_forward_whose_dial_fails_closes_the_client_and_logs_the_failure() {
     let (_home, paths) = temp_paths();
     let upstream = StubSocks5::start().await;
-    let daemon = TestDaemon::start(&paths, upstream.addr()).await;
+    let daemon = TestDaemon::start(&paths, &[upstream.addr()]).await;
     let gone = closed_port().await;
     let listen = forward(&daemon, ephemeral(), &gone.ip().to_string(), gone.port()).await;
     let mut decisions = daemon.state().live().events().subscribe();
@@ -163,7 +163,7 @@ async fn a_forward_whose_dial_fails_closes_the_client_and_logs_the_failure() {
 async fn a_forward_pointed_at_its_own_address_refuses_without_dialling() {
     let (_home, paths) = temp_paths();
     let upstream = StubSocks5::start().await;
-    let daemon = TestDaemon::start(&paths, upstream.addr()).await;
+    let daemon = TestDaemon::start(&paths, &[upstream.addr()]).await;
     let own = closed_port().await;
     let listen = forward(&daemon, own, &own.ip().to_string(), own.port()).await;
     assert_eq!(listen, own);

@@ -5,13 +5,13 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use nhop::daemon::state::LiveUpstream;
-use nhop::proxy::{Dialled, NextHop, UpstreamDown};
+use nhop::proxy::{Dialled, NextHop, UpstreamDown, Upstreams};
 use nhop::rules::{Decision, RuleClass, RuleId};
 use nhop::upstream::{
     HealthHandle, PREFER_CONNECT_TIMEOUT, PROBE_INTERVAL, PROBE_TIMEOUT, REQUIRE_CONNECT_TIMEOUT,
-    UpstreamHop,
+    UpstreamHop, VerdictCause,
 };
-use nhop_ipc::{HealthState, Host, Port};
+use nhop_ipc::{HealthState, Host, Port, UpstreamAddr};
 use tokio::net::{TcpListener, TcpStream};
 
 use support::{Answers, SocksRequest, StubOrigin, StubSocks5, ephemeral};
@@ -22,20 +22,32 @@ const SNAPPY: Duration = Duration::from_millis(100);
 const DELIBERATE: Duration = Duration::from_millis(500);
 const GRACE: Duration = Duration::from_millis(500);
 
+fn listed(upstream: SocketAddr) -> Upstreams {
+    Upstreams::parse(UpstreamAddr(format!("socks5://{upstream}")), Vec::new()).unwrap()
+}
+
 fn published(upstream: SocketAddr) -> LiveUpstream {
     let published = LiveUpstream::default();
-    published.publish(upstream);
+    published.publish(&listed(upstream));
     published
 }
 
-fn verdict(state: HealthState) -> HealthHandle {
-    let health = HealthHandle::default();
-    health.seed(state);
-    health
+/// Returns the verdict on the first published upstream, the one the dialer routes by.
+fn verdict_of(published: &LiveUpstream) -> HealthHandle {
+    let Some(entry) = published.snapshot().first().cloned() else {
+        panic!("an upstream must be published");
+    };
+    entry.health().clone()
+}
+
+fn seeded(upstream: SocketAddr, state: HealthState) -> LiveUpstream {
+    let published = published(upstream);
+    verdict_of(&published).seed(state);
+    published
 }
 
 fn hop(upstream: SocketAddr, state: HealthState) -> UpstreamHop {
-    UpstreamHop::start(published(upstream), verdict(state), PATIENT, PATIENT)
+    UpstreamHop::start(seeded(upstream, state), PATIENT, PATIENT)
 }
 
 /// Dials through the hop, keeping only whether a connection came back.
@@ -102,7 +114,7 @@ async fn a_prefer_rule_reaches_the_destination_while_the_upstream_is_closed() {
     let dialled = dial(&hop, &host, port, prefer(1)).await.unwrap();
 
     assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
-    assert_eq!(hop.health().state(), HealthState::Down);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Down);
 }
 
 #[tokio::test]
@@ -121,7 +133,7 @@ async fn a_require_rule_fails_while_the_upstream_is_closed() {
         down.to_string(),
         format!("nhop: upstream {upstream} is down (require rule 2)")
     );
-    assert_eq!(hop.health().state(), HealthState::Down);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Down);
     assert_eq!(origin.connections(), 0);
 }
 
@@ -143,7 +155,7 @@ async fn a_require_rule_travels_through_the_upstream_as_the_name_the_client_wrot
             port: 443,
         }]
     );
-    assert_eq!(hop.health().state(), HealthState::Up);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Up);
 }
 
 #[tokio::test]
@@ -191,14 +203,14 @@ async fn a_require_dial_reaches_the_upstream_while_the_verdict_is_down() {
 #[tokio::test]
 async fn the_verdict_flips_up_once_the_upstream_answers_a_probe() {
     let published = published(closed_port().await);
-    let health = HealthHandle::default();
-    let _hop = UpstreamHop::start(published.clone(), health.clone(), EAGER, SNAPPY);
+    let _hop = UpstreamHop::start(published.clone(), EAGER, SNAPPY);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(health.state(), HealthState::Down);
-    let settled = health.changed_at();
+    assert_eq!(verdict_of(&published).state(), HealthState::Down);
 
     let stub = StubSocks5::start().await;
-    published.publish(stub.addr());
+    published.publish(&listed(stub.addr()));
+    let health = verdict_of(&published);
+    let settled = health.changed_at();
 
     await_state(&health, HealthState::Up, Duration::from_secs(5)).await;
     assert!(health.changed_at() > settled);
@@ -217,12 +229,7 @@ async fn the_verdict_flips_up_once_the_upstream_answers_a_probe() {
 #[tokio::test]
 async fn a_probe_is_sent_while_the_verdict_is_up() {
     let stub = StubSocks5::start().await;
-    let _hop = UpstreamHop::start(
-        published(stub.addr()),
-        verdict(HealthState::Up),
-        EAGER,
-        PATIENT,
-    );
+    let _hop = UpstreamHop::start(seeded(stub.addr(), HealthState::Up), EAGER, PATIENT);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -237,8 +244,9 @@ async fn a_probe_is_sent_while_the_verdict_is_up() {
 #[tokio::test]
 async fn a_cold_start_reaches_up_shortly_after_the_confirm_delay() {
     let stub = StubSocks5::start().await;
-    let health = HealthHandle::default();
-    let _hop = UpstreamHop::start(published(stub.addr()), health.clone(), PATIENT, SNAPPY);
+    let published = published(stub.addr());
+    let health = verdict_of(&published);
+    let _hop = UpstreamHop::start(published, PATIENT, SNAPPY);
     let started = Instant::now();
 
     await_state(&health, HealthState::Up, SNAPPY + GRACE).await;
@@ -253,11 +261,11 @@ async fn a_cold_start_reaches_up_shortly_after_the_confirm_delay() {
 #[tokio::test]
 async fn an_upstream_published_after_the_hop_starts_is_probed_without_waiting_an_interval() {
     let live = LiveUpstream::default();
-    let health = HealthHandle::default();
-    let _hop = UpstreamHop::start(live.clone(), health.clone(), PROBE_INTERVAL, SNAPPY);
+    let _hop = UpstreamHop::start(live.clone(), PROBE_INTERVAL, SNAPPY);
     let stub = StubSocks5::start().await;
     tokio::time::sleep(SNAPPY).await;
-    live.publish(stub.addr());
+    live.publish(&listed(stub.addr()));
+    let health = verdict_of(&live);
     let started = Instant::now();
 
     await_state(&health, HealthState::Up, Duration::from_secs(2)).await;
@@ -272,8 +280,9 @@ async fn an_upstream_published_after_the_hop_starts_is_probed_without_waiting_an
 #[tokio::test]
 async fn an_upstream_that_answers_exactly_once_never_flips_the_verdict_up() {
     let stub = StubSocks5::answering(Answers::Once).await;
-    let health = HealthHandle::default();
-    let _hop = UpstreamHop::start(published(stub.addr()), health.clone(), EAGER, SNAPPY);
+    let published = published(stub.addr());
+    let health = verdict_of(&published);
+    let _hop = UpstreamHop::start(published, EAGER, SNAPPY);
 
     tokio::time::sleep(Duration::from_millis(600)).await;
 
@@ -283,13 +292,9 @@ async fn an_upstream_that_answers_exactly_once_never_flips_the_verdict_up() {
 
 #[tokio::test]
 async fn a_vanished_upstream_reaches_down_inside_the_stated_budget() {
-    let health = verdict(HealthState::Up);
-    let _hop = UpstreamHop::start(
-        published(closed_port().await),
-        health.clone(),
-        EAGER,
-        SNAPPY,
-    );
+    let published = seeded(closed_port().await, HealthState::Up);
+    let health = verdict_of(&published);
+    let _hop = UpstreamHop::start(published, EAGER, SNAPPY);
     let started = Instant::now();
 
     await_state(&health, HealthState::Down, EAGER + SNAPPY + GRACE).await;
@@ -304,8 +309,9 @@ async fn a_vanished_upstream_reaches_down_inside_the_stated_budget() {
 #[tokio::test]
 async fn an_upstream_that_never_answers_is_discovered_by_the_patrol() {
     let mute = StubSocks5::answering(Answers::Never).await;
-    let health = verdict(HealthState::Up);
-    let _hop = UpstreamHop::start(published(mute.addr()), health.clone(), EAGER, SNAPPY);
+    let published = seeded(mute.addr(), HealthState::Up);
+    let health = verdict_of(&published);
+    let _hop = UpstreamHop::start(published, EAGER, SNAPPY);
     let started = Instant::now();
 
     await_state(
@@ -325,8 +331,9 @@ async fn an_upstream_that_never_answers_is_discovered_by_the_patrol() {
 #[tokio::test]
 async fn one_missed_probe_leaves_the_verdict_up() {
     let stub = StubSocks5::answering(Answers::AfterOneDrop).await;
-    let health = verdict(HealthState::Up);
-    let hop = UpstreamHop::start(published(stub.addr()), health.clone(), EAGER, SNAPPY);
+    let published = seeded(stub.addr(), HealthState::Up);
+    let health = verdict_of(&published);
+    let hop = UpstreamHop::start(published, EAGER, SNAPPY);
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -340,9 +347,9 @@ async fn one_missed_probe_leaves_the_verdict_up() {
 #[tokio::test]
 async fn a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes() {
     let stub = StubSocks5::answering(Answers::AfterOneDrop).await;
-    let live = published(stub.addr());
-    let health = verdict(HealthState::Up);
-    let hop = UpstreamHop::start(live.clone(), health.clone(), PATIENT, DELIBERATE);
+    let live = seeded(stub.addr(), HealthState::Up);
+    let health = verdict_of(&live);
+    let _hop = UpstreamHop::start(live.clone(), PATIENT, DELIBERATE);
     tokio::time::sleep(SNAPPY).await;
     assert_eq!(
         health.state(),
@@ -350,20 +357,7 @@ async fn a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes() {
         "one missed probe must not move the verdict"
     );
 
-    live.publish(closed_port().await);
-    let failure = dial(&hop, &Host("example.com".to_owned()), Port(443), require(0))
-        .await
-        .unwrap_err();
-    assert!(
-        UpstreamDown::carried_by(&failure).is_some(),
-        "{failure} must carry the upstream-down surface"
-    );
-    assert_eq!(
-        health.state(),
-        HealthState::Down,
-        "a real dial failure still flips down on one failure"
-    );
-    live.publish(stub.addr());
+    health.set(HealthState::Down, VerdictCause::Dial);
 
     tokio::time::sleep(DELIBERATE).await;
     assert_eq!(
@@ -376,12 +370,13 @@ async fn a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes() {
 
 #[tokio::test]
 async fn a_sequence_banked_against_one_upstream_is_not_closed_by_the_next() {
-    let live = published(closed_port().await);
-    let health = verdict(HealthState::Up);
-    let _hop = UpstreamHop::start(live.clone(), health.clone(), PATIENT, DELIBERATE);
+    let live = seeded(closed_port().await, HealthState::Up);
+    let _hop = UpstreamHop::start(live.clone(), PATIENT, DELIBERATE);
     tokio::time::sleep(SNAPPY).await;
 
-    live.publish(closed_port().await);
+    live.publish(&listed(closed_port().await));
+    let health = verdict_of(&live);
+    health.seed(HealthState::Up);
 
     tokio::time::sleep(DELIBERATE + SNAPPY).await;
     assert_eq!(
@@ -405,7 +400,7 @@ async fn a_prefer_dial_leaves_a_black_holed_upstream_within_three_seconds() {
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(3), "waited {waited:?}");
     assert_eq!(dialled.peer_addr().unwrap(), origin.addr());
-    assert_eq!(hop.health().state(), HealthState::Down);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Down);
 }
 
 #[tokio::test]
@@ -426,7 +421,7 @@ async fn a_require_dial_is_served_by_a_slow_upstream() {
             port: 443,
         }]
     );
-    assert_eq!(hop.health().state(), HealthState::Up);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Up);
 }
 
 #[tokio::test]
@@ -449,7 +444,7 @@ async fn a_prefer_dial_leaves_a_slow_upstream_for_the_direct_route() {
         waited < Duration::from_secs(3),
         "a prefer dial must not wait out an upstream slower than its budget: {waited:?}"
     );
-    assert_eq!(hop.health().state(), HealthState::Down);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Down);
 }
 
 #[tokio::test(start_paused = true)]
@@ -471,5 +466,5 @@ async fn a_require_dial_into_a_black_hole_costs_the_require_budget() {
         "{failure} must carry the upstream-down surface"
     );
     assert_eq!(started.elapsed(), REQUIRE_CONNECT_TIMEOUT);
-    assert_eq!(hop.health().state(), HealthState::Down);
+    assert_eq!(verdict_of(hop.upstream()).state(), HealthState::Down);
 }

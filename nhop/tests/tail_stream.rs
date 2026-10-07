@@ -52,7 +52,7 @@ async fn tail_prints_one_document_per_routed_connection() {
     let home = tempfile::tempdir().unwrap();
     let paths = Paths::from_home(home.path());
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let out = Shared::default();
     let err = Shared::default();
     let mut printed = out.clone();
@@ -102,7 +102,7 @@ async fn a_subscriber_that_never_reads_still_lets_connections_through() {
     let home = tempfile::tempdir().unwrap();
     let paths = Paths::from_home(home.path());
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let mut deaf = tokio::net::UnixStream::connect(daemon.ipc_path())
         .await
         .unwrap();

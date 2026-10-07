@@ -443,12 +443,7 @@ fn accept_forward(
 ///
 /// [`io::Error`]: std::io::Error
 pub fn spawn_frontends(live: &Live, listen: Listen) -> io::Result<Frontends> {
-    let hop = UpstreamHop::start(
-        live.upstream().clone(),
-        live.health().clone(),
-        PROBE_INTERVAL,
-        PROBE_CONFIRM_DELAY,
-    );
+    let hop = UpstreamHop::start(live.upstream().clone(), PROBE_INTERVAL, PROBE_CONFIRM_DELAY);
     Frontends::bind(live.clone(), Arc::new(hop), listen)
 }
 
@@ -707,7 +702,6 @@ mod tests {
         let live = Live::default();
         let hop = Arc::new(UpstreamHop::start(
             live.upstream().clone(),
-            live.health().clone(),
             PROBE_INTERVAL,
             PROBE_CONFIRM_DELAY,
         ));

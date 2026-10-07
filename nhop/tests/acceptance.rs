@@ -222,8 +222,8 @@ async fn require_reaches_upstream() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
     let upstream = StubSocks5::start().await;
-    let daemon = TestDaemon::start(&paths, upstream.addr()).await;
-    daemon.state().live().health().seed(HealthState::Up);
+    let daemon = TestDaemon::start(&paths, &[upstream.addr()]).await;
+    daemon.verdict(upstream.addr()).seed(HealthState::Up);
     add_rule(&daemon, RuleClass::Require, origin.addr()).await;
     let mut decisions = daemon.state().live().events().subscribe();
 
@@ -253,8 +253,8 @@ async fn prefer_reaches_upstream() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
     let upstream = StubSocks5::start().await;
-    let daemon = TestDaemon::start(&paths, upstream.addr()).await;
-    daemon.state().live().health().seed(HealthState::Up);
+    let daemon = TestDaemon::start(&paths, &[upstream.addr()]).await;
+    daemon.verdict(upstream.addr()).seed(HealthState::Up);
     add_rule(&daemon, RuleClass::Prefer, origin.addr()).await;
     let mut decisions = daemon.state().live().events().subscribe();
 
@@ -278,7 +278,7 @@ async fn prefer_falls_back_direct_when_upstream_closed() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
     let closed = closed_port().await;
-    let daemon = TestDaemon::start(&paths, closed).await;
+    let daemon = TestDaemon::start(&paths, &[closed]).await;
     add_rule(&daemon, RuleClass::Prefer, origin.addr()).await;
     let mut decisions = daemon.state().live().events().subscribe();
 
@@ -301,7 +301,7 @@ async fn require_fails_when_upstream_closed() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
     let closed = closed_port().await;
-    let daemon = TestDaemon::start(&paths, closed).await;
+    let daemon = TestDaemon::start(&paths, &[closed]).await;
     add_rule(&daemon, RuleClass::Require, origin.addr()).await;
     let mut decisions = daemon.state().live().events().subscribe();
 

@@ -70,13 +70,12 @@ fn never(value: &str) -> Ruleset {
     rules
 }
 
-fn watched(rules: Ruleset, upstream: SocketAddr) -> (ConnCtx, mpsc::Receiver<EventView>) {
+fn watched(rules: Ruleset) -> (ConnCtx, mpsc::Receiver<EventView>) {
     let events = EventTx::default();
     let decisions = events.subscribe();
     let ctx = ConnCtx {
         rules: Arc::new(rules),
         health: HealthHandle::default(),
-        upstream,
         events,
     };
     (ctx, decisions)
@@ -131,7 +130,7 @@ async fn status_of(daemon: &TestDaemon) -> (SocketAddr, SocketAddr) {
 async fn a_connect_request_tunnels_to_the_destination() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
 
     let client = establish(daemon.http_addr(), origin.addr()).await;
 
@@ -144,7 +143,7 @@ async fn a_connect_request_tunnels_to_the_destination() {
 async fn an_absolute_form_request_is_rebuilt_for_the_origin() {
     let (_home, paths) = temp_paths();
     let origin = StubHttpOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let request = format!(
         "GET http://{origin}/index.html HTTP/1.1\r\nHost: stale.example\r\n\
          Proxy-Connection: Keep-Alive\r\nAccept: */*\r\n\r\n",
@@ -181,7 +180,7 @@ async fn an_absolute_form_request_is_rebuilt_for_the_origin() {
 async fn a_request_body_arriving_with_its_head_reaches_the_origin() {
     let (_home, paths) = temp_paths();
     let origin = StubHttpOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let request = format!(
         "POST http://{origin}/submit HTTP/1.1\r\nHost: {origin}\r\nContent-Length: 7\r\n\r\na=1&b=2",
         origin = origin.addr()
@@ -203,7 +202,7 @@ async fn a_request_body_arriving_with_its_head_reaches_the_origin() {
 async fn a_body_is_forwarded_but_a_request_pipelined_behind_it_is_not() {
     let (_home, paths) = temp_paths();
     let origin = StubHttpOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let first = format!(
         "POST http://{origin}/first HTTP/1.1\r\nContent-Length: 3\r\nHost: {origin}\r\n\r\na=1",
         origin = origin.addr()
@@ -229,7 +228,7 @@ async fn a_body_is_forwarded_but_a_request_pipelined_behind_it_is_not() {
 async fn payload_sent_ahead_of_the_tunnel_answer_still_reaches_the_destination() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let request = format!(
         "CONNECT {origin} HTTP/1.1\r\nHost: {origin}\r\n\r\nearly",
         origin = origin.addr()
@@ -249,7 +248,7 @@ async fn payload_sent_ahead_of_the_tunnel_answer_still_reaches_the_destination()
 async fn a_second_request_on_the_same_connection_is_not_forwarded() {
     let (_home, paths) = temp_paths();
     let origin = StubHttpOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let first = format!(
         "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\n\r\n",
         origin = origin.addr()
@@ -275,7 +274,7 @@ async fn a_second_request_on_the_same_connection_is_not_forwarded() {
 async fn a_request_sent_after_the_answer_never_reaches_the_first_next_hop() {
     let (_home, paths) = temp_paths();
     let origin = StubHttpOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let first = format!(
         "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\n\r\n",
         origin = origin.addr()
@@ -309,7 +308,7 @@ async fn a_request_sent_after_the_answer_never_reaches_the_first_next_hop() {
 #[tokio::test]
 async fn a_malformed_request_line_is_answered_with_400() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
 
     let answer = answer_of(daemon.http_addr(), "GARBAGE\r\n\r\n").await;
 
@@ -321,7 +320,7 @@ async fn a_malformed_request_line_is_answered_with_400() {
 #[tokio::test]
 async fn a_head_over_the_cap_closes_the_connection() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let head = vec![b'a'; http::HEAD_LIMIT];
 
     let mut client = TcpStream::connect(daemon.http_addr()).await.unwrap();
@@ -336,7 +335,7 @@ async fn a_head_over_the_cap_closes_the_connection() {
 #[tokio::test]
 async fn a_destination_that_refuses_the_dial_is_answered_with_502() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let closed = closed_port().await;
 
     let answer = answer_of(
@@ -356,7 +355,7 @@ async fn a_destination_that_refuses_the_dial_is_answered_with_502() {
 #[tokio::test]
 async fn a_require_rule_is_refused_with_502_while_the_upstream_is_down() {
     let upstream: SocketAddr = "192.0.2.10:1080".parse().unwrap();
-    let (ctx, mut decisions) = watched(require("example.com"), upstream);
+    let (ctx, mut decisions) = watched(require("example.com"));
     let front = serve_once(
         ctx,
         Arc::new(DownHop::new(upstream, Refusal::BeforeDialling)),
@@ -378,7 +377,7 @@ async fn a_require_rule_is_refused_with_502_while_the_upstream_is_down() {
 async fn a_connect_request_for_the_front_ends_own_address_is_refused_before_any_dial() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, _decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop.clone()).await;
 
     let answer = answer_of(
@@ -402,7 +401,7 @@ async fn a_connect_request_for_the_front_ends_own_address_is_refused_before_any_
 async fn an_absolute_form_request_for_the_front_ends_own_address_is_refused_the_same_way() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, _decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop.clone()).await;
 
     let answer = answer_of(
@@ -426,7 +425,7 @@ async fn an_absolute_form_request_for_the_front_ends_own_address_is_refused_the_
 async fn the_front_ends_own_address_by_name_is_refused_the_same_way() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, _decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop.clone()).await;
     let named = format!("localhost:{}", front.port());
 
@@ -451,7 +450,7 @@ async fn the_front_ends_own_address_by_name_is_refused_the_same_way() {
 async fn an_origin_form_request_naming_the_front_end_in_its_host_header_is_refused_the_same_way() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, _decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop.clone()).await;
 
     let answer = answer_of(front, &format!("GET / HTTP/1.1\r\nHost: {front}\r\n\r\n")).await;
@@ -471,7 +470,7 @@ async fn an_origin_form_request_naming_the_front_end_in_its_host_header_is_refus
 async fn a_never_rule_matching_the_front_ends_own_name_does_not_bypass_the_refusal() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, mut decisions) = watched(never("localhost"), ephemeral());
+    let (ctx, mut decisions) = watched(never("localhost"));
     let front = serve_once(ctx, hop.clone()).await;
     let named = format!("localhost:{}", front.port());
 
@@ -501,7 +500,7 @@ async fn a_never_rule_matching_the_front_ends_own_name_does_not_bypass_the_refus
 async fn a_front_end_bound_to_the_wildcard_refuses_the_interface_the_client_reached() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, _decisions) = watched(Ruleset::default());
     let bound = serve_once_bound("0.0.0.0:0".parse().unwrap(), ctx, hop.clone()).await;
     let reached: SocketAddr = format!("127.0.0.1:{}", bound.port()).parse().unwrap();
 
@@ -526,7 +525,7 @@ async fn a_front_end_bound_to_the_wildcard_refuses_the_interface_the_client_reac
 async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, mut decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, mut decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop).await;
 
     let answer = answer_of(
@@ -556,7 +555,7 @@ async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
 async fn an_ordinary_local_destination_still_reaches_its_origin() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, _decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, _decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop.clone()).await;
 
     let mut client = TcpStream::connect(front).await.unwrap();
@@ -575,7 +574,7 @@ async fn an_ordinary_local_destination_still_reaches_its_origin() {
 async fn moving_the_front_ends_keeps_an_open_connection_alive() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let (was_http, _was_socks) = status_of(&daemon).await;
     let client = establish(was_http, origin.addr()).await;
 
@@ -604,7 +603,7 @@ async fn moving_the_front_ends_keeps_an_open_connection_alive() {
 async fn moving_the_front_ends_to_the_addresses_they_hold_keeps_them_serving() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let (http, socks) = status_of(&daemon).await;
 
     let moved = daemon
@@ -626,7 +625,7 @@ async fn moving_the_front_ends_to_the_addresses_they_hold_keeps_them_serving() {
 async fn an_address_that_cannot_be_bound_leaves_the_front_ends_where_they_are() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let (was_http, was_socks) = status_of(&daemon).await;
     let squatter = TcpListener::bind(ephemeral()).await.unwrap();
 

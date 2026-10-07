@@ -12,6 +12,7 @@ use std::time::Duration;
 use nhop::daemon::{self, Daemon};
 use nhop::proxy::{Dialled, Listen, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleId};
+use nhop::upstream::HealthHandle;
 use nhop_ipc::{Command, EffectiveHop, Host, Paths, Port, Response, UpstreamAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -479,13 +480,21 @@ pub struct TestDaemon {
 }
 
 impl TestDaemon {
-    pub async fn start(paths: &Paths, upstream: SocketAddr) -> Self {
+    /// Starts a daemon dialling `upstreams` in the order given, the first one preferred.
+    pub async fn start(paths: &Paths, upstreams: &[SocketAddr]) -> Self {
+        let Some((first, rest)) = upstreams.split_first() else {
+            panic!("a test daemon is pointed at one upstream at least");
+        };
+        let mut fallbacks = Vec::with_capacity(rest.len());
+        for fallback in rest {
+            fallbacks.push(UpstreamAddr(format!("socks5://{fallback}")));
+        }
         let daemon = daemon::start_on(paths, ephemeral_listen()).unwrap();
         let answer = daemon
             .state()
             .call(Command::SetUpstream {
-                addr: UpstreamAddr(format!("socks5://{upstream}")),
-                fallbacks: Vec::new(),
+                addr: UpstreamAddr(format!("socks5://{first}")),
+                fallbacks,
                 load: None,
             })
             .await;
@@ -512,6 +521,16 @@ impl TestDaemon {
 
     pub fn state(&self) -> &nhop::daemon::state::StateHandle {
         self.daemon.state()
+    }
+
+    /// Returns the verdict the daemon holds on one published upstream.
+    pub fn verdict(&self, upstream: SocketAddr) -> HealthHandle {
+        for entry in self.daemon.state().live().upstream().snapshot().as_slice() {
+            if entry.upstream().socket() == upstream {
+                return entry.health().clone();
+            }
+        }
+        panic!("{upstream} is not a published upstream");
     }
 
     pub async fn call(&self, command: Command) -> Response {

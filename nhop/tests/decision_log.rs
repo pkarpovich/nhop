@@ -82,7 +82,7 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
     let subscriber = logging::subscriber(&paths).unwrap();
     tracing::subscriber::set_global_default(subscriber).unwrap();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
 
     tunnelled(daemon.http_addr(), origin.addr(), b"ping").await;
     relayed(daemon.socks_addr(), origin.addr(), b"pong").await;

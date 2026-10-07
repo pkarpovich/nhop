@@ -26,7 +26,7 @@ use crate::proxy::{
     Upstreams,
 };
 use crate::rules::{InvalidRule, Ruleset};
-use crate::upstream::HealthHandle;
+use crate::upstream::{Health, HealthHandle, UpstreamEntries};
 
 /// Address the HTTP front end binds until the init script moves it.
 pub const DEFAULT_HTTP_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890);
@@ -87,27 +87,25 @@ impl LiveRules {
     }
 }
 
-/// Upstream serving traffic, published the same way the ruleset is.
-#[derive(Debug, Clone)]
-pub struct LiveUpstream(Arc<ArcSwap<SocketAddr>>);
-
-impl Default for LiveUpstream {
-    fn default() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(NO_UPSTREAM)))
-    }
-}
+/// Upstreams serving traffic, each with its verdict, published the same way the ruleset is.
+///
+/// Only the state task publishes, so a publication reads the list it replaces without racing
+/// another one.
+#[derive(Debug, Clone, Default)]
+pub struct LiveUpstream(Arc<ArcSwap<UpstreamEntries>>);
 
 impl LiveUpstream {
-    /// Returns the address new connections are handed to at this instant.
-    pub fn snapshot(&self) -> SocketAddr {
+    /// Returns the entries new connections are handed to at this instant.
+    pub fn snapshot(&self) -> Arc<UpstreamEntries> {
         let Self(live) = self;
-        **live.load()
+        live.load_full()
     }
 
-    /// Swaps in an address for connections accepted from now on.
-    pub fn publish(&self, addr: SocketAddr) {
+    /// Swaps in a list for connections accepted from now on, keeping the verdict of every address
+    /// the list in force already names.
+    pub fn publish(&self, upstreams: &Upstreams) {
         let Self(live) = self;
-        live.store(Arc::new(addr));
+        live.rcu(|published| published.adopted(upstreams));
     }
 }
 
@@ -116,23 +114,29 @@ impl LiveUpstream {
 pub struct Live {
     rules: LiveRules,
     upstream: LiveUpstream,
-    health: HealthHandle,
     events: EventTx,
 }
 
 impl Live {
     /// Returns the context one accepted connection is routed by.
+    ///
+    /// The verdict is the first entry's, or a fresh [`HealthState::Down`] one while no upstream is
+    /// configured.
+    ///
+    /// [`HealthState::Down`]: nhop_ipc::HealthState::Down
     pub fn accepted(&self) -> ConnCtx {
         let Self {
             rules,
             upstream,
-            health,
             events,
         } = self;
+        let health = match upstream.snapshot().first() {
+            Some(entry) => entry.health().clone(),
+            None => HealthHandle::default(),
+        };
         ConnCtx {
             rules: rules.snapshot(),
-            health: health.clone(),
-            upstream: upstream.snapshot(),
+            health,
             events: events.clone(),
         }
     }
@@ -145,11 +149,6 @@ impl Live {
     /// Returns the upstream publication.
     pub fn upstream(&self) -> &LiveUpstream {
         &self.upstream
-    }
-
-    /// Returns the upstream verdict.
-    pub fn health(&self) -> &HealthHandle {
-        &self.health
     }
 
     /// Returns the fan-out the front ends publish their decisions to.
@@ -339,6 +338,7 @@ struct DaemonState {
     socks_listen: SocketAddr,
     forwards: Forwards,
     upstream: UpstreamAddr,
+    unconfigured: Health,
     init_path: Option<PathBuf>,
     last_load: Option<LastLoadView>,
     load_ids: LoadIds,
@@ -369,6 +369,7 @@ impl DaemonState {
             socks_listen: socks,
             forwards: Forwards::default(),
             upstream: UpstreamAddr(String::new()),
+            unconfigured: Health::default(),
             init_path: None,
             last_load: None,
             load_ids: LoadIds::default(),
@@ -750,7 +751,18 @@ impl DaemonState {
             return;
         };
         self.upstream = upstream.written().clone();
-        self.live.upstream().publish(upstream.socket());
+        self.live.upstream().publish(&upstreams);
+    }
+
+    /// Returns the first entry's address and verdict, the one `status` and `doctor` report.
+    ///
+    /// While no upstream is configured that is [`NO_UPSTREAM`], `Down` since the state task began.
+    fn first_upstream(&self) -> (SocketAddr, Health) {
+        let entries = self.live.upstream().snapshot();
+        let Some(entry) = entries.first() else {
+            return (NO_UPSTREAM, self.unconfigured);
+        };
+        (entry.upstream().socket(), entry.health().verdict())
     }
 
     fn bind_state(&self) -> BindState {
@@ -779,8 +791,7 @@ impl DaemonState {
         let service = self.service.clone();
         let reading = self.reading_proxy();
         let written = self.upstream.clone();
-        let upstream = self.live.upstream().snapshot();
-        let health = self.live.health().verdict();
+        let (upstream, health) = self.first_upstream();
         tokio::spawn(async move {
             findings.push(doctor::system_proxy(reading.await, listen, &service));
             findings.push(doctor::upstream_reachable(&written, upstream, health).await);
@@ -815,13 +826,14 @@ impl DaemonState {
 
     fn daemon_status(&self) -> DaemonStatus {
         let rules = self.live.rules().snapshot();
+        let (_first, health) = self.first_upstream();
         DaemonStatus {
             uptime_secs: self.started.elapsed().as_secs(),
             listen: self.listen(),
             bound: self.bind_state(),
             forwards: self.forwards.clone(),
             upstream: self.upstream.clone(),
-            health: self.live.health().verdict(),
+            health,
             init_path: self.init_path.clone(),
             last_load: self.last_load.clone(),
             rules: RuleCountsView {

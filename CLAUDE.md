@@ -59,10 +59,11 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   flips it up.** A SOCKS reply about a destination proves the upstream is
   serving, so a connection through it and a `Destination` failure both write
   `Up` at once, with no hysteresis - the symmetric half of one failure writing
-  `Down`. Every write from a real dial goes through `UpstreamHop::observed`,
-  which re-reads the published upstream and drops the write unless it still
-  names the address that dial was made against, so a dial landing after a reload
-  cannot move the new upstream's verdict (`upstream/mod.rs`). `failed_dial`
+  `Down`. Every write from a real dial goes through `observed`, onto the
+  `HealthHandle` of the `UpstreamEntry` that dial took from its snapshot; a
+  reload keeps an entry's handle only while it keeps the address, so a dial
+  landing after a reload cannot move the verdict of an address that replaced it
+  (`upstream/mod.rs`, `upstream/entries.rs`). `failed_dial`
   splits three ways, not two: `DialFailure::Unsent` is a failure tokio-socks
   raised before it opened a socket - `InvalidTargetAddress`, which a client
   reaches with a host past the 255-byte SOCKS5 domain limit - and it writes no

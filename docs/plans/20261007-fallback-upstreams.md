@@ -259,17 +259,20 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/tests/support/mod.rs`
 - Modify: every test that constructs `LiveUpstream`, `Live` or `UpstreamHop` (enumerate with the grep in "Skills to invoke")
 
-- [ ] change `LiveUpstream` to publish `Arc<Upstreams>`, empty by default; remove the shared `HealthHandle` from `Live` and from both `UpstreamHop::start` call sites
-- [ ] in `adopt_upstream`, build the published entries by reusing the `HealthHandle` of any entry whose `SocketAddr` is in the currently published list and creating a fresh one otherwise
-- [ ] remove `ConnCtx.upstream` (no reader) and take `ConnCtx.health` from the selected entry - until Task 3 lands selection, the first entry's handle, or a fresh `Down` handle for an empty list
-- [ ] keep `NO_UPSTREAM` only where it is still meaningful (the empty-list refusal and the `test` rendering); delete the constant if no reader is left and say so in this plan
-- [ ] make `required()`, `preferred()` and `observed()` take the entry they dial: in this task the first entry, so routing for a one-entry list is unchanged; verdict writes go to that entry's handle
-- [ ] give `TestDaemon::start` a list of upstream addresses; existing callers pass one
-- [ ] write the unit test `a_reload_keeps_the_verdict_of_an_address_it_keeps`: publish [A, B], seed A `Up`, publish [B, A, C] - A is still `Up` with its `changed_at` unchanged, C is `Down`
-- [ ] write the unit test `an_address_removed_and_added_back_starts_down`: publish [A], seed `Up`, publish [B], publish [A] - A is `Down`
-- [ ] rewrite `a_dial_landing_after_a_reload_leaves_the_new_verdict_alone` against the new model: a write to the handle of an entry no longer published does not change the verdict of the entry that replaced it
-- [ ] confirm every test in `nhop/tests/upstream_dialer.rs` and `nhop/tests/acceptance.rs` passes with only constructor changes
-- [ ] run `mise run check` - must pass before task 3
+- [x] change `LiveUpstream` to publish `Arc<Upstreams>`, empty by default; remove the shared `HealthHandle` from `Live` and from both `UpstreamHop::start` call sites
+- [x] in `adopt_upstream`, build the published entries by reusing the `HealthHandle` of any entry whose `SocketAddr` is in the currently published list and creating a fresh one otherwise
+- [x] remove `ConnCtx.upstream` (no reader) and take `ConnCtx.health` from the selected entry - until Task 3 lands selection, the first entry's handle, or a fresh `Down` handle for an empty list
+- [x] keep `NO_UPSTREAM` only where it is still meaningful (the empty-list refusal and the `test` rendering); delete the constant if no reader is left and say so in this plan
+- [x] make `required()`, `preferred()` and `observed()` take the entry they dial: in this task the first entry, so routing for a one-entry list is unchanged; verdict writes go to that entry's handle
+- [x] give `TestDaemon::start` a list of upstream addresses; existing callers pass one
+- [x] write the unit test `a_reload_keeps_the_verdict_of_an_address_it_keeps`: publish [A, B], seed A `Up`, publish [B, A, C] - A is still `Up` with its `changed_at` unchanged, C is `Down`
+- [x] write the unit test `an_address_removed_and_added_back_starts_down`: publish [A], seed `Up`, publish [B], publish [A] - A is `Down`
+- [x] rewrite `a_dial_landing_after_a_reload_leaves_the_new_verdict_alone` against the new model: a write to the handle of an entry no longer published does not change the verdict of the entry that replaced it
+- [x] confirm every test in `nhop/tests/upstream_dialer.rs` and `nhop/tests/acceptance.rs` passes with only constructor changes
+- [x] run `mise run check` - must pass before task 3
+- + note: the published list is `UpstreamEntries(Vec<UpstreamEntry>)` in `nhop/src/upstream/entries.rs`, since `Upstreams` already names the staged form from Task 1; where later tasks write `Upstreams` for the published value (`select`, `Selection::observe(&Arc<Upstreams>)`) read `UpstreamEntries`. `LiveUpstream::publish(&Upstreams)` adopts the handles through `UpstreamEntries::adopted`. `UpstreamHop::health()` gave way to `UpstreamHop::upstream()`, and `observed` is a free function writing to the dialled entry's handle with no address guard left to keep
+- + note: `NO_UPSTREAM` stays: the empty-list `require` refusal names it, and `status`/`doctor` report it with the `Down` verdict `DaemonState::unconfigured` holds from the state task's start, so an unconfigured daemon reports as before. `TestDaemon` gained `verdict(addr)` for seeding one entry
+- + note: two dialer tests needed more than constructors, because a reload no longer carries one verdict across different addresses: `a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes` moves the verdict under the pending sequence with a dial-cause `set` on the entry's handle rather than a failed dial against a reloaded address, and `a_sequence_banked_against_one_upstream_is_not_closed_by_the_next` seeds the replacing entry `Up` and watches its verdict. Tests that publish an address later read that entry's verdict after publishing. The front-end test helpers lost their unused upstream argument with `ConnCtx.upstream`
 
 ### Task 3: Selection with a return hold
 

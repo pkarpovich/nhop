@@ -122,10 +122,11 @@ impl Forwards {
     }
 }
 
-/// Address published while no init script has named an upstream.
+/// Address reported while no init script has named an upstream.
 ///
-/// Port zero cannot be dialled, so `require` traffic is refused at once instead of waiting out a
-/// connect timeout.
+/// Nothing is published then, so `require` traffic is refused at once instead of waiting out a
+/// connect timeout, and the refusal and `doctor` name this address, which port zero makes
+/// undialable.
 pub const NO_UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 const SOCKS5_SCHEME: &str = "socks5://";
@@ -469,7 +470,6 @@ impl From<UpstreamDown> for io::Error {
 pub struct ConnCtx {
     pub rules: Arc<Ruleset>,
     pub health: HealthHandle,
-    pub upstream: SocketAddr,
     pub events: EventTx,
 }
 
@@ -904,7 +904,6 @@ mod tests {
         let ctx = ConnCtx {
             rules: Arc::new(Ruleset::default()),
             health: HealthHandle::default(),
-            upstream: NO_UPSTREAM,
             events: events.clone(),
         };
         let host = Host("api.example.com".to_owned());
@@ -971,7 +970,6 @@ mod tests {
         let ctx = ConnCtx {
             rules: Arc::new(Ruleset::default()),
             health: HealthHandle::default(),
-            upstream: NO_UPSTREAM,
             events: events.clone(),
         };
         let host = Host("api.example.com".to_owned());
