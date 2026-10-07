@@ -386,11 +386,12 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] a one-entry list behaves as before: every pre-existing test in `nhop/tests/` passes with constructor-only changes, and the decision and verdict goldens are byte-unchanged
-- [ ] `cargo test -p nhop --test upstream_fallback` passes - failover, return after the hold, an open connection surviving the switch, forwards following selection
-- [ ] `cargo test -p nhop selection_follows_the_list_order_and_the_hold every_switch_has_exactly_one_cause` passes
-- [ ] `cargo test -p nhop a_require_dial_with_nothing_up_dials_the_first_entry a_prefer_dial_with_nothing_up_goes_direct_at_once` passes - rule semantics across the list
-- [ ] run the full gate: `mise run check`
+- [x] a one-entry list behaves as before: every pre-existing test in `nhop/tests/` passes with constructor-only changes, and the decision and verdict goldens are byte-unchanged
+- [x] `cargo test -p nhop --test upstream_fallback` passes - failover, return after the hold, an open connection surviving the switch, forwards following selection
+- [x] `cargo test -p nhop selection_follows_the_list_order_and_the_hold every_switch_has_exactly_one_cause` passes
+- [x] `cargo test -p nhop a_require_dial_with_nothing_up_dials_the_first_entry a_prefer_dial_with_nothing_up_goes_direct_at_once` passes - rule semantics across the list
+- [x] run the full gate: `mise run check`
+- + note: against `main`, the pre-existing files in `nhop/tests/` differ only in `TestDaemon::start(&paths, &[addr])`, `daemon.verdict(addr).seed(..)`, the dropped upstream argument of the front-end helpers, and `via: _` / `upstreams: _` in exhaustive destructures (plus `assert_eq!(via, None)` on the direct hops in `decision_log.rs`); the two dialer tests that needed more are the ones recorded under Task 4. No expected line in the decision or verdict rendering tests changed. The `//` and `matches!`/`_ =>` counts are still 5 and 4
 
 ### Task 9: Update documentation
 
