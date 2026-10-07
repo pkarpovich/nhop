@@ -80,9 +80,10 @@ nhop <require|prefer|never> <suffix|cidr|port|keyword> <value>
 The three classes differ only in what happens when the upstream is down:
 
 - `require` - must traverse the upstream. The health verdict does not gate it:
-  every configured upstream address is dialled whatever the verdict says, with a
-  budget of `REQUIRE_CONNECT_TIMEOUT`, 10 seconds. Only an upstream that is not
-  configured at all is refused before the network. When the dial does fail the
+  the selected upstream - or the first in the list while none is up - is dialled
+  whatever its verdict says, with a budget of `REQUIRE_CONNECT_TIMEOUT`, 10
+  seconds, and a failed dial is not retried on the next entry. Only an empty
+  upstream list is refused before the network. When the dial does fail the
   connection fails the same way it always has: `502 Bad Gateway` on the HTTP
   front end, reply `0x04` on the SOCKS5 one, exit 3 from the CLI. For what only
   exists behind the upstream - an upstream that is merely slow still serves it,
@@ -349,7 +350,10 @@ fallback      socks5://192.0.2.11:1080 up since 2026-02-02T02:41:00Z (selected)
 ```
 
 The log names the entry behind every turnover, and writes a line of its own
-each time the selected entry changes, `none` standing for nothing selected:
+each time the selected entry changes, `none` standing for nothing selected. A
+turnover names the address as it was first written: an entry a reload keeps
+under another spelling (`192.0.2.10:1080` for `socks5://192.0.2.10:1080`) keeps
+its verdict and its first spelling in verdict lines, and is no switch:
 
 ```
 2026-10-07T09:12:31Z  verdict socks5://192.0.2.10:1080 up -> down  (dial)
@@ -728,7 +732,7 @@ previous ruleset is still the one serving traffic.
 if nhop doctor >/dev/null
     echo "routing is healthy"
 else if test $status -eq 3
-    echo "the upstream is down - require rules still dial it, prefer rules go direct"
+    echo "no upstream answers - require rules still dial the first one, prefer rules go direct"
 end
 ```
 

@@ -87,6 +87,8 @@ mod tests {
 
     use super::*;
 
+    const SPAWN_ATTEMPTS: usize = 50;
+
     struct Script {
         home: tempfile::TempDir,
     }
@@ -113,8 +115,26 @@ mod tests {
             self.home.path().join(name)
         }
 
+        /// Runs the script, spawning again while Linux reports it busy.
+        ///
+        /// A test thread forking while another has the script open for writing hands the child
+        /// that descriptor until it execs, and an exec of the script in that window fails with
+        /// `ETXTBSY`. That is the suite racing itself, not the outcome under test.
         async fn run(&self, timeout: Duration) -> ScriptOutcome {
-            run(&self.path(), &self.config_dir(), LoadId(11), timeout).await
+            let mut outcome = ScriptOutcome::TimedOut;
+            for _attempt in 0..SPAWN_ATTEMPTS {
+                outcome = run(&self.path(), &self.config_dir(), LoadId(11), timeout).await;
+                let ScriptOutcome::NotRun(failure) = &outcome else {
+                    return outcome;
+                };
+                match failure.kind() {
+                    io::ErrorKind::ExecutableFileBusy => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    _ => return outcome,
+                }
+            }
+            outcome
         }
     }
 

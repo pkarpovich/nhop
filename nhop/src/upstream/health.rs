@@ -66,13 +66,13 @@ impl Default for Health {
 /// A daemon starts [`HealthState::Down`], so no `prefer` destination is sent through an upstream
 /// that has not answered anything yet. A `require` destination is dialled from that cold verdict,
 /// since it has no direct route to be spared for.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HealthHandle(Arc<Judged>);
 
-/// The address a verdict is about, when it is about one, and the verdict itself.
-#[derive(Debug, Default)]
+/// The address a verdict is about and the verdict itself.
+#[derive(Debug)]
 struct Judged {
-    upstream: Option<UpstreamAddr>,
+    upstream: UpstreamAddr,
     health: ArcSwap<Health>,
 }
 
@@ -80,10 +80,10 @@ impl HealthHandle {
     /// Returns a fresh [`HealthState::Down`] verdict on `upstream`, named on every turnover line.
     ///
     /// With several upstreams a turnover line that does not say which one turned over cannot be
-    /// read; a handle made by [`Default`] judges no particular address and its lines name none.
+    /// read.
     pub fn judging(upstream: UpstreamAddr) -> Self {
         Self(Arc::new(Judged {
-            upstream: Some(upstream),
+            upstream,
             health: ArcSwap::default(),
         }))
     }
@@ -125,8 +125,8 @@ impl HealthHandle {
 
     /// Records one observation, stamping a turnover with `at` and logging a line only on a turnover.
     ///
-    /// The line carries `upstream` - the written address this handle judges, absent for a handle
-    /// judging none - beside `verdict_from`, `verdict_to` and `cause`.
+    /// The line carries `upstream` - the written address this handle judges - beside
+    /// `verdict_from`, `verdict_to` and `cause`.
     ///
     /// The patrol stamps every write of one round with the instant the round started, so entries
     /// whose sequences close in the same round settle at the same instant and [`select`] breaks
@@ -140,7 +140,7 @@ impl HealthHandle {
         let previous = self.settle(state, at);
         let Self(judged) = self;
         let Judged {
-            upstream,
+            upstream: UpstreamAddr(upstream),
             health: _,
         } = &**judged;
         let Health {
@@ -151,9 +151,7 @@ impl HealthHandle {
             (HealthState::Up, HealthState::Up) | (HealthState::Down, HealthState::Down) => {}
             (HealthState::Up, HealthState::Down) | (HealthState::Down, HealthState::Up) => {
                 tracing::info!(
-                    upstream = upstream
-                        .as_ref()
-                        .map(|UpstreamAddr(upstream)| upstream.as_str()),
+                    upstream = upstream.as_str(),
                     verdict_from = health_name(previous),
                     verdict_to = health_name(state),
                     cause = cause_name(cause),
@@ -213,6 +211,7 @@ mod tests {
     use crate::logging;
 
     const TICK: Duration = Duration::from_millis(2);
+    const JUDGED: &str = "socks5://192.0.2.11:1080";
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -224,8 +223,12 @@ mod tests {
         cause: VerdictCause,
     }
 
+    fn judged() -> HealthHandle {
+        HealthHandle::judging(UpstreamAddr(JUDGED.to_owned()))
+    }
+
     fn recorded(observe: impl FnOnce(&HealthHandle)) -> Vec<VerdictFields> {
-        recorded_on(HealthHandle::default(), observe)
+        recorded_on(judged(), observe)
     }
 
     fn recorded_on(
@@ -250,14 +253,14 @@ mod tests {
 
     #[test]
     fn a_fresh_verdict_is_down() {
-        let health = HealthHandle::default();
+        let health = judged();
         assert_eq!(health.state(), HealthState::Down);
         assert!(health.changed_at() <= SystemTime::now());
     }
 
     #[test]
     fn one_success_flips_up_and_moves_the_instant() {
-        let health = HealthHandle::default();
+        let health = judged();
         let settled = health.changed_at();
         sleep(TICK);
 
@@ -269,7 +272,7 @@ mod tests {
 
     #[test]
     fn one_failure_flips_down_and_moves_the_instant() {
-        let health = HealthHandle::default();
+        let health = judged();
         health.seed(HealthState::Up);
         let settled = health.changed_at();
         sleep(TICK);
@@ -282,7 +285,7 @@ mod tests {
 
     #[test]
     fn an_observation_that_confirms_the_verdict_leaves_the_instant_alone() {
-        let health = HealthHandle::default();
+        let health = judged();
         health.seed(HealthState::Up);
         let settled = health.verdict();
 
@@ -294,7 +297,7 @@ mod tests {
 
     #[test]
     fn every_holder_of_the_handle_reads_the_same_verdict() {
-        let health = HealthHandle::default();
+        let health = judged();
         let elsewhere = health.clone();
 
         elsewhere.seed(HealthState::Up);
@@ -304,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_turnover_set_at_an_instant_settles_at_that_instant() {
-        let health = HealthHandle::default();
+        let health = judged();
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
 
         health.set_at(HealthState::Up, VerdictCause::Probe, at);
@@ -325,10 +328,10 @@ mod tests {
 
     #[test]
     fn a_clone_is_the_same_handle_and_a_fresh_one_is_not() {
-        let health = HealthHandle::default();
+        let health = judged();
 
         assert!(health.same(&health.clone()));
-        assert!(!health.same(&HealthHandle::default()));
+        assert!(!health.same(&judged()));
     }
 
     #[test]
@@ -351,7 +354,7 @@ mod tests {
         assert_eq!(
             records,
             vec![VerdictFields {
-                upstream: None,
+                upstream: Some(UpstreamAddr(JUDGED.to_owned())),
                 verdict_from: HealthState::Down,
                 verdict_to: HealthState::Up,
                 cause: VerdictCause::Dial,
@@ -376,12 +379,5 @@ mod tests {
                 cause: VerdictCause::Probe,
             }]
         );
-    }
-
-    #[test]
-    fn a_judging_handle_starts_down() {
-        let health = HealthHandle::judging(UpstreamAddr("socks5://192.0.2.11:1080".to_owned()));
-
-        assert_eq!(health.state(), HealthState::Down);
     }
 }

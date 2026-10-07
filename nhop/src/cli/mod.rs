@@ -1003,16 +1003,13 @@ fn render_upstreams(
     upstreams: &[UpstreamView],
     out: &mut dyn Write,
 ) {
-    let [primary, fallbacks @ ..] = upstreams else {
+    let [primary, second, rest @ ..] = upstreams else {
         render_upstream("upstream", first, health, changed_at, "", out);
         return;
     };
-    if fallbacks.is_empty() {
-        render_upstream("upstream", first, health, changed_at, "", out);
-        return;
-    }
     render_listed("upstream", primary, out);
-    for fallback in fallbacks {
+    render_listed("fallback", second, out);
+    for fallback in rest {
         render_listed("fallback", fallback, out);
     }
 }

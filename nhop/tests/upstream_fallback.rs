@@ -7,8 +7,8 @@ use nhop::daemon::Pace;
 use nhop::logging::{self, Logged, LoggedSwitch};
 use nhop::upstream::SwitchCause;
 use nhop_ipc::{
-    Command, EffectiveHop, EventView, ForwardView, Host, Paths, Port, Response, RuleClass,
-    RuleKind, RuleValue, UpstreamAddr,
+    Command, EffectiveHop, EventView, ForwardView, HealthState, Host, Paths, Port, Response,
+    RuleClass, RuleKind, RuleValue, UpstreamAddr,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -239,7 +239,7 @@ async fn a_down_primary_hands_new_connections_to_the_fallback() {
         decision: _,
         rule_index: _,
         class,
-        upstream: _,
+        upstream,
         connect_ms: _,
         hop,
         via,
@@ -248,6 +248,7 @@ async fn a_down_primary_hands_new_connections_to_the_fallback() {
     } = next_event(&mut events).await;
     assert_eq!(host, Host("api.example.com".to_owned()));
     assert_eq!(class, Some(RuleClass::Require));
+    assert_eq!(upstream, HealthState::Up);
     assert_eq!(hop, Some(EffectiveHop::Upstream));
     assert_eq!(via, Some(written(fallback.addr())));
     assert_eq!(error, None);

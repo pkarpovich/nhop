@@ -490,7 +490,9 @@ struct Pending {
 ///
 /// Every round ends by recording the selection with [`Selection::observe`], so a higher-ranked
 /// entry whose return hold expires is logged as a switch without waiting for a connection to
-/// notice it.
+/// notice it. The selection is made from the list published when the round ends rather than the
+/// one it probed: a reload committed while a probe was out would otherwise be logged as a switch
+/// back to the list it replaced.
 ///
 /// A real dial failure still flips down on one failure, in [`UpstreamHop`]: that path is evidence
 /// a user already paid for, while a self-generated timeout is not.
@@ -517,6 +519,7 @@ async fn patrol(
         };
         looking = Duration::ZERO;
         pending = round(&entries, pending).await;
+        let entries = upstream.snapshot();
         selection.observe(&entries, entries.selected(SystemTime::now(), hold));
         let waited = match pending.is_empty() {
             true => interval,
@@ -1339,6 +1342,65 @@ mod tests {
             "an address added back starts over, whatever was banked before its removal"
         );
         assert_eq!(pending.len(), 1, "the probe opens a sequence of its own");
+    }
+
+    #[tokio::test]
+    async fn a_dial_logs_the_switch_it_is_first_to_see() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = nhop_ipc::Paths::from_home(home.path());
+        let (_listener, host, port) = destination().await;
+        let primary = black_hole().await;
+        let fallback = upstream_answering(GRANTED).await;
+        let hop = hop_over(&[(primary, HealthState::Down), (fallback, HealthState::Up)]);
+        let _silent = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let logging = tracing::subscriber::set_default(crate::logging::subscriber(&paths).unwrap());
+
+        let (taken, via, _next) =
+            attempted(&hop, &host, port, upstream_decision(RuleClass::Prefer, 0)).await;
+        drop(logging);
+
+        assert_eq!(taken, EffectiveHop::Upstream);
+        assert_eq!(via, Some(written(fallback)));
+        let mut switches = Vec::new();
+        for file in crate::logging::files(&paths).unwrap() {
+            let (lines, _offset) = crate::logging::read_from(&file, 0).unwrap();
+            for line in lines {
+                let Some(crate::logging::Logged::Switch(crate::logging::LoggedSwitch {
+                    at: _,
+                    from,
+                    to,
+                    cause,
+                })) = crate::logging::logged(&line)
+                else {
+                    continue;
+                };
+                switches.push((from, to, cause));
+            }
+        }
+        assert_eq!(
+            switches,
+            vec![(None, Some(written(fallback)), SwitchCause::Reload)],
+            "the patrol is still waiting on the black-holed primary, so only the dial can log it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sequence_survives_a_reload_that_keeps_its_address() {
+        let upstream = upstream_answering(GRANTED).await;
+        let other = closed_port().await;
+        let published = published_over(&[upstream, other]);
+        let pending = round(&published.snapshot(), Vec::new()).await;
+        assert_eq!(pending.len(), 1, "one contradicting probe banks a sequence");
+
+        published.publish(&listed_in_order(&[other, upstream]));
+        let pending = round(&published.snapshot(), pending).await;
+
+        assert_eq!(
+            health_in(&published, upstream).state(),
+            HealthState::Up,
+            "a reordered address keeps its handle, so the confirming probe closes its sequence"
+        );
+        assert!(pending.is_empty(), "{pending:?}");
     }
 
     #[tokio::test]

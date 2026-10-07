@@ -45,8 +45,12 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   the system-proxy read goes through `spawn_blocking`, and a load runs as its
   own task so the script's own CLI calls can be served while it runs.
 - **The hot path never touches the actor.** Front ends read `Live` (`ArcSwap`
-  ruleset and upstream, health, event fan-out) and take one snapshot per
-  accepted connection, so a load that commits mid-connection cannot move it.
+  ruleset and upstream list, event fan-out). `ConnCtx` snapshots the ruleset
+  once per accepted connection, and the upstream list - each entry with its own
+  verdict - is read where it is used: once when the hop dials
+  (`UpstreamHop::routed`) and once for `EventView.upstream` through
+  `NextHop::verdict()` at `Routed::begun`. A load that commits mid-connection
+  cannot move it.
 - **Loads are atomic.** A run gets a `LoadId`, passed to the script as
   `NHOP_LOAD_ID` and carried back by every mutating command; those accumulate in
   `Staging` and go live only on a zero exit. A command with no id or a stale one
@@ -103,18 +107,22 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   closes, re-dials or migrates it, and a failed dial is not retried on the next
   entry, since that would stack budgets.
 - **The prober patrols both verdict states with two-probe hysteresis.** `patrol`
-  probes from startup on, Up and Down alike. A probe contradicting the live
-  verdict only opens a pending sequence recording the state it aims at and the
-  address it was made against; a confirming probe after `PROBE_CONFIRM_DELAY` has
-  to agree with that recorded target, against that same address, before the
-  verdict moves. An agreeing probe, a verdict change arriving by any other path,
-  or a reload pointing the daemon elsewhere discards the sequence. A real dial
-  failure still flips Down on one failure - it is evidence a user already paid
-  for, a self-generated timeout is not.
+  probes every entry of the current list each round, from startup on, Up and
+  Down alike, concurrently (`round` folds each probe in as it returns, so a
+  black-holed entry cannot delay another's confirmation). A probe contradicting
+  an entry's live verdict only opens a pending sequence recording the state it
+  aims at, banked against that entry's `HealthHandle`; a confirming probe after
+  `PROBE_CONFIRM_DELAY` has to agree with that recorded target, on that same
+  handle (`HealthHandle::same`), before the verdict moves. An agreeing probe, a
+  verdict change arriving by any other path, or a reload that drops the address
+  discards the sequence - an address removed and added back can never close one.
+  A round ends by observing the selection on the list published at that moment,
+  not the one it probed. A real dial failure still flips Down on one failure -
+  it is evidence a user already paid for, a self-generated timeout is not.
 - **A verdict turnover is a log record, not an event.** `HealthHandle::set_at`
   writes it - the one place the settled verdict and the observation are both in
-  hand - as `upstream` (the written address the handle judges, absent for a
-  `Default` handle), `verdict_from`, `verdict_to` and `cause` (`probe` or
+  hand - as `upstream` (the written address the handle judges; every handle
+  judges one, made by `HealthHandle::judging`), `verdict_from`, `verdict_to` and `cause` (`probe` or
   `dial`); `seed` establishes a starting verdict and logs nothing. It never
   reaches `EventView`, `Command::Subscribe` or `nhop tail`. `logging::logged`
   returns `Logged::{Decision, Verdict, Switch}` and tries `EventView` first,
@@ -167,14 +175,25 @@ The whole tree obeys these; a change that breaks one reads as foreign.
 - every entry point takes `Paths`, so no test touches `$HOME` or any process
   global; use `Paths::from_home(tempdir)`
 - integration tests share `nhop/tests/support/mod.rs` (`StubSocks5`,
-  `StubOrigin`, `StubHttpOrigin`, `TestDaemon`, `StubHop`, `DownHop`) instead of
-  new stubs
+  `StubOrigin`, `StubHttpOrigin`, `TestDaemon`, `StubHop`, `DownHop`,
+  `ScopedLog`) instead of new stubs
 - `StubSocks5::requests()` records patrol probes too, since a probe is a CONNECT
   to the stub's own address. Assert what a front end dialled with
   `client_dials()`; `requests()` is for probe assertions
 - bind port 0 everywhere - nothing in the suite may touch 7890/7891
 - the logging subscriber is scoped with `tracing::subscriber::with_default`,
-  since several daemons run in one test process
+  since several daemons run in one test process. A test that reads a log while
+  other tests run daemons holds `support::ScopedLog::install(&paths)` (or, in a
+  unit test, keeps a `NoSubscriber` `Dispatch` alive beside its subscriber):
+  tracing caches callsite interest process-wide, and with one dispatcher
+  registered a parallel test can silence a callsite for good
+- failover and return tests start the daemon with
+  `TestDaemon::paced(&paths, &[p, f], Pace { .. })` (short interval, confirm
+  delay and hold) and stay on the wall clock, since the hold is measured against
+  `SystemTime`; wait for "after the hold" by polling with a deadline, never a
+  fixed sleep. `daemon.verdict(addr).seed(..)` arranges one entry's verdict, and
+  `StubSocks5::stop()` / `restart()` model an upstream turned off and on at the
+  same address
 - `HealthHandle::seed` arranges a starting verdict, `set` is the observation
   under test - seeding through `set` writes a turnover line the test did not
   mean to make

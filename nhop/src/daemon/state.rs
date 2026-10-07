@@ -315,7 +315,6 @@ struct DaemonState {
     http_listen: SocketAddr,
     socks_listen: SocketAddr,
     forwards: Forwards,
-    upstream: UpstreamAddr,
     unconfigured: Health,
     init_path: Option<PathBuf>,
     last_load: Option<LastLoadView>,
@@ -347,7 +346,6 @@ impl DaemonState {
             http_listen: http,
             socks_listen: socks,
             forwards: Forwards::default(),
-            upstream: UpstreamAddr(String::new()),
             unconfigured: Health::default(),
             init_path: None,
             last_load: None,
@@ -727,21 +725,17 @@ impl DaemonState {
         let Some(upstreams) = upstreams else {
             return;
         };
-        let Some(upstream) = upstreams.first() else {
-            return;
-        };
-        self.upstream = upstream.written().clone();
         self.live.upstream().publish(&upstreams);
     }
 
-    /// Returns the first entry's verdict, the one `status` reports beside the first address.
+    /// Returns the first entry's address and verdict, the pair `status` reports on its own.
     ///
-    /// While no upstream is configured that is `Down` since the state task began.
-    fn first_verdict(&self, entries: &UpstreamEntries) -> Health {
+    /// While no upstream is configured that is an empty address, `Down` since the state task began.
+    fn first(&self, entries: &UpstreamEntries) -> (UpstreamAddr, Health) {
         let Some(entry) = entries.first() else {
-            return self.unconfigured;
+            return (UpstreamAddr(String::new()), self.unconfigured);
         };
-        entry.health().verdict()
+        (entry.upstream().written().clone(), entry.health().verdict())
     }
 
     fn bind_state(&self) -> BindState {
@@ -805,14 +799,14 @@ impl DaemonState {
     fn daemon_status(&self) -> DaemonStatus {
         let rules = self.live.rules().snapshot();
         let entries = self.live.upstream().snapshot();
-        let health = self.first_verdict(&entries);
+        let (upstream, health) = self.first(&entries);
         let selected = entries.selected(SystemTime::now(), self.hold);
         DaemonStatus {
             uptime_secs: self.started.elapsed().as_secs(),
             listen: self.listen(),
             bound: self.bind_state(),
             forwards: self.forwards.clone(),
-            upstream: self.upstream.clone(),
+            upstream,
             health,
             upstreams: upstream_views(&entries, selected),
             init_path: self.init_path.clone(),

@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use nhop_ipc::{HealthState, UpstreamAddr};
 
 use crate::logging::switch_cause_name;
+use crate::proxy::Upstream;
 use crate::upstream::{Health, SwitchCause, UpstreamEntries};
 
 /// How long a higher-ranked upstream has to stay up before it takes new connections back.
@@ -103,8 +104,8 @@ impl Selection {
     /// Records the selection `new` made from `list`, logging one line when it moved.
     ///
     /// The line carries `upstream_from`, `upstream_to` - the written addresses, empty for none -
-    /// and `switch_cause`. A selection that names the same address as the previous one is no
-    /// switch, even when a reload moved that address to another position. Several callers seeing
+    /// and `switch_cause`. A selection that dials the same socket address as the previous one is no
+    /// switch, even when a reload moved that address to another position or spelled it another way. Several callers seeing
     /// the same move log it once, since only the first of them swaps out the selection before it.
     pub fn observe(&self, list: &Arc<UpstreamEntries>, new: Option<usize>) {
         let Some(switch) = self.switched(list, new) else {
@@ -128,9 +129,14 @@ impl Selection {
             list: previous_list,
             selected: previous,
         } = &*previous;
-        let from = written(previous_list, *previous);
-        let to = written(list, new);
-        if from == to {
+        let from = upstream_at(previous_list, *previous);
+        let to = upstream_at(list, new);
+        let same = match (from, to) {
+            (Some(from), Some(to)) => from.socket() == to.socket(),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if same {
             return None;
         }
         let cause = match Arc::ptr_eq(previous_list, list) {
@@ -138,8 +144,8 @@ impl Selection {
             true => cause(list, *previous, new),
         };
         Some(Switch {
-            from: from.cloned(),
-            to: to.cloned(),
+            from: from.map(|upstream| upstream.written().clone()),
+            to: to.map(|upstream| upstream.written().clone()),
             cause,
         })
     }
@@ -174,9 +180,9 @@ fn cause(list: &UpstreamEntries, previous: Option<usize>, new: Option<usize>) ->
     }
 }
 
-fn written(list: &UpstreamEntries, index: Option<usize>) -> Option<&UpstreamAddr> {
+fn upstream_at(list: &UpstreamEntries, index: Option<usize>) -> Option<&Upstream> {
     let entry = list.as_slice().get(index?)?;
-    Some(entry.upstream().written())
+    Some(entry.upstream())
 }
 
 fn logged_addr(addr: Option<&UpstreamAddr>) -> &str {
@@ -490,8 +496,8 @@ mod tests {
 
                         let switch = selection.switched(&reordered, new);
 
-                        let from = written(&list, previous).cloned();
-                        let to = written(&reordered, new).cloned();
+                        let from = upstream_at(&list, previous).map(Upstream::written).cloned();
+                        let to = upstream_at(&reordered, new).map(Upstream::written).cloned();
                         let expected = match from == to {
                             true => None,
                             false => Some(Switch {
@@ -535,6 +541,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn each_row_of_the_switch_cause_table_names_its_cause() {
+        let live = LiveUpstream::default();
+        let list = published(&live, &[P, F]);
+        let rows = [
+            (
+                "the carrying entry turned down",
+                [down(secs(0)), up(secs(0))],
+                Some(0),
+                Some(1),
+                SwitchCause::Down,
+            ),
+            (
+                "the last up entry turned down",
+                [down(secs(0)), down(secs(0))],
+                Some(0),
+                None,
+                SwitchCause::Down,
+            ),
+            (
+                "the primary held",
+                [up(secs(0)), up(secs(0))],
+                Some(1),
+                Some(0),
+                SwitchCause::Held,
+            ),
+            (
+                "an entry came up from none",
+                [down(secs(0)), up(secs(0))],
+                None,
+                Some(1),
+                SwitchCause::Recovered,
+            ),
+        ];
+        for (name, after, previous, new, expected) in rows {
+            let selection = Selection::default();
+            let _primed = selection.switched(&list, previous);
+            seeded(&list, &after);
+
+            let Some(Switch {
+                from: _,
+                to: _,
+                cause,
+            }) = selection.switched(&list, new)
+            else {
+                panic!("{name}: no switch logged");
+            };
+
+            assert_eq!(cause, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_reload_that_respells_the_selected_address_is_no_switch() {
+        let live = LiveUpstream::default();
+        let list = published(&live, &[P, F]);
+        let selection = Selection::default();
+        let _primed = selection.switched(&list, Some(0));
+        let respelled =
+            Upstreams::parse(UpstreamAddr(P.to_owned()), vec![UpstreamAddr(F.to_owned())]).unwrap();
+        live.publish(&respelled);
+        let respelled = live.snapshot();
+
+        let switch = selection.switched(&respelled, Some(0));
+
+        assert_eq!(switch, None);
+    }
+
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct SwitchFields {
@@ -553,6 +627,7 @@ mod tests {
         list.as_slice()[1].health().seed(HealthState::Up);
         let selection = Selection::default();
         selection.observe(&list, None);
+        let _silent = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
 
         tracing::subscriber::with_default(subscriber, || {
             selection.observe(&list, Some(1));

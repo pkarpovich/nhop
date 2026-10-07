@@ -218,12 +218,6 @@ impl Upstreams {
         Ok(Self(entries))
     }
 
-    /// Returns the entry preferred over every other, absent for an empty list.
-    pub fn first(&self) -> Option<&Upstream> {
-        let Self(entries) = self;
-        entries.first()
-    }
-
     /// Returns the entries in order of preference.
     pub fn as_slice(&self) -> &[Upstream] {
         let Self(entries) = self;
@@ -710,7 +704,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            upstreams.first(),
+            upstreams.as_slice().first(),
             Some(&upstream("socks5://192.0.2.10:1080").unwrap())
         );
     }
