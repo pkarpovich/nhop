@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use nhop_ipc::{EffectiveHop, HealthState, Host, Port, RuleClass, UpstreamAddr};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_socks::tcp::Socks5Stream;
 
 use crate::daemon::state::{LOAD_TIMEOUT, LiveUpstream};
@@ -149,11 +149,18 @@ impl UpstreamHop {
         confirm_delay: Duration,
         hold: Duration,
     ) -> Self {
-        let patrolling = tokio::spawn(patrol(upstream.clone(), interval, confirm_delay));
+        let selection = Selection::default();
+        let patrolling = tokio::spawn(patrol(
+            upstream.clone(),
+            interval,
+            confirm_delay,
+            hold,
+            selection.clone(),
+        ));
         Self {
             upstream,
             hold,
-            selection: Selection::default(),
+            selection,
             patrolling,
         }
     }
@@ -467,35 +474,49 @@ fn failed_dial(failure: tokio_socks::Error) -> DialFailure {
 /// moved by any other path - a real dial failure, an operator command - since an observation
 /// aiming somewhere else opens a fresh sequence instead of closing the stale one.
 ///
-/// The `addr` is the upstream the observation was made against. `patrol` re-reads the published
-/// list every iteration, so without it a contradiction banked against the old first entry could be
-/// closed by the first probe of the one a reload put in its place.
-#[derive(Debug, Clone, Copy)]
+/// The `health` is the handle of the entry the observation was made against. `patrol` re-reads the
+/// published list every round, and a reload keeps a handle only while it keeps the address, so a
+/// contradiction banked against one address can be closed neither by the entry a reload put in its
+/// place nor by the same address removed and added back, which starts over with a fresh handle.
+#[derive(Debug, Clone)]
 struct Pending {
     target: HealthState,
-    addr: SocketAddr,
+    health: HealthHandle,
 }
 
-/// Probes the upstream in both verdict states, moving the verdict only on two probes that agree.
+/// Probes every published upstream in both verdict states, moving a verdict only on two probes
+/// that agree.
 ///
-/// The first probe goes out immediately, so a daemon that starts against a live upstream does not
+/// The first round goes out immediately, so a daemon that starts against a live upstream does not
 /// hand the discovery to the first user dial, and a dead one is found by the patrol rather than by
 /// a connection somebody is waiting on.
 ///
-/// A single observation never moves the verdict: one 2s [`PROBE_TIMEOUT`] miss against a
+/// A single observation never moves a verdict: one 2s [`PROBE_TIMEOUT`] miss against a
 /// momentarily loaded upstream must not hard-refuse `require` traffic, and one stray answer while
 /// the upstream boots must not declare it alive. A verdict change therefore costs
 /// `interval + confirm_delay` plus up to one [`PROBE_TIMEOUT`] per observation, which is the
-/// difference between a peer that refuses fast and one that black-holes.
+/// difference between a peer that refuses fast and one that black-holes. The round waits
+/// `confirm_delay` while any entry has a sequence pending and `interval` otherwise.
+///
+/// Every round ends by recording the selection with [`Selection::observe`], so a higher-ranked
+/// entry whose return hold expires is logged as a switch without waiting for a connection to
+/// notice it.
 ///
 /// A real dial failure still flips down on one failure, in [`UpstreamHop`]: that path is evidence
 /// a user already paid for, while a self-generated timeout is not.
-async fn patrol(upstream: LiveUpstream, interval: Duration, confirm_delay: Duration) {
-    let mut pending = None;
+async fn patrol(
+    upstream: LiveUpstream,
+    interval: Duration,
+    confirm_delay: Duration,
+    hold: Duration,
+    selection: Selection,
+) {
+    let mut pending = Vec::new();
     let mut looking = Duration::ZERO;
     loop {
         let entries = upstream.snapshot();
-        let Some(entry) = entries.first() else {
+        let Some(_first) = entries.first() else {
+            pending.clear();
             let tick = match looking < NO_UPSTREAM_EAGER {
                 true => NO_UPSTREAM_TICK.min(interval),
                 false => interval,
@@ -505,43 +526,82 @@ async fn patrol(upstream: LiveUpstream, interval: Duration, confirm_delay: Durat
             continue;
         };
         looking = Duration::ZERO;
-        let addr = entry.upstream().socket();
-        pending = advance(pending, probe(addr).await, addr, entry.health());
-        let waited = match pending {
-            Some(_sequence) => confirm_delay,
-            None => interval,
+        pending = round(&entries, pending).await;
+        selection.observe(&entries, entries.selected(SystemTime::now(), hold));
+        let waited = match pending.is_empty() {
+            true => interval,
+            false => confirm_delay,
         };
         tokio::time::sleep(waited).await;
     }
 }
 
-/// Folds one observation into the pending sequence, moving the verdict when the sequence closes.
+/// Probes every entry at once and folds each observation in as soon as it returns.
 ///
+/// A round costs at most one [`PROBE_TIMEOUT`] however long the list is, and an entry that answers
+/// is judged without waiting for one that black-holes. Every write is stamped with the instant the
+/// round started, so entries whose sequences close in the same round tie and [`select`] gives the
+/// tie to list order. Only sequences for entries of this round's list are returned, which drops
+/// the sequence of an address no longer published.
+async fn round(entries: &UpstreamEntries, pending: Vec<Pending>) -> Vec<Pending> {
+    let started = SystemTime::now();
+    let mut probing = JoinSet::new();
+    for entry in entries.as_slice() {
+        let entry = entry.clone();
+        probing.spawn(async move {
+            let seen = probe(entry.upstream().socket()).await;
+            (entry, seen)
+        });
+    }
+    let mut next = Vec::new();
+    while let Some(probed) = probing.join_next().await {
+        let Ok((entry, seen)) = probed else {
+            continue;
+        };
+        let health = entry.health();
+        let mut banked = None;
+        for Pending {
+            target,
+            health: judged,
+        } in &pending
+        {
+            if judged.same(health) {
+                banked = Some(*target);
+                break;
+            }
+        }
+        let Some(target) = advance(banked, seen, health, started) else {
+            continue;
+        };
+        next.push(Pending {
+            target,
+            health: health.clone(),
+        });
+    }
+    next
+}
+
+/// Folds one observation into the sequence pending for its entry, returning the sequence left.
+///
+/// The verdict moves, stamped `at`, when the observation agrees with the target banked before it.
 /// An observation agreeing with the live verdict discards whatever was pending, since the verdict
 /// it contradicted is the one in force again.
 fn advance(
-    pending: Option<Pending>,
+    banked: Option<HealthState>,
     seen: HealthState,
-    addr: SocketAddr,
     health: &HealthHandle,
-) -> Option<Pending> {
+    at: SystemTime,
+) -> Option<HealthState> {
     let settled = health.state();
     match (settled, seen) {
         (HealthState::Up, HealthState::Up) | (HealthState::Down, HealthState::Down) => return None,
         (HealthState::Up, HealthState::Down) | (HealthState::Down, HealthState::Up) => {}
     }
-    let confirms = match pending {
-        None => false,
-        Some(Pending {
-            target,
-            addr: probed,
-        }) => target == seen && probed == addr,
-    };
-    if confirms {
-        health.set(seen, VerdictCause::Probe);
+    if banked == Some(seen) {
+        health.set_at(seen, VerdictCause::Probe, at);
         return None;
     }
-    Some(Pending { target: seen, addr })
+    Some(seen)
 }
 
 /// Asks the upstream to carry a connection to its own address, and reads the answer as a verdict.
@@ -576,6 +636,9 @@ mod tests {
     use crate::proxy::Upstreams;
 
     const PATIENT: Duration = Duration::from_secs(60);
+    const BRISK: Duration = Duration::from_millis(50);
+    const SLOWER: Duration = Duration::from_millis(50);
+    const POLL: Duration = Duration::from_millis(10);
     const NO_AUTH: [u8; 2] = [0x05, 0x00];
     const GRANTED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
@@ -613,12 +676,22 @@ mod tests {
     }
 
     fn health_of(hop: &UpstreamHop, upstream: SocketAddr) -> HealthHandle {
-        for entry in hop.upstream().snapshot().as_slice() {
+        health_in(hop.upstream(), upstream)
+    }
+
+    fn health_in(published: &LiveUpstream, upstream: SocketAddr) -> HealthHandle {
+        for entry in published.snapshot().as_slice() {
             if entry.upstream().socket() == upstream {
                 return entry.health().clone();
             }
         }
         panic!("{upstream} is not published");
+    }
+
+    fn published_over(upstreams: &[SocketAddr]) -> LiveUpstream {
+        let published = LiveUpstream::default();
+        published.publish(&listed_in_order(upstreams));
+        published
     }
 
     fn hop_over(seeded: &[(SocketAddr, HealthState)]) -> UpstreamHop {
@@ -704,6 +777,10 @@ mod tests {
     }
 
     async fn upstream_answering(reply: [u8; 10]) -> SocketAddr {
+        upstream_answering_after(reply, Duration::ZERO).await
+    }
+
+    async fn upstream_answering_after(reply: [u8; 10], delay: Duration) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -728,6 +805,7 @@ mod tests {
                     let Ok(_read) = stream.read_exact(&mut request).await else {
                         return;
                     };
+                    tokio::time::sleep(delay).await;
                     let _answered = stream.write_all(&reply).await;
                     let mut carried = Vec::new();
                     let _relayed = stream.read_to_end(&mut carried).await;
@@ -1217,6 +1295,81 @@ mod tests {
              the fast tick has to outlast the whole run: {NO_UPSTREAM_EAGER:?} against \
              {LOAD_TIMEOUT:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_round_probes_every_entry() {
+        let primary = upstream_answering(GRANTED).await;
+        let fallback = upstream_answering(GRANTED).await;
+        let published = published_over(&[primary, fallback]);
+        let entries = published.snapshot();
+
+        let pending = round(&entries, Vec::new()).await;
+        let _pending = round(&entries, pending).await;
+
+        assert_eq!(health_in(&published, primary).state(), HealthState::Up);
+        assert_eq!(health_in(&published, fallback).state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn entries_confirmed_in_one_round_tie_and_the_primary_wins() {
+        let primary = upstream_answering_after(GRANTED, SLOWER).await;
+        let fallback = upstream_answering(GRANTED).await;
+        let published = published_over(&[primary, fallback]);
+        let entries = published.snapshot();
+
+        let pending = round(&entries, Vec::new()).await;
+        let _pending = round(&entries, pending).await;
+
+        let primary = health_in(&published, primary).verdict();
+        let fallback = health_in(&published, fallback).verdict();
+        assert_eq!(primary.state, HealthState::Up);
+        assert_eq!(fallback.state, HealthState::Up);
+        assert_eq!(
+            primary.changed_at, fallback.changed_at,
+            "every verdict a round settles is stamped with the instant the round started"
+        );
+        assert_eq!(entries.selected(SystemTime::now(), RETURN_HOLD), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_sequence_for_a_removed_address_cannot_close() {
+        let upstream = upstream_answering(GRANTED).await;
+        let published = published_over(&[upstream]);
+        let pending = round(&published.snapshot(), Vec::new()).await;
+        assert_eq!(pending.len(), 1, "one contradicting probe banks a sequence");
+
+        published.publish(&listed(closed_port().await));
+        published.publish(&listed(upstream));
+        let pending = round(&published.snapshot(), pending).await;
+
+        assert_eq!(
+            health_in(&published, upstream).state(),
+            HealthState::Down,
+            "an address added back starts over, whatever was banked before its removal"
+        );
+        assert_eq!(pending.len(), 1, "the probe opens a sequence of its own");
+    }
+
+    #[tokio::test]
+    async fn a_dead_entry_does_not_slow_the_round() {
+        let dead = black_hole().await;
+        let live = upstream_answering(GRANTED).await;
+        let published = published_over(&[dead, live]);
+        let health = health_in(&published, live);
+        let budget = PROBE_TIMEOUT + BRISK + PROBE_TIMEOUT / 2;
+        let started = std::time::Instant::now();
+
+        let _hop = UpstreamHop::start(published, PATIENT, BRISK, PATIENT);
+
+        while health.state() == HealthState::Down {
+            assert!(
+                started.elapsed() < budget,
+                "the live entry must be judged within one probe timeout and the confirm delay \
+                 of the patrol starting, not after the dead entry's second timeout"
+            );
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     #[tokio::test]

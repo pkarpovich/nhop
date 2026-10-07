@@ -325,15 +325,18 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 **Files:**
 - Modify: `nhop/src/upstream/mod.rs`
 
-- [ ] make `patrol` probe every entry of the current list concurrently each round, keep one `Pending` per address (a sequence for an address no longer published is dropped), and sleep `confirm_delay` while any sequence is pending, `interval` otherwise
-- [ ] add `HealthHandle::set_at(state, cause, at: SystemTime)` as specified in "Same-round ties", make `set` delegate to it with `SystemTime::now()`, and have the patrol stamp every write of one round with the instant the round started
-- [ ] after each round call `Selection::observe` so a hold expiring is logged without waiting for traffic
-- [ ] write the unit test `entries_confirmed_in_one_round_tie_and_the_primary_wins`: two upstreams answering `GRANTED`, the fallback's stub answering faster; after the round that confirms both, their `changed_at` are equal and `select` picks the primary
-- [ ] keep the empty-list behaviour of today's `NO_UPSTREAM` branch: the fast tick for `NO_UPSTREAM_EAGER`, then the interval
-- [ ] write the unit test `a_round_probes_every_entry`: two upstreams answering `GRANTED`, both start `Down`, both are `Up` after two rounds
-- [ ] write the unit test `a_sequence_for_a_removed_address_cannot_close`: one contradicting probe banked for A, A removed from the list, a later probe of the same address added back does not close it
-- [ ] write the unit test `a_dead_entry_does_not_slow_the_round`: one entry `Answers::Never`, one `GRANTED`; the live entry is judged `Up` within one `PROBE_TIMEOUT` plus `confirm_delay` of the round starting (paused time)
-- [ ] run `mise run check` - must pass before task 6
+- [x] make `patrol` probe every entry of the current list concurrently each round, keep one `Pending` per address (a sequence for an address no longer published is dropped), and sleep `confirm_delay` while any sequence is pending, `interval` otherwise
+- [x] add `HealthHandle::set_at(state, cause, at: SystemTime)` as specified in "Same-round ties", make `set` delegate to it with `SystemTime::now()`, and have the patrol stamp every write of one round with the instant the round started
+- [x] after each round call `Selection::observe` so a hold expiring is logged without waiting for traffic
+- [x] write the unit test `entries_confirmed_in_one_round_tie_and_the_primary_wins`: two upstreams answering `GRANTED`, the fallback's stub answering faster; after the round that confirms both, their `changed_at` are equal and `select` picks the primary
+- [x] keep the empty-list behaviour of today's `NO_UPSTREAM` branch: the fast tick for `NO_UPSTREAM_EAGER`, then the interval
+- [x] write the unit test `a_round_probes_every_entry`: two upstreams answering `GRANTED`, both start `Down`, both are `Up` after two rounds
+- [x] write the unit test `a_sequence_for_a_removed_address_cannot_close`: one contradicting probe banked for A, A removed from the list, a later probe of the same address added back does not close it
+- [x] write the unit test `a_dead_entry_does_not_slow_the_round`: one entry `Answers::Never`, one `GRANTED`; the live entry is judged `Up` within one `PROBE_TIMEOUT` plus `confirm_delay` of the round starting (paused time)
+- [x] run `mise run check` - must pass before task 6
+- + note: `Pending` holds the `HealthHandle` of the entry it was banked against instead of its address, and a confirming probe has to land on that same handle (`HealthHandle::same`, `Arc::ptr_eq`). Since a reload keeps a handle only while it keeps the address, this also covers an address removed and added back between two rounds, which address keying would miss. `round` spawns one probe per entry on a `JoinSet` and folds each observation as soon as it returns, stamped with the round's start instant. That per-completion fold is what keeps a black-holed entry from delaying the live one's confirmation by a second `PROBE_TIMEOUT`. `advance` now works on the banked target alone
+- + note: `a_dead_entry_does_not_slow_the_round` runs on the wall clock with a 50 ms confirm delay and a budget of `PROBE_TIMEOUT + confirm_delay + PROBE_TIMEOUT / 2`, not on paused time: the live entry needs a real stub to answer, and CLAUDE.md keeps tests like that off the paused clock because it races real I/O readiness. The dead entry comes first in the list, so a sequential or join-all patrol would need about two `PROBE_TIMEOUT`s and fail the test
+- + note: known edge of round-start stamping. If a dial turns an entry up while a round is still probing, and a lower-ranked entry's sequence closes later in that same round, the lower-ranked entry is stamped earlier and wins step 2 until the hold. The window is one round's probing time, and the plan's tie rule accepts it
 
 ### Task 6: Pin failover and return end to end
 

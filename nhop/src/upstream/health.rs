@@ -100,12 +100,25 @@ impl HealthHandle {
         changed_at
     }
 
-    /// Records one observation, moving `changed_at` and logging a line only on a turnover.
+    /// Records one observation made now, moving `changed_at` and logging a line only on a turnover.
+    ///
+    /// It is [`HealthHandle::set_at`] stamped with [`SystemTime::now`], the form a real dial uses.
+    pub fn set(&self, state: HealthState, cause: VerdictCause) {
+        self.set_at(state, cause, SystemTime::now());
+    }
+
+    /// Records one observation, stamping a turnover with `at` and logging a line only on a turnover.
+    ///
+    /// The patrol stamps every write of one round with the instant the round started, so entries
+    /// whose sequences close in the same round settle at the same instant and [`select`] breaks
+    /// the tie by list order rather than by which probe happened to return first.
     ///
     /// The line is written here because this is the one place a turnover can be seen: the settled
     /// verdict and the observation are only both in hand while the swap is being made.
-    pub fn set(&self, state: HealthState, cause: VerdictCause) {
-        let previous = self.settle(state);
+    ///
+    /// [`select`]: crate::upstream::select
+    pub fn set_at(&self, state: HealthState, cause: VerdictCause, at: SystemTime) {
+        let previous = self.settle(state, at);
         let Health {
             state: previous,
             changed_at: _,
@@ -127,10 +140,20 @@ impl HealthHandle {
     /// A test that needs a daemon to begin [`HealthState::Up`] is arranging the world, not watching
     /// it move; [`HealthHandle::set`] is for the observations under test.
     pub fn seed(&self, state: HealthState) {
-        let _previous = self.settle(state);
+        let _previous = self.settle(state, SystemTime::now());
     }
 
-    fn settle(&self, state: HealthState) -> Arc<Health> {
+    /// Returns whether both handles judge the same verdict rather than two equal ones.
+    ///
+    /// A reload keeps an entry's handle only while it keeps the address, so two handles that are
+    /// the same judge one address published without a break in between.
+    pub fn same(&self, other: &HealthHandle) -> bool {
+        let Self(health) = self;
+        let Self(other) = other;
+        Arc::ptr_eq(health, other)
+    }
+
+    fn settle(&self, state: HealthState, at: SystemTime) -> Arc<Health> {
         let Self(health) = self;
         health.rcu(|settled| {
             let Health {
@@ -141,9 +164,7 @@ impl HealthHandle {
                 (HealthState::Up, HealthState::Up) | (HealthState::Down, HealthState::Down) => {
                     changed_at
                 }
-                (HealthState::Up, HealthState::Down) | (HealthState::Down, HealthState::Up) => {
-                    SystemTime::now()
-                }
+                (HealthState::Up, HealthState::Down) | (HealthState::Down, HealthState::Up) => at,
             };
             Health { state, changed_at }
         })
@@ -240,6 +261,35 @@ mod tests {
         elsewhere.seed(HealthState::Up);
 
         assert_eq!(health.verdict(), elsewhere.verdict());
+    }
+
+    #[test]
+    fn a_turnover_set_at_an_instant_settles_at_that_instant() {
+        let health = HealthHandle::default();
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+        health.set_at(HealthState::Up, VerdictCause::Probe, at);
+        health.set_at(
+            HealthState::Up,
+            VerdictCause::Probe,
+            at + Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            health.verdict(),
+            Health {
+                state: HealthState::Up,
+                changed_at: at,
+            }
+        );
+    }
+
+    #[test]
+    fn a_clone_is_the_same_handle_and_a_fresh_one_is_not() {
+        let health = HealthHandle::default();
+
+        assert!(health.same(&health.clone()));
+        assert!(!health.same(&HealthHandle::default()));
     }
 
     #[test]
