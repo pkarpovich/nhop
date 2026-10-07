@@ -27,7 +27,7 @@ use crate::daemon::state::{
 };
 use crate::logging;
 use crate::proxy::{self, Forward, Forwards, Listen, NextHop, Target};
-use crate::upstream::{PROBE_CONFIRM_DELAY, PROBE_INTERVAL, UpstreamHop};
+use crate::upstream::{PROBE_CONFIRM_DELAY, PROBE_INTERVAL, RETURN_HOLD, UpstreamHop};
 
 /// Addresses both front ends bind until an init script moves them.
 pub const DEFAULT_LISTEN: Listen = Listen {
@@ -443,7 +443,12 @@ fn accept_forward(
 ///
 /// [`io::Error`]: std::io::Error
 pub fn spawn_frontends(live: &Live, listen: Listen) -> io::Result<Frontends> {
-    let hop = UpstreamHop::start(live.upstream().clone(), PROBE_INTERVAL, PROBE_CONFIRM_DELAY);
+    let hop = UpstreamHop::start(
+        live.upstream().clone(),
+        PROBE_INTERVAL,
+        PROBE_CONFIRM_DELAY,
+        RETURN_HOLD,
+    );
     Frontends::bind(live.clone(), Arc::new(hop), listen)
 }
 
@@ -704,6 +709,7 @@ mod tests {
             live.upstream().clone(),
             PROBE_INTERVAL,
             PROBE_CONFIRM_DELAY,
+            RETURN_HOLD,
         ));
         Frontends::bind(live, hop, ephemeral()).unwrap()
     }

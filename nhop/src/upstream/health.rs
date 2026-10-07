@@ -20,6 +20,23 @@ pub enum VerdictCause {
     Dial,
 }
 
+/// Why new connections moved from one upstream to another.
+///
+/// Derived once per switch from the selection before and after it, so a reader of the log can tell
+/// traffic leaving an upstream that failed from traffic returning to one that has stayed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchCause {
+    /// The upstream that was carrying new connections turned down.
+    Down,
+    /// A higher-ranked upstream stayed up for the whole return hold and took traffic back.
+    Held,
+    /// An upstream came up while none was selectable.
+    Recovered,
+    /// A load published a different list.
+    Reload,
+}
+
 /// Verdict on the upstream and the instant it settled.
 ///
 /// The instant is a [`SystemTime`] rather than an [`Instant`] because `status` and `doctor` render

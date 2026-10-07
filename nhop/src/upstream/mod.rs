@@ -1,8 +1,10 @@
 mod entries;
 mod health;
+mod select;
 
 pub use entries::{UpstreamEntries, UpstreamEntry};
-pub use health::{Health, HealthHandle, VerdictCause};
+pub use health::{Health, HealthHandle, SwitchCause, VerdictCause};
+pub use select::{RETURN_HOLD, Selection, select};
 
 use std::future::Future;
 use std::io;
@@ -119,6 +121,7 @@ pub const KEEPALIVE_RETRIES: u32 = 4;
 #[derive(Debug)]
 pub struct UpstreamHop {
     upstream: LiveUpstream,
+    hold: Duration,
     patrolling: JoinHandle<()>,
 }
 
@@ -126,6 +129,7 @@ impl Drop for UpstreamHop {
     fn drop(&mut self) {
         let Self {
             upstream: _,
+            hold: _,
             patrolling,
         } = self;
         patrolling.abort();
@@ -135,12 +139,18 @@ impl Drop for UpstreamHop {
 impl UpstreamHop {
     /// Starts dialling through the published upstreams, patrolling them in both verdict states.
     ///
-    /// The interval and the confirm delay are parameters so tests do not wait out
-    /// [`PROBE_INTERVAL`] and [`PROBE_CONFIRM_DELAY`].
-    pub fn start(upstream: LiveUpstream, interval: Duration, confirm_delay: Duration) -> Self {
+    /// The interval, the confirm delay and the return hold are parameters so tests do not wait
+    /// out [`PROBE_INTERVAL`], [`PROBE_CONFIRM_DELAY`] and [`RETURN_HOLD`].
+    pub fn start(
+        upstream: LiveUpstream,
+        interval: Duration,
+        confirm_delay: Duration,
+        hold: Duration,
+    ) -> Self {
         let patrolling = tokio::spawn(patrol(upstream.clone(), interval, confirm_delay));
         Self {
             upstream,
+            hold,
             patrolling,
         }
     }
@@ -148,6 +158,11 @@ impl UpstreamHop {
     /// Returns the publication the hop dials by, each entry carrying its own verdict.
     pub fn upstream(&self) -> &LiveUpstream {
         &self.upstream
+    }
+
+    /// Returns how long a higher-ranked entry has to stay up before it takes traffic back.
+    pub fn hold(&self) -> Duration {
+        self.hold
     }
 
     async fn routed(&self, host: &Host, port: Port, class: RuleClass, rule: RuleId) -> Dialled {
@@ -555,7 +570,7 @@ mod tests {
         let published = LiveUpstream::default();
         published.publish(&listed(upstream));
         first(&published).health().seed(state);
-        UpstreamHop::start(published, interval, PATIENT)
+        UpstreamHop::start(published, interval, PATIENT, PATIENT)
     }
 
     fn upstream_decision(class: RuleClass, rule: usize) -> Decision {
@@ -770,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn a_require_refusal_reports_that_nothing_was_dialled() {
         let (_listener, host, port) = destination().await;
-        let hop = UpstreamHop::start(LiveUpstream::default(), PATIENT, PATIENT);
+        let hop = UpstreamHop::start(LiveUpstream::default(), PATIENT, PATIENT, PATIENT);
 
         let dialled = hop
             .dial(&host, port, upstream_decision(RuleClass::Require, 4))

@@ -11,7 +11,7 @@ use tracing::Subscriber;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::EnvFilter;
 
-use crate::upstream::VerdictCause;
+use crate::upstream::{SwitchCause, VerdictCause};
 
 /// Number of daily log files kept, the one being written included.
 pub const KEPT_FILES: usize = 7;
@@ -305,6 +305,15 @@ pub(crate) fn cause_name(cause: VerdictCause) -> &'static str {
     match cause {
         VerdictCause::Probe => "probe",
         VerdictCause::Dial => "dial",
+    }
+}
+
+pub(crate) fn switch_cause_name(cause: SwitchCause) -> &'static str {
+    match cause {
+        SwitchCause::Down => "down",
+        SwitchCause::Held => "held",
+        SwitchCause::Recovered => "recovered",
+        SwitchCause::Reload => "reload",
     }
 }
 
