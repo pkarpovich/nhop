@@ -21,7 +21,6 @@ use tokio::sync::mpsc;
 
 use crate::logging;
 use crate::rules::{Decision, NormalizedHost, RuleId, Ruleset};
-use crate::upstream::HealthHandle;
 
 /// Addresses the two protocol front ends listen on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,10 +121,11 @@ impl Forwards {
     }
 }
 
-/// Address published while no init script has named an upstream.
+/// Address reported while no init script has named an upstream.
 ///
-/// Port zero cannot be dialled, so `require` traffic is refused at once instead of waiting out a
-/// connect timeout.
+/// Nothing is published then, so `require` traffic is refused at once instead of waiting out a
+/// connect timeout, and the refusal and `doctor` name this address, which port zero makes
+/// undialable.
 pub const NO_UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 const SOCKS5_SCHEME: &str = "socks5://";
@@ -171,6 +171,57 @@ impl Upstream {
 
     pub fn socket(&self) -> SocketAddr {
         self.socket
+    }
+}
+
+/// Rejection of an upstream list that names one address twice.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("upstream {0} is listed more than once")]
+pub struct DuplicateUpstream(pub SocketAddr);
+
+/// Rejection of an upstream list a `set_upstream` or `set_upstreams` command named.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnusableUpstreams {
+    /// One of the addresses cannot be dialled.
+    #[error(transparent)]
+    Invalid(#[from] InvalidUpstream),
+    /// Two entries dial the same address.
+    #[error(transparent)]
+    Duplicate(#[from] DuplicateUpstream),
+}
+
+/// Upstream proxies in the order the operator prefers them, each address at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstreams(Vec<Upstream>);
+
+impl Upstreams {
+    /// Reads the first upstream and its fallbacks, keeping the order they were written in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnusableUpstreams::Invalid`] when an address cannot be read and
+    /// [`UnusableUpstreams::Duplicate`] when two of them dial the same socket address.
+    pub fn parse(
+        first: UpstreamAddr,
+        fallbacks: Vec<UpstreamAddr>,
+    ) -> Result<Self, UnusableUpstreams> {
+        let mut entries: Vec<Upstream> = Vec::with_capacity(1 + fallbacks.len());
+        for written in std::iter::once(first).chain(fallbacks) {
+            let upstream = Upstream::parse(written)?;
+            for listed in &entries {
+                if listed.socket() == upstream.socket() {
+                    return Err(DuplicateUpstream(upstream.socket()).into());
+                }
+            }
+            entries.push(upstream);
+        }
+        Ok(Self(entries))
+    }
+
+    /// Returns the entries in order of preference.
+    pub fn as_slice(&self) -> &[Upstream] {
+        let Self(entries) = self;
+        entries
     }
 }
 
@@ -221,6 +272,7 @@ fn reporting(event: EventView, dropped: u64) -> EventView {
         upstream,
         connect_ms,
         hop,
+        via,
         duration_ms,
         error,
     } = event;
@@ -237,6 +289,7 @@ fn reporting(event: EventView, dropped: u64) -> EventView {
         upstream,
         connect_ms,
         hop,
+        via,
         duration_ms,
         error: Some(error),
     }
@@ -411,8 +464,6 @@ impl From<UpstreamDown> for io::Error {
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
     pub rules: Arc<Ruleset>,
-    pub health: HealthHandle,
-    pub upstream: SocketAddr,
     pub events: EventTx,
 }
 
@@ -420,18 +471,26 @@ pub struct ConnCtx {
 ///
 /// The two variants are what separates a slow dial from a long-lived connection in the log, which
 /// [`EventView::duration_ms`] alone cannot say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Connect {
     /// No dial was made, so there is no dial time: the decision refused before the network.
     Refused,
     /// A dial was made, took this long and went this way, whether or not it connected.
-    Attempted { took: Duration, hop: EffectiveHop },
+    ///
+    /// `via` is the upstream that carried it, present only when `hop` is
+    /// [`EffectiveHop::Upstream`].
+    Attempted {
+        took: Duration,
+        hop: EffectiveHop,
+        via: Option<UpstreamAddr>,
+    },
 }
 
 /// One connection, from the decision that routed it to the line it leaves in the log.
 ///
 /// The verdict is taken at the decision and the duration at the end, so the event reports what
-/// the routing saw.
+/// the routing saw. The upstream that carried the connection comes from the dial, never from a
+/// selection made afterwards.
 #[derive(Debug)]
 pub struct Routed {
     host: Host,
@@ -440,20 +499,29 @@ pub struct Routed {
     upstream: HealthState,
     connect: Option<Duration>,
     hop: Option<EffectiveHop>,
+    via: Option<UpstreamAddr>,
     started: Instant,
     events: EventTx,
 }
 
 impl Routed {
-    /// Records the decision a connection was routed by.
-    pub fn begun(ctx: &ConnCtx, host: &Host, port: Port, decision: Decision) -> Self {
+    /// Records the decision a connection was routed by and the verdict of the upstream selected
+    /// when it was made, read from [`NextHop::verdict`].
+    pub fn begun(
+        ctx: &ConnCtx,
+        upstream: HealthState,
+        host: &Host,
+        port: Port,
+        decision: Decision,
+    ) -> Self {
         Self {
             host: host.clone(),
             port,
             decision,
-            upstream: ctx.health.state(),
+            upstream,
             connect: None,
             hop: None,
+            via: None,
             started: Instant::now(),
             events: ctx.events.clone(),
         }
@@ -461,12 +529,13 @@ impl Routed {
 
     /// Records what the dial phase cost, once the front end has been through it.
     pub fn dialled(&mut self, connect: Connect) {
-        let (connect, hop) = match connect {
-            Connect::Refused => (None, None),
-            Connect::Attempted { took, hop } => (Some(took), Some(hop)),
+        let (connect, hop, via) = match connect {
+            Connect::Refused => (None, None, None),
+            Connect::Attempted { took, hop, via } => (Some(took), Some(hop), via),
         };
         self.connect = connect;
         self.hop = hop;
+        self.via = via;
     }
 
     /// Emits the single event this connection produces, once it has ended.
@@ -481,6 +550,7 @@ impl Routed {
             upstream,
             connect,
             hop,
+            via,
             started,
             events,
         } = self;
@@ -493,6 +563,7 @@ impl Routed {
             upstream,
             connect_ms: connect.map(millis),
             hop,
+            via,
             duration_ms: millis(started.elapsed()),
             error: failure.map(io::Error::to_string),
         };
@@ -528,8 +599,12 @@ pub enum Dialled {
     /// network.
     Refused(io::Error),
     /// A dial was made over the network, this way, whether or not it produced a connection.
+    ///
+    /// `via` names the upstream that carried it, present only when `hop` is
+    /// [`EffectiveHop::Upstream`].
     Attempted {
         hop: EffectiveHop,
+        via: Option<UpstreamAddr>,
         next: io::Result<TcpStream>,
     },
 }
@@ -542,7 +617,7 @@ impl Dialled {
     pub fn timed(self, took: Duration) -> (Connect, io::Result<TcpStream>) {
         match self {
             Self::Refused(failure) => (Connect::Refused, Err(failure)),
-            Self::Attempted { hop, next } => (Connect::Attempted { took, hop }, next),
+            Self::Attempted { hop, via, next } => (Connect::Attempted { took, hop, via }, next),
         }
     }
 }
@@ -562,6 +637,13 @@ pub trait NextHop: fmt::Debug + Send + Sync + 'static {
         port: Port,
         decision: Decision,
     ) -> Pin<Box<dyn Future<Output = Dialled> + Send + 'a>>;
+
+    /// Returns the verdict of the upstream new connections go through at this instant.
+    ///
+    /// It is [`HealthState::Down`] while none is selected. A connection records it when its
+    /// decision is made, as the state of the world the routing saw; which upstream actually carried
+    /// the connection is reported by the dial on [`Dialled::Attempted`].
+    fn verdict(&self) -> HealthState;
 }
 
 #[cfg(test)]
@@ -596,6 +678,48 @@ mod tests {
         assert!(failure.to_string().contains("vm.example.com"), "{failure}");
         assert!(upstream("").is_err());
         assert!(upstream("socks5://192.0.2.10").is_err());
+    }
+
+    #[test]
+    fn an_upstream_list_keeps_the_order_it_was_written_in() {
+        let upstreams = Upstreams::parse(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![
+                UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                UpstreamAddr("192.0.2.12:1080".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        let mut sockets = Vec::new();
+        for entry in upstreams.as_slice() {
+            sockets.push(entry.socket());
+        }
+        assert_eq!(
+            sockets,
+            [
+                "192.0.2.10:1080".parse::<SocketAddr>().unwrap(),
+                "192.0.2.11:1080".parse().unwrap(),
+                "192.0.2.12:1080".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            upstreams.as_slice().first(),
+            Some(&upstream("socks5://192.0.2.10:1080").unwrap())
+        );
+    }
+
+    #[test]
+    fn an_upstream_list_naming_one_address_twice_is_rejected() {
+        let refused = Upstreams::parse(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![UpstreamAddr("192.0.2.10:1080".to_owned())],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            UnusableUpstreams::Duplicate(DuplicateUpstream("192.0.2.10:1080".parse().unwrap()))
+        );
     }
 
     fn forward(listen: &str, host: &str, port: u16) -> Forward {
@@ -804,12 +928,10 @@ mod tests {
 
         let ctx = ConnCtx {
             rules: Arc::new(Ruleset::default()),
-            health: HealthHandle::default(),
-            upstream: NO_UPSTREAM,
             events: events.clone(),
         };
         let host = Host("api.example.com".to_owned());
-        let routed = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
+        let routed = Routed::begun(&ctx, HealthState::Down, &host, Port(443), Decision::Direct);
         routed.ended(None);
 
         assert_eq!(events.subscribers(), 1);
@@ -860,6 +982,7 @@ mod tests {
             upstream: HealthState::Down,
             connect_ms: Some(0),
             hop: Some(EffectiveHop::Direct),
+            via: None,
             duration_ms: 1,
             error: None,
         }
@@ -871,19 +994,20 @@ mod tests {
         let mut queue = events.subscribe();
         let ctx = ConnCtx {
             rules: Arc::new(Ruleset::default()),
-            health: HealthHandle::default(),
-            upstream: NO_UPSTREAM,
             events: events.clone(),
         };
         let host = Host("api.example.com".to_owned());
 
-        let mut attempted = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
+        let mut attempted =
+            Routed::begun(&ctx, HealthState::Down, &host, Port(443), Decision::Direct);
         attempted.dialled(Connect::Attempted {
             took: Duration::from_millis(41),
             hop: EffectiveHop::FallbackDirect,
+            via: None,
         });
         attempted.ended(None);
-        let mut refused = Routed::begun(&ctx, &host, Port(443), Decision::Direct);
+        let mut refused =
+            Routed::begun(&ctx, HealthState::Down, &host, Port(443), Decision::Direct);
         refused.dialled(Connect::Refused);
         refused.ended(None);
 

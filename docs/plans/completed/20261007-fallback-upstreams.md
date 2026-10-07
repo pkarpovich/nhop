@@ -81,6 +81,8 @@ Line numbers below are as of commit `1b75da9` (v0.1.6). Anchor by the named symb
 - `mise run check` green: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - `grep -rn '^\s*//[^/!]' nhop/src nhop-ipc/src | wc -l` must not grow from its value at the start of Task 1 (record it in this file before starting)
 - `grep -rn 'matches!\|_ =>' nhop/src nhop-ipc/src | wc -l` must not grow from its value at the start of Task 1 (record it the same way)
+- recorded at the start of Task 1: `//` comments **5**, `matches!`/`_ =>` **4**
+- `mise` is not installed in the agent environment; the gate is run as its three commands directly
 
 ## Testing Strategy
 
@@ -236,15 +238,16 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/daemon/state.rs`
 - Modify: `nhop/src/cli/mod.rs`
 
-- [ ] add `fallbacks: Vec<UpstreamAddr>` with `#[serde(default)]` to `Command::SetUpstream`, documented as the entries after `addr`, in order
-- [ ] make the `upstream` subcommand take one or more positional addresses; the CLI sends the first as `addr` and the rest as `fallbacks`
-- [ ] add `Upstreams` (ordered, non-empty when parsed from a command) with a constructor that parses every address with `Upstream::parse` and rejects a repeated `SocketAddr` with `DuplicateUpstream`; staging stores `Option<Upstreams>` and `set_upstream` replaces it whole
-- [ ] map `DuplicateUpstream` to a failed staged command the way `DuplicateForward` is mapped
-- [ ] keep publishing only the first entry's address through the existing `LiveUpstream` in this task, so routing is unchanged until Task 2
-- [ ] write the wire test `a_single_upstream_command_serializes_as_before`: a `SetUpstream` with empty `fallbacks` produces the exact JSON today's command produces, and that JSON without `fallbacks` deserializes to empty `fallbacks`
-- [ ] write the CLI parse tests `upstream_takes_several_addresses_in_order` and `upstream_without_an_address_is_a_usage_error`
-- [ ] write the staging tests `a_repeated_upstream_address_fails_the_command` and `a_second_upstream_line_replaces_the_whole_list`
-- [ ] run `mise run check` - must pass before task 2
+- [x] add `fallbacks: Vec<UpstreamAddr>` with `#[serde(default)]` to `Command::SetUpstream`, documented as the entries after `addr`, in order
+- [x] make the `upstream` subcommand take one or more positional addresses; the CLI sends the first as `addr` and the rest as `fallbacks`
+- [x] add `Upstreams` (ordered, non-empty when parsed from a command) with a constructor that parses every address with `Upstream::parse` and rejects a repeated `SocketAddr` with `DuplicateUpstream`; staging stores `Option<Upstreams>` and `set_upstream` replaces it whole
+- [x] map `DuplicateUpstream` to a failed staged command the way `DuplicateForward` is mapped
+- [x] keep publishing only the first entry's address through the existing `LiveUpstream` in this task, so routing is unchanged until Task 2
+- [x] write the wire test `a_single_upstream_command_serializes_as_before`: a `SetUpstream` with empty `fallbacks` produces the exact JSON today's command produces, and that JSON without `fallbacks` deserializes to empty `fallbacks`
+- [x] write the CLI parse tests `upstream_takes_several_addresses_in_order` and `upstream_without_an_address_is_a_usage_error`
+- [x] write the staging tests `a_repeated_upstream_address_fails_the_command` and `a_second_upstream_line_replaces_the_whole_list`
+- [x] run `mise run check` - must pass before task 2
+- + note: `fallbacks` also carries `skip_serializing_if = "Vec::is_empty"`, which is what keeps a one-address command byte-identical on the wire. `Upstreams` lands in `nhop/src/proxy/mod.rs` beside `Upstream` as `Upstreams(Vec<Upstream>)` (staged form, no verdicts) with `UnusableUpstreams { Invalid, Duplicate }` as its rejection; Task 2 decides where the published entries with their `HealthHandle` live. `Staging::set_upstream(first, fallbacks)` parses and fails the run itself, as `push_rule` does, so `DaemonState::fail_staged` was removed
 
 ### Task 2: Publish the list with a verdict per entry
 
@@ -256,17 +259,20 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/tests/support/mod.rs`
 - Modify: every test that constructs `LiveUpstream`, `Live` or `UpstreamHop` (enumerate with the grep in "Skills to invoke")
 
-- [ ] change `LiveUpstream` to publish `Arc<Upstreams>`, empty by default; remove the shared `HealthHandle` from `Live` and from both `UpstreamHop::start` call sites
-- [ ] in `adopt_upstream`, build the published entries by reusing the `HealthHandle` of any entry whose `SocketAddr` is in the currently published list and creating a fresh one otherwise
-- [ ] remove `ConnCtx.upstream` (no reader) and take `ConnCtx.health` from the selected entry - until Task 3 lands selection, the first entry's handle, or a fresh `Down` handle for an empty list
-- [ ] keep `NO_UPSTREAM` only where it is still meaningful (the empty-list refusal and the `test` rendering); delete the constant if no reader is left and say so in this plan
-- [ ] make `required()`, `preferred()` and `observed()` take the entry they dial: in this task the first entry, so routing for a one-entry list is unchanged; verdict writes go to that entry's handle
-- [ ] give `TestDaemon::start` a list of upstream addresses; existing callers pass one
-- [ ] write the unit test `a_reload_keeps_the_verdict_of_an_address_it_keeps`: publish [A, B], seed A `Up`, publish [B, A, C] - A is still `Up` with its `changed_at` unchanged, C is `Down`
-- [ ] write the unit test `an_address_removed_and_added_back_starts_down`: publish [A], seed `Up`, publish [B], publish [A] - A is `Down`
-- [ ] rewrite `a_dial_landing_after_a_reload_leaves_the_new_verdict_alone` against the new model: a write to the handle of an entry no longer published does not change the verdict of the entry that replaced it
-- [ ] confirm every test in `nhop/tests/upstream_dialer.rs` and `nhop/tests/acceptance.rs` passes with only constructor changes
-- [ ] run `mise run check` - must pass before task 3
+- [x] change `LiveUpstream` to publish `Arc<Upstreams>`, empty by default; remove the shared `HealthHandle` from `Live` and from both `UpstreamHop::start` call sites
+- [x] in `adopt_upstream`, build the published entries by reusing the `HealthHandle` of any entry whose `SocketAddr` is in the currently published list and creating a fresh one otherwise
+- [x] remove `ConnCtx.upstream` (no reader) and take `ConnCtx.health` from the selected entry - until Task 3 lands selection, the first entry's handle, or a fresh `Down` handle for an empty list
+- [x] keep `NO_UPSTREAM` only where it is still meaningful (the empty-list refusal and the `test` rendering); delete the constant if no reader is left and say so in this plan
+- [x] make `required()`, `preferred()` and `observed()` take the entry they dial: in this task the first entry, so routing for a one-entry list is unchanged; verdict writes go to that entry's handle
+- [x] give `TestDaemon::start` a list of upstream addresses; existing callers pass one
+- [x] write the unit test `a_reload_keeps_the_verdict_of_an_address_it_keeps`: publish [A, B], seed A `Up`, publish [B, A, C] - A is still `Up` with its `changed_at` unchanged, C is `Down`
+- [x] write the unit test `an_address_removed_and_added_back_starts_down`: publish [A], seed `Up`, publish [B], publish [A] - A is `Down`
+- [x] rewrite `a_dial_landing_after_a_reload_leaves_the_new_verdict_alone` against the new model: a write to the handle of an entry no longer published does not change the verdict of the entry that replaced it
+- [x] confirm every test in `nhop/tests/upstream_dialer.rs` and `nhop/tests/acceptance.rs` passes with only constructor changes
+- [x] run `mise run check` - must pass before task 3
+- + note: the published list is `UpstreamEntries(Vec<UpstreamEntry>)` in `nhop/src/upstream/entries.rs`, since `Upstreams` already names the staged form from Task 1; where later tasks write `Upstreams` for the published value (`select`, `Selection::observe(&Arc<Upstreams>)`) read `UpstreamEntries`. `LiveUpstream::publish(&Upstreams)` adopts the handles through `UpstreamEntries::adopted`. `UpstreamHop::health()` gave way to `UpstreamHop::upstream()`, and `observed` is a free function writing to the dialled entry's handle with no address guard left to keep
+- + note: `NO_UPSTREAM` stays: the empty-list `require` refusal names it, and `status`/`doctor` report it with the `Down` verdict `DaemonState::unconfigured` holds from the state task's start, so an unconfigured daemon reports as before. `TestDaemon` gained `verdict(addr)` for seeding one entry
+- + note: two dialer tests needed more than constructors, because a reload no longer carries one verdict across different addresses: `a_verdict_that_moves_mid_sequence_still_needs_two_agreeing_probes` moves the verdict under the pending sequence with a dial-cause `set` on the entry's handle rather than a failed dial against a reloaded address, and `a_sequence_banked_against_one_upstream_is_not_closed_by_the_next` seeds the replacing entry `Up` and watches its verdict. Tests that publish an address later read that entry's verdict after publishing. The front-end test helpers lost their unused upstream argument with `ConnCtx.upstream`
 
 ### Task 3: Selection with a return hold
 
@@ -276,16 +282,19 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/upstream/health.rs`
 - Modify: `nhop/src/logging.rs`
 
-- [ ] add `RETURN_HOLD` with its doc comment and the reasoning from "`RETURN_HOLD`"
-- [ ] add the pure function `select(entries, now, hold) -> Option<usize>` implementing the three steps in "Solution Overview"; a `changed_at` in the future of `now` (wall clock moved back) counts as not held
-- [ ] add `SwitchCause` and `Selection` (`observe(&self, list: &Arc<Upstreams>, new)`), keeping the previous selection and the previous list's `Arc`, deriving the cause from the table in "Switch causes" and writing one log record with `upstream_from`, `upstream_to`, `switch_cause` on a change only; `rcu`-style as `HealthHandle::set`, with the closure kept pure and the log written after the swap
-- [ ] add `hold: Duration` to `UpstreamHop::start` beside `interval` and `confirm_delay`; production passes `RETURN_HOLD`
-- [ ] write the table-driven unit test `selection_follows_the_list_order_and_the_hold` covering at least: one entry up; one entry down; primary up and held; primary up but not held with fallback up and held - fallback; primary up but not held with fallback down - primary; both up with equal `changed_at` (cold start) - primary; both up, neither held, fallback up first - fallback; primary down and fallback up - fallback; everything down - none; a `changed_at` after `now` - not held
-- [ ] in the same test, the trace from "Solution Overview" as consecutive rows with list [P, F] and a 60 s hold: F up at t=0, P up at t=10; the selection is F at t=0, t=10 and t=60, and P at t=70
-- [ ] write the unit test `every_switch_has_exactly_one_cause`, exhaustive over a three-entry list: every combination of each entry's verdict and `changed_at` drawn from a small set of instants (including equal ones and ones on either side of the hold) at two consecutive `now` values, with the list unchanged; assert that whenever the selection changes it derives exactly one `SwitchCause`, that no change ever has a still-`Up` previous entry replaced by a lower-ranked one, and that an unchanged selection logs nothing. Add the case of a reloaded list (a new `Arc`) yielding `reload` whatever else changed
-- [ ] add the trace from "Solution Overview" to that test as a sequence of observations, asserting exactly one switch, F -> P, cause `held`
-- [ ] write the unit test `a_switch_is_logged_once`, capturing records with a scoped subscriber: two `observe` calls with the same new selection produce one record
-- [ ] run `mise run check` - must pass before task 4
+- [x] add `RETURN_HOLD` with its doc comment and the reasoning from "`RETURN_HOLD`"
+- [x] add the pure function `select(entries, now, hold) -> Option<usize>` implementing the three steps in "Solution Overview"; a `changed_at` in the future of `now` (wall clock moved back) counts as not held
+- [x] add `SwitchCause` and `Selection` (`observe(&self, list: &Arc<Upstreams>, new)`), keeping the previous selection and the previous list's `Arc`, deriving the cause from the table in "Switch causes" and writing one log record with `upstream_from`, `upstream_to`, `switch_cause` on a change only; `rcu`-style as `HealthHandle::set`, with the closure kept pure and the log written after the swap
+- [x] add `hold: Duration` to `UpstreamHop::start` beside `interval` and `confirm_delay`; production passes `RETURN_HOLD`
+- [x] write the table-driven unit test `selection_follows_the_list_order_and_the_hold` covering at least: one entry up; one entry down; primary up and held; primary up but not held with fallback up and held - fallback; primary up but not held with fallback down - primary; both up with equal `changed_at` (cold start) - primary; both up, neither held, fallback up first - fallback; primary down and fallback up - fallback; everything down - none; a `changed_at` after `now` - not held
+- [x] in the same test, the trace from "Solution Overview" as consecutive rows with list [P, F] and a 60 s hold: F up at t=0, P up at t=10; the selection is F at t=0, t=10 and t=60, and P at t=70
+- [x] write the unit test `every_switch_has_exactly_one_cause`, exhaustive over a three-entry list: every combination of each entry's verdict and `changed_at` drawn from a small set of instants (including equal ones and ones on either side of the hold) at two consecutive `now` values, with the list unchanged; assert that whenever the selection changes it derives exactly one `SwitchCause`, that no change ever has a still-`Up` previous entry replaced by a lower-ranked one, and that an unchanged selection logs nothing. Add the case of a reloaded list (a new `Arc`) yielding `reload` whatever else changed
+- [x] add the trace from "Solution Overview" to that test as a sequence of observations, asserting exactly one switch, F -> P, cause `held`
+- [x] write the unit test `a_switch_is_logged_once`, capturing records with a scoped subscriber: two `observe` calls with the same new selection produce one record
+- [x] run `mise run check` - must pass before task 4
+- + note: `select(&[Health], now, hold)` takes the verdicts rather than the entries, so the tests hand-build `changed_at`; Task 4 collects them from `UpstreamEntries`. `Selection` swaps in each observation with `ArcSwap::swap` rather than `rcu`: the new value does not depend on the previous one, so a swap is already the atomic read-and-replace and the log is written after it. A switch is a change of the selected address, not of the index, so a reload that only moves the selected address logs nothing
+- + note: the cause derivation is total over the four causes: the shapes the table leaves out - the previous entry still `Up` and left for a lower-ranked entry or for none - need it to have turned over unseen between two observations, or the wall clock to have moved back, and are read as `down`. The exhaustive test found that a `changed_at` after `now` breaks the "never displaced by a lower-ranked entry" property (a lower-ranked entry turning up at `now` orders before it in step 2), so its instants stop at `now`; the future case stays covered by the table test. It models a turnover between the two observations as one flip stamped at the second `now`
+- + note: `UpstreamHop` stores `hold` and exposes `hold()` until Task 4's `routed()` reads it; `logging::switch_cause_name` writes the `switch_cause` field
 
 ### Task 4: Dial through the selected entry
 
@@ -299,44 +308,54 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/cli/mod.rs`
 - Modify: `nhop/tests/support/mod.rs`
 
-- [ ] make `routed()` compute `select` once per connection and dial per the class table in "Solution Overview"; call `Selection::observe` with the result
-- [ ] report the carrying entry on `Dialled::Attempted` and `Connect::Attempted` as `via: Option<UpstreamAddr>`, set only when the hop is `Upstream`; fill `EventView.via` in `Routed::ended`
-- [ ] take `EventView.upstream` from the selected entry's verdict (`Down` when none is selected)
-- [ ] emit `via` in `logging::decision` and render ` @ <via>` in `render_event` when present
-- [ ] update `StubHop` and `DownHop` in the support module for the new field
-- [ ] write the unit tests `a_require_dial_uses_the_selected_fallback`, `a_require_dial_with_nothing_up_dials_the_first_entry`, `a_prefer_dial_with_nothing_up_goes_direct_at_once` and `a_prefer_dial_uses_the_selected_fallback`, each asserting the dialled stub, `hop` and `via`
-- [ ] write the unit test `a_dial_failure_flips_only_the_entry_it_dialled`: two entries both seeded `Up`, the selected one closed; after a `require` dial the selected one is `Down` and the other is still `Up`
-- [ ] write the rendering test `a_line_carried_by_an_upstream_names_it` and confirm the existing decision goldens are byte-unchanged
-- [ ] run `mise run check` - must pass before task 5
+- [x] make `routed()` compute `select` once per connection and dial per the class table in "Solution Overview"; call `Selection::observe` with the result
+- [x] report the carrying entry on `Dialled::Attempted` and `Connect::Attempted` as `via: Option<UpstreamAddr>`, set only when the hop is `Upstream`; fill `EventView.via` in `Routed::ended`
+- [x] take `EventView.upstream` from the selected entry's verdict (`Down` when none is selected)
+- [x] emit `via` in `logging::decision` and render ` @ <via>` in `render_event` when present
+- [x] update `StubHop` and `DownHop` in the support module for the new field
+- [x] write the unit tests `a_require_dial_uses_the_selected_fallback`, `a_require_dial_with_nothing_up_dials_the_first_entry`, `a_prefer_dial_with_nothing_up_goes_direct_at_once` and `a_prefer_dial_uses_the_selected_fallback`, each asserting the dialled stub, `hop` and `via`
+- [x] write the unit test `a_dial_failure_flips_only_the_entry_it_dialled`: two entries both seeded `Up`, the selected one closed; after a `require` dial the selected one is `Down` and the other is still `Up`
+- [x] write the rendering test `a_line_carried_by_an_upstream_names_it` and confirm the existing decision goldens are byte-unchanged
+- [x] run `mise run check` - must pass before task 5
+- + note: `EventView.upstream` comes from a new `NextHop::verdict()` read when `Routed::begun` records the decision (`Up` while any entry is selected, since a selected entry is `Up`), so `ConnCtx.health` is gone: `Live::accepted` has no hold to select with, and the hop is the one owner of it. `StubHop` and `DownHop` answer `Down`, which is what their default `HealthHandle` gave before. The verdict read does not call `Selection::observe`; only dials do (and patrol rounds from Task 5)
+- + note: `UpstreamEntries::selected(now, hold)` collects the verdicts and calls `select`, for the patrol (Task 5) and the state task (Task 7) to reuse. `preferred()` no longer checks the entry's verdict itself: it is handed the selected entry or none. `Connect` lost `Copy` with `via`. `EventView.via` also carries `skip_serializing_if`, so an event without it is byte-identical on the wire. `hold()` on `UpstreamHop` was removed now that `routed()` reads the field. The dialler tests assert "the dialled stub" by the relay socket's `peer_addr`, since the patrol's first probe also reaches the stubs. The extra test `the_verdict_is_up_while_any_entry_is_selected` pins `verdict()`
 
 ### Task 5: Patrol every entry
 
 **Files:**
 - Modify: `nhop/src/upstream/mod.rs`
 
-- [ ] make `patrol` probe every entry of the current list concurrently each round, keep one `Pending` per address (a sequence for an address no longer published is dropped), and sleep `confirm_delay` while any sequence is pending, `interval` otherwise
-- [ ] add `HealthHandle::set_at(state, cause, at: SystemTime)` as specified in "Same-round ties", make `set` delegate to it with `SystemTime::now()`, and have the patrol stamp every write of one round with the instant the round started
-- [ ] after each round call `Selection::observe` so a hold expiring is logged without waiting for traffic
-- [ ] write the unit test `entries_confirmed_in_one_round_tie_and_the_primary_wins`: two upstreams answering `GRANTED`, the fallback's stub answering faster; after the round that confirms both, their `changed_at` are equal and `select` picks the primary
-- [ ] keep the empty-list behaviour of today's `NO_UPSTREAM` branch: the fast tick for `NO_UPSTREAM_EAGER`, then the interval
-- [ ] write the unit test `a_round_probes_every_entry`: two upstreams answering `GRANTED`, both start `Down`, both are `Up` after two rounds
-- [ ] write the unit test `a_sequence_for_a_removed_address_cannot_close`: one contradicting probe banked for A, A removed from the list, a later probe of the same address added back does not close it
-- [ ] write the unit test `a_dead_entry_does_not_slow_the_round`: one entry `Answers::Never`, one `GRANTED`; the live entry is judged `Up` within one `PROBE_TIMEOUT` plus `confirm_delay` of the round starting (paused time)
-- [ ] run `mise run check` - must pass before task 6
+- [x] make `patrol` probe every entry of the current list concurrently each round, keep one `Pending` per address (a sequence for an address no longer published is dropped), and sleep `confirm_delay` while any sequence is pending, `interval` otherwise
+- [x] add `HealthHandle::set_at(state, cause, at: SystemTime)` as specified in "Same-round ties", make `set` delegate to it with `SystemTime::now()`, and have the patrol stamp every write of one round with the instant the round started
+- [x] after each round call `Selection::observe` so a hold expiring is logged without waiting for traffic
+- [x] write the unit test `entries_confirmed_in_one_round_tie_and_the_primary_wins`: two upstreams answering `GRANTED`, the fallback's stub answering faster; after the round that confirms both, their `changed_at` are equal and `select` picks the primary
+- [x] keep the empty-list behaviour of today's `NO_UPSTREAM` branch: the fast tick for `NO_UPSTREAM_EAGER`, then the interval
+- [x] write the unit test `a_round_probes_every_entry`: two upstreams answering `GRANTED`, both start `Down`, both are `Up` after two rounds
+- [x] write the unit test `a_sequence_for_a_removed_address_cannot_close`: one contradicting probe banked for A, A removed from the list, a later probe of the same address added back does not close it
+- [x] write the unit test `a_dead_entry_does_not_slow_the_round`: one entry `Answers::Never`, one `GRANTED`; the live entry is judged `Up` within one `PROBE_TIMEOUT` plus `confirm_delay` of the round starting (paused time)
+- [x] run `mise run check` - must pass before task 6
+- + note: `Pending` holds the `HealthHandle` of the entry it was banked against instead of its address, and a confirming probe has to land on that same handle (`HealthHandle::same`, `Arc::ptr_eq`). Since a reload keeps a handle only while it keeps the address, this also covers an address removed and added back between two rounds, which address keying would miss. `round` spawns one probe per entry on a `JoinSet` and folds each observation as soon as it returns, stamped with the round's start instant. That per-completion fold is what keeps a black-holed entry from delaying the live one's confirmation by a second `PROBE_TIMEOUT`. `advance` now works on the banked target alone
+- + note: `a_dead_entry_does_not_slow_the_round` runs on the wall clock with a 50 ms confirm delay and a budget of `PROBE_TIMEOUT + confirm_delay + PROBE_TIMEOUT / 2`, not on paused time: the live entry needs a real stub to answer, and CLAUDE.md keeps tests like that off the paused clock because it races real I/O readiness. The dead entry comes first in the list, so a sequential or join-all patrol would need about two `PROBE_TIMEOUT`s and fail the test
+- + note: known edge of round-start stamping. If a dial turns an entry up while a round is still probing, and a lower-ranked entry's sequence closes later in that same round, the lower-ranked entry is stamped earlier and wins step 2 until the hold. The window is one round's probing time, and the plan's tie rule accepts it
 
 ### Task 6: Pin failover and return end to end
 
 **Files:**
 - Modify: `nhop/tests/support/mod.rs`
 - Create: `nhop/tests/upstream_fallback.rs`
+- Modify: `nhop/src/daemon/mod.rs`
 
-- [ ] give `StubSocks5` a way to stop accepting and start again on the same port (`stop()` closing the listener, `restart()` rebinding the recorded address), documented as the shape of an upstream host that is turned off and on
-- [ ] write `a_down_primary_hands_new_connections_to_the_fallback`: daemon with [P, F], short interval/confirm/hold, P stopped; a `require` connection is carried by F (`F.client_dials()`), its event has `via` F
-- [ ] write `a_primary_back_takes_new_connections_only_after_the_hold`: from the previous state restart P; a connection made before the hold elapses still goes to F; after the hold plus one probe cycle a new connection goes to P
-- [ ] write `an_open_connection_survives_a_switch`: open a relayed connection through F, let P come back and win selection, then exchange bytes over the open connection and assert the echo; assert F still holds it
-- [ ] write `the_log_records_each_switch_with_its_cause`: read the daemon's log after the scenario above and assert the switch records `P -> F (down)` and `F -> P (held)` in order
-- [ ] write `a_forward_port_follows_selection`: a `forward` port whose destination matches a `require` rule is carried by F while P is down
-- [ ] run `mise run check` - must pass before task 7
+- [x] give `StubSocks5` a way to stop accepting and start again on the same port (`stop()` closing the listener, `restart()` rebinding the recorded address), documented as the shape of an upstream host that is turned off and on
+- [x] write `a_down_primary_hands_new_connections_to_the_fallback`: daemon with [P, F], short interval/confirm/hold, P stopped; a `require` connection is carried by F (`F.client_dials()`), its event has `via` F
+- [x] write `a_primary_back_takes_new_connections_only_after_the_hold`: from the previous state restart P; a connection made before the hold elapses still goes to F; after the hold plus one probe cycle a new connection goes to P
+- [x] write `an_open_connection_survives_a_switch`: open a relayed connection through F, let P come back and win selection, then exchange bytes over the open connection and assert the echo; assert F still holds it
+- [x] write `the_log_records_each_switch_with_its_cause`: read the daemon's log after the scenario above and assert the switch records `P -> F (down)` and `F -> P (held)` in order
+- [x] write `a_forward_port_follows_selection`: a `forward` port whose destination matches a `require` rule is carried by F while P is down
+- [x] run `mise run check` - must pass before task 7
+- + note: a daemon needs a short interval, confirm delay and hold to fail over and return within seconds, so `daemon::Pace { interval, confirm_delay, hold }` (with `Pace::PRODUCTION`) now feeds `spawn_frontends`; `start_on` is `start_paced(paths, listen, Pace::PRODUCTION)`, and `TestDaemon::paced` is `TestDaemon::start` at a given pace. The tests run at 100 ms / 50 ms / 2 s
+- + note: every scenario goes through one helper, `failed_over`: [P, F] cold-start, P selected, P stopped, F selected. The log test then needs no extra setup to see `P -> F (down)`, since P really served before it went away. "Selected" is polled with `UpstreamEntries::selected(now, HOLD)` over the published snapshot, the same pure function the dial computes
+- + note: switch records are read as raw JSON fields (`upstream_from`, `upstream_to`, `switch_cause`) until Task 7 adds `Logged::Switch`
+- + note: the log test passed alone and lost records beside the other four. tracing-core caches callsite interest process-wide, and while exactly one dispatcher is registered it judges a callsite by the default of the thread that registers it, so a parallel test's daemon reaching the switch callsite first silenced it for good. `support::ScopedLog::install(paths)` installs the daemon's subscriber with `set_default` and keeps a silent `NoSubscriber` dispatch alive beside it, which makes every registration consult all live dispatchers
 
 ### Task 7: Status, doctor, test and logs
 
@@ -351,24 +370,28 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/cli/mod.rs`
 - Modify: `nhop/tests/golden/status.json`
 
-- [ ] add `UpstreamView` and `StatusView.upstreams` as specified in "Status shape"; fill them in the state task from the published list and `select`
-- [ ] render the per-entry status lines as specified in "Status shape", with no suffix for a one-entry list
-- [ ] change `doctor::upstream_reachable` as specified in "`doctor`"
-- [ ] change `decision_view` as specified in "`test` / `explain`"
-- [ ] add the `upstream` field to verdict records, `LoggedSwitch` and `Logged::Switch`, and both renderings from "Event and log shape"
-- [ ] write the status tests `status_lists_every_upstream_in_order`, `status_marks_the_selected_upstream` and `a_single_upstream_status_line_is_unchanged` (byte-for-byte today's line), and update the golden file
-- [ ] write the doctor tests `doctor_passes_while_any_upstream_answers` and `doctor_fails_when_no_upstream_answers`, both asserting the detail names every entry; confirm the acceptance test's seven check names are unchanged
-- [ ] write the test `test_reports_the_selected_upstream`
-- [ ] write the rendering tests `logs_renders_a_verdict_line_with_its_upstream`, `logs_renders_a_switch_line` and confirm `logs_renders_a_verdict_line` (no address) is byte-unchanged; extend the serde-parity test to `SwitchCause`
-- [ ] run `mise run check` - must pass before task 8
+- [x] add `UpstreamView` and `StatusView.upstreams` as specified in "Status shape"; fill them in the state task from the published list and `select`
+- [x] render the per-entry status lines as specified in "Status shape", with no suffix for a one-entry list
+- [x] change `doctor::upstream_reachable` as specified in "`doctor`"
+- [x] change `decision_view` as specified in "`test` / `explain`"
+- [x] add the `upstream` field to verdict records, `LoggedSwitch` and `Logged::Switch`, and both renderings from "Event and log shape"
+- [x] write the status tests `status_lists_every_upstream_in_order`, `status_marks_the_selected_upstream` and `a_single_upstream_status_line_is_unchanged` (byte-for-byte today's line), and update the golden file
+- [x] write the doctor tests `doctor_passes_while_any_upstream_answers` and `doctor_fails_when_no_upstream_answers`, both asserting the detail names every entry; confirm the acceptance test's seven check names are unchanged
+- [x] write the test `test_reports_the_selected_upstream`
+- [x] write the rendering tests `logs_renders_a_verdict_line_with_its_upstream`, `logs_renders_a_switch_line` and confirm `logs_renders_a_verdict_line` (no address) is byte-unchanged; extend the serde-parity test to `SwitchCause`
+- [x] run `mise run check` - must pass before task 8
+- + note: the verdict record's `upstream` comes from the handle itself: `HealthHandle` now wraps the written address it judges beside the verdict (`HealthHandle::judging`, used by `UpstreamEntries::adopted` for a fresh address), so `set_at` - the one place a turnover is seen - names it without a parameter. A `Default` handle judges no address and logs no `upstream` field, so `StubHop`, `DownHop` and an unconfigured daemon write the old shape. A handle kept across a reload keeps the written form of the address it was first created for
+- + note: `StateConfig` gained `hold` (`RETURN_HOLD` by default, `Pace::hold` from `start_paced`) so `status` and `test` select with the hold the dialer uses; `DaemonState::new` now takes the `StateConfig` whole. `UpstreamEntries::at(selected)` and `UpstreamEntries::required(selected)` (the selected entry, or the first while none is selected) are shared by `routed()` and `decision_view`, which takes `Option<&UpstreamAddr>` now
+- + note: `doctor::upstream_reachable(&UpstreamEntries)` spawns one TCP connect per entry; a one-entry list keeps today's detail word for word (`... answered on ..., the verdict is up`, `cannot reach ... on ...: ...`), two or more entries are joined with `; ` as `<addr> reachable, the verdict is up` / `<addr> unreachable, <reason>, the verdict is down`. `status` falls back to today's single line whenever `upstreams` has fewer than two entries, which covers an unconfigured daemon and a daemon older than the field. The extra tests `a_listed_status_prints_one_line_per_upstream_and_marks_the_selected_one`, `upstream_views_follow_the_list_and_mark_only_the_selected_entry`, `a_turnover_names_the_upstream_it_judges` and `logged_reads_the_upstream_of_a_verdict_and_both_sides_of_a_switch` pin the pieces; `upstream_fallback.rs` now reads switch records through `Logged::Switch`
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] a one-entry list behaves as before: every pre-existing test in `nhop/tests/` passes with constructor-only changes, and the decision and verdict goldens are byte-unchanged
-- [ ] `cargo test -p nhop --test upstream_fallback` passes - failover, return after the hold, an open connection surviving the switch, forwards following selection
-- [ ] `cargo test -p nhop selection_follows_the_list_order_and_the_hold every_switch_has_exactly_one_cause` passes
-- [ ] `cargo test -p nhop a_require_dial_with_nothing_up_dials_the_first_entry a_prefer_dial_with_nothing_up_goes_direct_at_once` passes - rule semantics across the list
-- [ ] run the full gate: `mise run check`
+- [x] a one-entry list behaves as before: every pre-existing test in `nhop/tests/` passes with constructor-only changes, and the decision and verdict goldens are byte-unchanged
+- [x] `cargo test -p nhop --test upstream_fallback` passes - failover, return after the hold, an open connection surviving the switch, forwards following selection
+- [x] `cargo test -p nhop selection_follows_the_list_order_and_the_hold every_switch_has_exactly_one_cause` passes
+- [x] `cargo test -p nhop a_require_dial_with_nothing_up_dials_the_first_entry a_prefer_dial_with_nothing_up_goes_direct_at_once` passes - rule semantics across the list
+- [x] run the full gate: `mise run check`
+- + note: against `main`, the pre-existing files in `nhop/tests/` differ only in `TestDaemon::start(&paths, &[addr])`, `daemon.verdict(addr).seed(..)`, the dropped upstream argument of the front-end helpers, and `via: _` / `upstreams: _` in exhaustive destructures (plus `assert_eq!(via, None)` on the direct hops in `decision_log.rs`); the two dialer tests that needed more are the ones recorded under Task 4. No expected line in the decision or verdict rendering tests changed. The `//` and `matches!`/`_ =>` counts are still 5 and 4
 
 ### Task 9: Update documentation
 
@@ -378,12 +401,12 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `packaging/nhop.init.example`
 - Modify: `docs/plans/20261007-fallback-upstreams.md`
 
-- [ ] in `README.md`, document the list form of `nhop upstream`, selection, `RETURN_HOLD` and why it exists, that open connections are never moved, the class table from "Solution Overview", and the new status, log and doctor output
-- [ ] in `README.md`, state the cold-start window: right after the daemon starts, and after a reload that adds addresses, the new entries are `Down` until two agreeing probes (about `confirm_delay` plus the probe time, around a second); during that window `require` dials the first entry, so with the primary off a connection made then can cost the full `REQUIRE_CONNECT_TIMEOUT`
-- [ ] in `README.md`, state the health non-goal: an entry is `Up` when its proxy answers, not when the network behind it works
-- [ ] in `packaging/nhop.init.example`, show a commented two-entry `nhop upstream` line with documentation addresses
-- [ ] in `CLAUDE.md`, add the invariants: each upstream has its own verdict, kept across reloads by address; selection is a pure function of the list, the verdicts and the time, and the selected entry is reported by the dial site (`via`), never re-derived; a switch never touches an accepted connection
-- [ ] move this plan to `docs/plans/completed/`
+- [x] in `README.md`, document the list form of `nhop upstream`, selection, `RETURN_HOLD` and why it exists, that open connections are never moved, the class table from "Solution Overview", and the new status, log and doctor output
+- [x] in `README.md`, state the cold-start window: right after the daemon starts, and after a reload that adds addresses, the new entries are `Down` until two agreeing probes (about `confirm_delay` plus the probe time, around a second); during that window `require` dials the first entry, so with the primary off a connection made then can cost the full `REQUIRE_CONNECT_TIMEOUT`
+- [x] in `README.md`, state the health non-goal: an entry is `Up` when its proxy answers, not when the network behind it works
+- [x] in `packaging/nhop.init.example`, show a commented two-entry `nhop upstream` line with documentation addresses
+- [x] in `CLAUDE.md`, add the invariants: each upstream has its own verdict, kept across reloads by address; selection is a pure function of the list, the verdicts and the time, and the selected entry is reported by the dial site (`via`), never re-derived; a switch never touches an accepted connection
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

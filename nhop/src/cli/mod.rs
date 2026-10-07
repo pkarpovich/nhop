@@ -17,7 +17,7 @@ use nhop_ipc::{
     CheckView, Command, DecisionKind, DecisionView, EffectiveHop, ErrKind, EventView, ForwardView,
     HealthState, Host, LOAD_ID_ENV, LastLoadView, LoadId, LoadOutcome, Paths, Port, Response,
     RuleClass, RuleCountsView, RuleKind, RuleValue, RuleView, StatusView, SystemProxyView,
-    Timestamp, UpstreamAddr,
+    Timestamp, UpstreamAddr, UpstreamView,
 };
 use serde::Serialize;
 
@@ -26,7 +26,9 @@ use crate::cli::system_proxy::{
     Invocation, NetworkService, Networksetup, Privilege, SystemProxyReader,
 };
 use crate::daemon::{self, StartFailure};
-use crate::logging::{self, Logged, LoggedDecision, LoggedVerdict, Window};
+use crate::logging::{
+    self, Logged, LoggedDecision, LoggedSwitch, LoggedVerdict, Window, switch_cause_name,
+};
 use crate::upstream::VerdictCause;
 
 const BINARY: &str = "nhop";
@@ -271,12 +273,15 @@ struct Never {
 }
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
-/// point the router at a SOCKS5 upstream
+/// point the router at SOCKS5 upstreams, the first preferred and the rest as fallbacks in order
 #[argh(subcommand, name = "upstream")]
 struct Upstream {
     /// upstream address, as socks5://host:port
     #[argh(positional, from_str_fn(parse_upstream))]
     addr: UpstreamAddr,
+    /// fallback addresses, in order of preference
+    #[argh(positional, from_str_fn(parse_upstream))]
+    fallbacks: Vec<UpstreamAddr>,
 }
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
@@ -440,9 +445,8 @@ async fn dispatch(
             let command = add_rule(RuleClass::Never, kind, value, load);
             ask(paths, command, Output::Human, out, err).await
         }
-        Subcommand::Upstream(Upstream { addr }) => {
-            let command = Command::SetUpstream { addr, load };
-            ask(paths, command, Output::Human, out, err).await
+        Subcommand::Upstream(Upstream { addr, fallbacks }) => {
+            set_upstreams(paths, Command::upstreams(addr, fallbacks, load), out, err).await
         }
         Subcommand::Listen(Listen { http, socks }) => {
             let command = Command::SetListen { http, socks, load };
@@ -593,6 +597,7 @@ async fn listen_of(paths: &Paths, err: &mut dyn Write) -> Result<crate::proxy::L
                 upstream: _,
                 health: _,
                 health_changed_at: _,
+                upstreams: _,
                 init_path: _,
                 last_load: _,
                 rules: _,
@@ -763,25 +768,56 @@ fn render_log(line: &str, out: &mut dyn Write) -> io::Result<()> {
             Ok(())
         }
         Logged::Verdict(verdict) => render_verdict(&verdict, out),
+        Logged::Switch(switch) => render_switch(&switch, out),
     }
 }
 
 fn render_verdict(verdict: &LoggedVerdict, out: &mut dyn Write) -> io::Result<()> {
     let LoggedVerdict {
         at,
+        upstream,
         from,
         to,
         cause,
     } = verdict;
     let Timestamp(at) = at;
+    let judged = match upstream {
+        Some(UpstreamAddr(upstream)) => format!("{upstream} "),
+        None => String::new(),
+    };
     writeln!(
         out,
-        "{}  verdict {} -> {}  ({})",
+        "{}  verdict {judged}{} -> {}  ({})",
         humantime::format_rfc3339_seconds(*at),
         health_name(*from),
         health_name(*to),
         cause_name(*cause)
     )
+}
+
+fn render_switch(switch: &LoggedSwitch, out: &mut dyn Write) -> io::Result<()> {
+    let LoggedSwitch {
+        at,
+        from,
+        to,
+        cause,
+    } = switch;
+    let Timestamp(at) = at;
+    writeln!(
+        out,
+        "{}  switch {} -> {}  ({})",
+        humantime::format_rfc3339_seconds(*at),
+        switched_name(from.as_ref()),
+        switched_name(to.as_ref()),
+        switch_cause_name(*cause)
+    )
+}
+
+fn switched_name(upstream: Option<&UpstreamAddr>) -> &str {
+    match upstream {
+        Some(UpstreamAddr(upstream)) => upstream,
+        None => "none",
+    }
 }
 
 fn unreadable_log(file: &Path, err: &mut dyn Write) -> Exit {
@@ -813,15 +849,57 @@ async fn ask(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Exit {
-    let answered = client::ask(&paths.socket_file(), &command).await;
-    let response = match answered {
+    let response = match answer(paths, &command, err).await {
         Ok(response) => response,
-        Err(failure) => {
-            let _ = writeln!(err, "nhop: {failure}");
-            return Exit::of_unreachable(&failure);
-        }
+        Err(exit) => return exit,
     };
     render(&response, output, out, err)
+}
+
+/// Sends the command `nhop upstream` built, failing its load when the daemon refuses a list.
+///
+/// A daemon older than fallbacks refuses [`Command::SetUpstreams`] before it reads the load id,
+/// leaving a run that commits on a zero exit, so a refused list within a load is followed by
+/// [`Command::unreadable_upstream`]. A current daemon has already failed the run by then, and
+/// keeps the first command it was rejected on.
+async fn set_upstreams(
+    paths: &Paths,
+    command: Command,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    let Command::SetUpstreams {
+        addr: _,
+        fallbacks: _,
+        load: Some(load),
+    } = command
+    else {
+        return ask(paths, command, Output::Human, out, err).await;
+    };
+    let response = match answer(paths, &command, err).await {
+        Ok(response) => response,
+        Err(exit) => return exit,
+    };
+    let Response::Err {
+        kind: ErrKind::InvalidArgs,
+        message: _,
+    } = &response
+    else {
+        return render(&response, Output::Human, out, err);
+    };
+    let _refused = client::ask(&paths.socket_file(), &Command::unreadable_upstream(load)).await;
+    render(&response, Output::Human, out, err)
+}
+
+async fn answer(paths: &Paths, command: &Command, err: &mut dyn Write) -> Result<Response, Exit> {
+    let answered = client::ask(&paths.socket_file(), command).await;
+    match answered {
+        Ok(response) => Ok(response),
+        Err(failure) => {
+            let _ = writeln!(err, "nhop: {failure}");
+            Err(Exit::of_unreachable(&failure))
+        }
+    }
 }
 
 fn render(response: &Response, output: Output, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
@@ -905,20 +983,18 @@ fn render_status(status: &StatusView, out: &mut dyn Write) {
         upstream,
         health,
         health_changed_at,
+        upstreams,
         init_path,
         last_load,
         rules,
         system_proxy,
     } = status;
-    let UpstreamAddr(upstream) = upstream;
     let RuleCountsView {
         require,
         prefer,
         never,
     } = rules;
     let SystemProxyView { http, https, socks } = system_proxy;
-    let Timestamp(changed_at) = health_changed_at;
-    let changed_at = humantime::format_rfc3339_seconds(*changed_at);
     let _ = writeln!(out, "uptime        {uptime_secs}s");
     let _ = writeln!(
         out,
@@ -936,11 +1012,7 @@ fn render_status(status: &StatusView, out: &mut dyn Write) {
         let Port(port) = port;
         let _ = writeln!(out, "forward       {listen} -> {host}:{port}");
     }
-    let _ = writeln!(
-        out,
-        "upstream      {upstream} {} since {changed_at}",
-        health_name(*health)
-    );
+    render_upstreams(upstream, *health, *health_changed_at, upstreams, out);
     let _ = writeln!(
         out,
         "rules         require {require}, prefer {prefer}, never {never}"
@@ -953,6 +1025,61 @@ fn render_status(status: &StatusView, out: &mut dyn Write) {
         proxy_name(http),
         proxy_name(https),
         proxy_name(socks)
+    );
+}
+
+/// Writes one line per upstream, the first under `upstream` and the rest under `fallback`.
+///
+/// Only a list of two or more marks the selected entry: with one there is nothing to choose
+/// between, so a one-entry list prints the line a single upstream always printed. A daemon older
+/// than the list, or one with no upstream configured, reports only the first address.
+fn render_upstreams(
+    first: &UpstreamAddr,
+    health: HealthState,
+    changed_at: Timestamp,
+    upstreams: &[UpstreamView],
+    out: &mut dyn Write,
+) {
+    let [primary, second, rest @ ..] = upstreams else {
+        render_upstream("upstream", first, health, changed_at, "", out);
+        return;
+    };
+    render_listed("upstream", primary, out);
+    render_listed("fallback", second, out);
+    for fallback in rest {
+        render_listed("fallback", fallback, out);
+    }
+}
+
+fn render_listed(label: &str, upstream: &UpstreamView, out: &mut dyn Write) {
+    let UpstreamView {
+        addr,
+        health,
+        health_changed_at,
+        selected,
+    } = upstream;
+    let mark = match selected {
+        true => " (selected)",
+        false => "",
+    };
+    render_upstream(label, addr, *health, *health_changed_at, mark, out);
+}
+
+fn render_upstream(
+    label: &str,
+    addr: &UpstreamAddr,
+    health: HealthState,
+    changed_at: Timestamp,
+    mark: &str,
+    out: &mut dyn Write,
+) {
+    let UpstreamAddr(addr) = addr;
+    let Timestamp(changed_at) = changed_at;
+    let _ = writeln!(
+        out,
+        "{label:<14}{addr} {} since {}{mark}",
+        health_name(health),
+        humantime::format_rfc3339_seconds(changed_at)
     );
 }
 
@@ -988,6 +1115,7 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         upstream,
         connect_ms,
         hop,
+        via,
         duration_ms,
         error,
     } = event;
@@ -1001,9 +1129,13 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         Some(connect_ms) => format!(" (dial {connect_ms}ms)"),
         None => String::new(),
     };
+    let carried = match via {
+        Some(UpstreamAddr(via)) => format!(" @ {via}"),
+        None => String::new(),
+    };
     let _ = writeln!(
         out,
-        "{host}:{port}  {} via {}{}  upstream {}  {duration_ms}ms{dialled}  {error}",
+        "{host}:{port}  {} via {}{carried}{}  upstream {}  {duration_ms}ms{dialled}  {error}",
         decision_name(*decision),
         rule_name(*rule_index, *class),
         fallen_back(*hop),
@@ -1205,6 +1337,7 @@ mod tests {
             parse(&["upstream", "socks5://192.0.2.10:1080"]),
             Subcommand::Upstream(Upstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: Vec::new(),
             })
         );
         assert_eq!(
@@ -1377,6 +1510,36 @@ mod tests {
         daemon.shutdown().await;
     }
 
+    #[test]
+    fn upstream_takes_several_addresses_in_order() {
+        assert_eq!(
+            parse(&[
+                "upstream",
+                "socks5://192.0.2.10:1080",
+                "socks5://192.0.2.11:1080",
+                "192.0.2.12:1080",
+            ]),
+            Subcommand::Upstream(Upstream {
+                addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: vec![
+                    UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    UpstreamAddr("192.0.2.12:1080".to_owned()),
+                ],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_without_an_address_is_a_usage_error() {
+        let (_home, paths) = temp_paths();
+
+        let (exit, out, err) = invoke(&paths, &["upstream"]).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("addr"), "{err}");
+    }
+
     #[tokio::test]
     async fn an_unknown_rule_kind_exits_four_without_touching_stdout() {
         let (_home, paths) = temp_paths();
@@ -1426,6 +1589,78 @@ mod tests {
         assert!(out.is_empty(), "{out}");
         assert_eq!(err.lines().count(), 1, "{err}");
         assert!(err.contains("nhop start"), "{err}");
+    }
+
+    async fn daemon_before_fallbacks(paths: &Paths) -> tokio::task::JoinHandle<Vec<Command>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        paths.state_dir().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            let mut asked = Vec::new();
+            loop {
+                let idle = Duration::from_millis(200);
+                let Ok(accepted) = tokio::time::timeout(idle, listener.accept()).await else {
+                    return asked;
+                };
+                let (stream, _address) = accepted.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let read = serde_json::from_str::<Command>(&line);
+                let refusal = Response::Err {
+                    kind: ErrKind::InvalidArgs,
+                    message: "unknown variant `set_upstreams`".to_owned(),
+                };
+                let mut wire = serde_json::to_vec(&refusal).unwrap();
+                wire.push(b'\n');
+                writer.write_all(&wire).await.unwrap();
+                asked.push(read.unwrap());
+            }
+        })
+    }
+
+    fn primary_and_fallback(load: Option<LoadId>) -> Command {
+        Command::upstreams(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![UpstreamAddr("socks5://192.0.2.11:1080".to_owned())],
+            load,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_list_refused_within_a_load_fails_the_run_on_a_command_every_daemon_reads() {
+        let (_home, paths) = temp_paths();
+        let daemon = daemon_before_fallbacks(&paths).await;
+        let command = primary_and_fallback(Some(LoadId(7)));
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let exit = set_upstreams(&paths, command.clone(), &mut out, &mut err).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("set_upstreams"), "{err}");
+        let poison = Command::unreadable_upstream(LoadId(7));
+        assert_eq!(daemon.await.unwrap(), [command, poison.clone()]);
+        let Command::SetUpstream { addr, load: _ } = poison else {
+            panic!("the poison must be the command every daemon parses: {poison:?}");
+        };
+        assert!(crate::proxy::Upstream::parse(addr).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_list_refused_outside_a_load_is_sent_alone() {
+        let (_home, paths) = temp_paths();
+        let daemon = daemon_before_fallbacks(&paths).await;
+        let command = primary_and_fallback(None);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let exit = set_upstreams(&paths, command.clone(), &mut out, &mut err).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        assert_eq!(daemon.await.unwrap(), [command]);
     }
 
     #[test]
@@ -1887,6 +2122,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_line_carried_by_an_upstream_names_it() {
+        let (_home, paths) = temp_paths();
+        let carried = r#"{"timestamp":"2026-10-07T09:12:30Z","level":"INFO","fields":{"host":"git.corp.example","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","connect_ms":37,"hop":"upstream","via":"socks5://192.0.2.11:1080","duration_ms":1204},"target":"nhop::logging"}"#;
+        write_log(&paths, "2026-10-07", &[carried.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some(
+                "2026-10-07T09:12:30Z  git.corp.example:443  upstream via rule 2 (require) @ socks5://192.0.2.11:1080  upstream up  1204ms (dial 37ms)  -"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn logs_renders_a_verdict_line() {
         let (_home, paths) = temp_paths();
         let turnover = r#"{"timestamp":"2026-09-03T19:28:46Z","level":"INFO","fields":{"verdict_from":"up","verdict_to":"down","cause":"dial"},"target":"nhop::upstream::health"}"#;
@@ -1899,6 +2152,46 @@ mod tests {
         assert_eq!(
             out.lines().next(),
             Some("2026-09-03T19:28:46Z  verdict up -> down  (dial)")
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_renders_a_verdict_line_with_its_upstream() {
+        let (_home, paths) = temp_paths();
+        let turnover = r#"{"timestamp":"2026-10-07T09:12:31Z","level":"INFO","fields":{"upstream":"socks5://192.0.2.11:1080","verdict_from":"up","verdict_to":"down","cause":"dial"},"target":"nhop::upstream::health"}"#;
+        write_log(&paths, "2026-10-07", &[turnover.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some("2026-10-07T09:12:31Z  verdict socks5://192.0.2.11:1080 up -> down  (dial)")
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_renders_a_switch_line() {
+        let (_home, paths) = temp_paths();
+        let left = r#"{"timestamp":"2026-10-07T09:12:31Z","level":"INFO","fields":{"upstream_from":"socks5://192.0.2.10:1080","upstream_to":"socks5://192.0.2.11:1080","switch_cause":"down"},"target":"nhop::upstream::select"}"#;
+        let lost = r#"{"timestamp":"2026-10-07T09:12:32Z","level":"INFO","fields":{"upstream_from":"socks5://192.0.2.11:1080","upstream_to":"","switch_cause":"down"},"target":"nhop::upstream::select"}"#;
+        let found = r#"{"timestamp":"2026-10-07T09:12:33Z","level":"INFO","fields":{"upstream_from":"","upstream_to":"socks5://192.0.2.10:1080","switch_cause":"recovered"},"target":"nhop::upstream::select"}"#;
+        write_log(
+            &paths,
+            "2026-10-07",
+            &[left.to_owned(), lost.to_owned(), found.to_owned()],
+        );
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out,
+            "2026-10-07T09:12:31Z  switch socks5://192.0.2.10:1080 -> socks5://192.0.2.11:1080  (down)\n\
+             2026-10-07T09:12:32Z  switch socks5://192.0.2.11:1080 -> none  (down)\n\
+             2026-10-07T09:12:33Z  switch none -> socks5://192.0.2.10:1080  (recovered)\n"
         );
     }
 
@@ -1977,6 +2270,100 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(document.is_array(), "{out}");
         assert!(err.is_empty());
+    }
+
+    fn changed_at() -> Timestamp {
+        Timestamp(humantime::parse_rfc3339("2026-02-02T02:40:00Z").unwrap())
+    }
+
+    fn upstream_view(addr: &str, health: HealthState, selected: bool) -> UpstreamView {
+        UpstreamView {
+            addr: UpstreamAddr(addr.to_owned()),
+            health,
+            health_changed_at: changed_at(),
+            selected,
+        }
+    }
+
+    fn status_text(upstreams: Vec<UpstreamView>) -> String {
+        let status = StatusView {
+            uptime_secs: 3600,
+            http_listen: "127.0.0.1:7890".parse().unwrap(),
+            http_bound: true,
+            socks_listen: "127.0.0.1:7891".parse().unwrap(),
+            socks_bound: true,
+            forwards: Vec::new(),
+            upstream: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            health: HealthState::Up,
+            health_changed_at: changed_at(),
+            upstreams,
+            init_path: None,
+            last_load: None,
+            rules: RuleCountsView {
+                require: 0,
+                prefer: 0,
+                never: 0,
+            },
+            system_proxy: SystemProxyView {
+                http: None,
+                https: None,
+                socks: None,
+            },
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        render(
+            &Response::Status(Box::new(status)),
+            Output::Human,
+            &mut out,
+            &mut err,
+        );
+        assert!(err.is_empty());
+        String::from_utf8(out).unwrap()
+    }
+
+    fn upstream_lines(text: &str) -> Vec<&str> {
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            if line.starts_with("upstream ") || line.starts_with("fallback ") {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn a_single_upstream_status_line_is_unchanged() {
+        let today = "upstream      socks5://192.0.2.10:1080 up since 2026-02-02T02:40:00Z";
+
+        let listed = status_text(vec![upstream_view(
+            "socks5://192.0.2.10:1080",
+            HealthState::Up,
+            true,
+        )]);
+        let older = status_text(Vec::new());
+
+        assert_eq!(upstream_lines(&listed), vec![today]);
+        assert_eq!(upstream_lines(&older), vec![today]);
+        assert_eq!(listed, older);
+    }
+
+    #[test]
+    fn a_listed_status_prints_one_line_per_upstream_and_marks_the_selected_one() {
+        let text = status_text(vec![
+            upstream_view("socks5://192.0.2.10:1080", HealthState::Down, false),
+            upstream_view("socks5://192.0.2.11:1080", HealthState::Up, true),
+            upstream_view("socks5://192.0.2.12:1080", HealthState::Down, false),
+        ]);
+
+        assert_eq!(
+            upstream_lines(&text),
+            vec![
+                "upstream      socks5://192.0.2.10:1080 down since 2026-02-02T02:40:00Z",
+                "fallback      socks5://192.0.2.11:1080 up since 2026-02-02T02:40:00Z (selected)",
+                "fallback      socks5://192.0.2.12:1080 down since 2026-02-02T02:40:00Z",
+            ]
+        );
     }
 
     #[test]

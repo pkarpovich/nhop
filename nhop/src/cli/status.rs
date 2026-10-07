@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use nhop_ipc::{LastLoadView, RuleCountsView, StatusView, Timestamp, UpstreamAddr};
+use nhop_ipc::{LastLoadView, RuleCountsView, StatusView, Timestamp, UpstreamAddr, UpstreamView};
 use serde_json::Value;
 
 use crate::cli::system_proxy::SystemProxy;
 use crate::daemon::state::BindState;
 use crate::proxy::{Forwards, Listen};
-use crate::upstream::Health;
+use crate::upstream::{Health, UpstreamEntries};
 
 /// Everything `status` reports that the daemon knows without asking macOS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,8 @@ pub struct DaemonStatus {
     pub upstream: UpstreamAddr,
     /// Verdict on the upstream and the instant it settled.
     pub health: Health,
+    /// Every configured upstream in order of preference, each with its verdict.
+    pub upstreams: Vec<UpstreamView>,
     /// Init script the daemon remembers, absent until one is run.
     pub init_path: Option<PathBuf>,
     /// Result of the most recent run, absent until one finishes.
@@ -40,6 +42,7 @@ pub fn status_view(state: &DaemonStatus, proxy: &SystemProxy) -> StatusView {
         forwards,
         upstream,
         health,
+        upstreams,
         init_path,
         last_load,
         rules,
@@ -56,11 +59,30 @@ pub fn status_view(state: &DaemonStatus, proxy: &SystemProxy) -> StatusView {
         upstream: upstream.clone(),
         health: *state,
         health_changed_at: Timestamp(*changed_at),
+        upstreams: upstreams.clone(),
         init_path: init_path.clone(),
         last_load: last_load.clone(),
         rules: *rules,
         system_proxy: proxy.view(),
     }
+}
+
+/// Lists the published upstreams in order, marking the one new connections go through.
+///
+/// `selected` is the index [`UpstreamEntries::selected`] returned for the same list, so the mark
+/// says which entry a dial made at that instant would take.
+pub fn upstream_views(entries: &UpstreamEntries, selected: Option<usize>) -> Vec<UpstreamView> {
+    let mut views = Vec::with_capacity(entries.as_slice().len());
+    for (index, entry) in entries.as_slice().iter().enumerate() {
+        let Health { state, changed_at } = entry.health().verdict();
+        views.push(UpstreamView {
+            addr: entry.upstream().written().clone(),
+            health: state,
+            health_changed_at: Timestamp(changed_at),
+            selected: selected == Some(index),
+        });
+    }
+    views
 }
 
 /// Renders the document `status --json` prints, without asking macOS anything.
@@ -78,7 +100,7 @@ mod tests {
     use nhop_ipc::{ForwardView, HealthState, Host, LoadOutcome, Port, SystemProxyView};
 
     use crate::cli::system_proxy::{ProxyEndpoint, parse};
-    use crate::proxy::{Forward, Target};
+    use crate::proxy::{Forward, Target, Upstreams};
 
     use super::*;
 
@@ -117,6 +139,20 @@ mod tests {
                 state: HealthState::Up,
                 changed_at,
             },
+            upstreams: vec![
+                UpstreamView {
+                    addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                    health: HealthState::Up,
+                    health_changed_at: settled(),
+                    selected: true,
+                },
+                UpstreamView {
+                    addr: UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    health: HealthState::Down,
+                    health_changed_at: settled(),
+                    selected: false,
+                },
+            ],
             init_path: Some(PathBuf::from("/Users/operator/.config/nhop/init")),
             last_load: Some(LastLoadView {
                 at: settled(),
@@ -161,6 +197,7 @@ mod tests {
             upstream,
             health,
             health_changed_at,
+            upstreams,
             init_path,
             last_load,
             rules,
@@ -185,6 +222,7 @@ mod tests {
         );
         assert_eq!(health, HealthState::Up);
         assert_eq!(health_changed_at, settled());
+        assert_eq!(upstreams, loaded().upstreams);
         assert_eq!(
             init_path,
             Some(PathBuf::from("/Users/operator/.config/nhop/init"))
@@ -213,6 +251,44 @@ mod tests {
                 socks: Some("127.0.0.1:7891".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn upstream_views_follow_the_list_and_mark_only_the_selected_entry() {
+        let upstreams = Upstreams::parse(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![UpstreamAddr("socks5://192.0.2.11:1080".to_owned())],
+        )
+        .unwrap();
+        let entries = UpstreamEntries::default().adopted(&upstreams);
+        entries.as_slice()[1].health().seed(HealthState::Up);
+        let Health {
+            state: _,
+            changed_at,
+        } = entries.as_slice()[1].health().verdict();
+
+        let views = upstream_views(&entries, Some(1));
+
+        assert_eq!(views.len(), 2, "{views:?}");
+        let UpstreamView {
+            addr,
+            health,
+            health_changed_at: _,
+            selected,
+        } = &views[0];
+        assert_eq!(addr, &UpstreamAddr("socks5://192.0.2.10:1080".to_owned()));
+        assert_eq!(*health, HealthState::Down);
+        assert!(!selected);
+        assert_eq!(
+            views[1],
+            UpstreamView {
+                addr: UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                health: HealthState::Up,
+                health_changed_at: Timestamp(changed_at),
+                selected: true,
+            }
+        );
+        assert!(!upstream_views(&entries, None)[1].selected);
     }
 
     #[test]

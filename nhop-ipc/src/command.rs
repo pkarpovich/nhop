@@ -106,10 +106,24 @@ pub enum Command {
         /// Init run this command belongs to, absent outside a load.
         load: Option<LoadId>,
     },
-    /// `set_upstream` - points the router at a SOCKS5 upstream.
+    /// `set_upstream` - points the router at a single SOCKS5 upstream.
     SetUpstream {
         /// Address of the upstream proxy.
         addr: UpstreamAddr,
+        /// Init run this command belongs to, absent outside a load.
+        load: Option<LoadId>,
+    },
+    /// `set_upstreams` - points the router at an ordered list of SOCKS5 upstreams.
+    ///
+    /// A command of its own rather than a field added to `set_upstream`, because a daemon older
+    /// than fallbacks would ignore an unknown field and answer `ok` with only the first upstream
+    /// configured, while it refuses an unknown command. [`Command::upstreams`] picks between the
+    /// two, so one address keeps reaching every daemon.
+    SetUpstreams {
+        /// Address of the first upstream proxy, the one preferred over every fallback.
+        addr: UpstreamAddr,
+        /// Upstreams after `addr`, in order of preference.
+        fallbacks: Vec<UpstreamAddr>,
         /// Init run this command belongs to, absent outside a load.
         load: Option<LoadId>,
     },
@@ -159,6 +173,45 @@ pub enum Command {
     Subscribe,
 }
 
+impl Command {
+    /// Returns the command pointing the router at `addr` followed by `fallbacks`, in order.
+    ///
+    /// One address goes out as [`Command::SetUpstream`], the shape every daemon reads, and a list
+    /// as [`Command::SetUpstreams`], which a daemon without fallbacks refuses instead of keeping
+    /// only the first entry.
+    pub fn upstreams(
+        addr: UpstreamAddr,
+        fallbacks: Vec<UpstreamAddr>,
+        load: Option<LoadId>,
+    ) -> Self {
+        match fallbacks.is_empty() {
+            true => Self::SetUpstream { addr, load },
+            false => Self::SetUpstreams {
+                addr,
+                fallbacks,
+                load,
+            },
+        }
+    }
+
+    /// Returns a `set_upstream` for `load` naming an address no daemon reads, so the run fails.
+    ///
+    /// Sent after a daemon refused [`Command::SetUpstreams`] within a load. A daemon older than
+    /// fallbacks refuses that line while parsing it, before it reads the load id, so its staged run
+    /// would still commit on a zero exit - and an init script need not stop at a failed command.
+    /// Every daemon parses this one and refuses the address inside the run, failing it as a
+    /// rejected `nhop upstream` line fails any run.
+    pub fn unreadable_upstream(load: LoadId) -> Self {
+        Self::SetUpstream {
+            addr: UpstreamAddr(UNREADABLE_UPSTREAM.to_owned()),
+            load: Some(load),
+        }
+    }
+}
+
+/// Address [`Command::unreadable_upstream`] sends, worded for the error it comes back in.
+const UNREADABLE_UPSTREAM: &str = "upstream fallbacks need a newer nhop daemon";
+
 /// One reply written by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "resp", content = "data", rename_all = "snake_case")]
@@ -206,7 +259,7 @@ mod tests {
 
     use crate::view::{
         DecisionKind, ForwardView, HealthState, LastLoadView, LoadOutcome, RuleCountsView,
-        SystemProxyView, Timestamp,
+        SystemProxyView, Timestamp, UpstreamView,
     };
 
     use super::*;
@@ -243,6 +296,14 @@ mod tests {
             Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
                 load: None,
+            },
+            Command::SetUpstreams {
+                addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: vec![
+                    UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    UpstreamAddr("socks5://192.0.2.12:1080".to_owned()),
+                ],
+                load: Some(LoadId(4)),
             },
             Command::SetListen {
                 http: "127.0.0.1:7890".parse().unwrap(),
@@ -287,6 +348,20 @@ mod tests {
             upstream: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
             health: HealthState::Down,
             health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
+            upstreams: vec![
+                UpstreamView {
+                    addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                    health: HealthState::Down,
+                    health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
+                    selected: false,
+                },
+                UpstreamView {
+                    addr: UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    health: HealthState::Up,
+                    health_changed_at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_000)),
+                    selected: true,
+                },
+            ],
             init_path: Some(PathBuf::from("/home/operator/.config/nhop/init")),
             last_load: Some(LastLoadView {
                 at: Timestamp(UNIX_EPOCH + Duration::from_secs(1_770_000_001)),
@@ -336,6 +411,7 @@ mod tests {
                 upstream: HealthState::Up,
                 connect_ms: Some(4),
                 hop: Some(crate::EffectiveHop::Direct),
+                via: None,
                 duration_ms: 12,
                 error: Some("reset by peer".to_owned()),
             }),
@@ -377,6 +453,63 @@ mod tests {
             wire,
             r#"{"cmd":"add_forward","listen":"127.0.0.1:19000","host":"api.example.com","port":9000,"load":null}"#
         );
+    }
+
+    #[test]
+    fn a_single_upstream_command_serializes_as_before() {
+        let before = r#"{"cmd":"set_upstream","addr":"socks5://192.0.2.10:1080","load":7}"#;
+        let command = Command::upstreams(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            Vec::new(),
+            Some(LoadId(7)),
+        );
+
+        assert_eq!(serde_json::to_string(&command).unwrap(), before);
+        assert_eq!(serde_json::from_str::<Command>(before).unwrap(), command);
+    }
+
+    #[test]
+    fn a_fallback_list_travels_after_the_first_upstream_in_order() {
+        let wire = serde_json::to_string(&Command::upstreams(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![
+                UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                UpstreamAddr("socks5://192.0.2.12:1080".to_owned()),
+            ],
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            wire,
+            r#"{"cmd":"set_upstreams","addr":"socks5://192.0.2.10:1080","fallbacks":["socks5://192.0.2.11:1080","socks5://192.0.2.12:1080"],"load":null}"#
+        );
+    }
+
+    #[test]
+    fn a_fallback_list_is_unreadable_as_a_single_upstream() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "cmd", rename_all = "snake_case")]
+        enum BeforeFallbacks {
+            SetUpstream {
+                addr: UpstreamAddr,
+                load: Option<LoadId>,
+            },
+        }
+        let wire = serde_json::to_string(&Command::upstreams(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![UpstreamAddr("socks5://192.0.2.11:1080".to_owned())],
+            None,
+        ))
+        .unwrap();
+
+        let read = serde_json::from_str::<BeforeFallbacks>(&wire);
+
+        match read {
+            Ok(BeforeFallbacks::SetUpstream { addr, load }) => {
+                panic!("an older daemon would keep only {addr:?} for load {load:?}")
+            }
+            Err(_refused) => {}
+        }
     }
 
     #[test]

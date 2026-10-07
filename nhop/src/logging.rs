@@ -5,13 +5,14 @@ use std::time::{Duration, SystemTime};
 
 use nhop_ipc::{
     DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp,
+    UpstreamAddr,
 };
 use serde::Deserialize;
 use tracing::Subscriber;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::EnvFilter;
 
-use crate::upstream::VerdictCause;
+use crate::upstream::{SwitchCause, VerdictCause};
 
 /// Number of daily log files kept, the one being written included.
 pub const KEPT_FILES: usize = 7;
@@ -76,6 +77,7 @@ pub fn decision(event: &EventView) {
         upstream,
         connect_ms,
         hop,
+        via,
         duration_ms,
         error,
     } = event;
@@ -90,6 +92,7 @@ pub fn decision(event: &EventView) {
         upstream = health_name(*upstream),
         connect_ms = *connect_ms,
         hop = hop.map(hop_name),
+        via = via.as_ref().map(|UpstreamAddr(via)| via.as_str()),
         duration_ms = *duration_ms,
         error = error.as_deref(),
     );
@@ -196,9 +199,22 @@ pub struct LoggedDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedVerdict {
     pub at: Timestamp,
+    /// Upstream whose verdict turned over, absent on a line written before lines named it.
+    pub upstream: Option<UpstreamAddr>,
     pub from: HealthState,
     pub to: HealthState,
     pub cause: VerdictCause,
+}
+
+/// One move of new connections between upstreams read back out of the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedSwitch {
+    pub at: Timestamp,
+    /// Upstream new connections left, absent when none was selected.
+    pub from: Option<UpstreamAddr>,
+    /// Upstream new connections go through now, absent when none is selected.
+    pub to: Option<UpstreamAddr>,
+    pub cause: SwitchCause,
 }
 
 /// One record of the log that says something a reader can be shown.
@@ -208,18 +224,30 @@ pub enum Logged {
     Decision(LoggedDecision),
     /// A turnover of the upstream verdict.
     Verdict(LoggedVerdict),
+    /// A move of new connections from one upstream to another.
+    Switch(LoggedSwitch),
 }
 
 #[derive(Debug, Deserialize)]
 struct VerdictFields {
+    #[serde(default)]
+    upstream: Option<UpstreamAddr>,
     verdict_from: HealthState,
     verdict_to: HealthState,
     cause: VerdictCause,
 }
 
+#[derive(Debug, Deserialize)]
+struct SwitchFields {
+    upstream_from: UpstreamAddr,
+    upstream_to: UpstreamAddr,
+    switch_cause: SwitchCause,
+}
+
 /// Reads back what a log line records, absent when it records something with no rendering.
 ///
-/// A decision is tried first: its required fields make a verdict line fail to parse as one.
+/// A decision is tried first: its required fields make a verdict line fail to parse as one. A
+/// switch is tried after both, so a record kind added later cannot shadow either of them.
 pub fn logged(line: &str) -> Option<Logged> {
     let Ok(line) = serde_json::from_str::<serde_json::Value>(line) else {
         return None;
@@ -230,20 +258,44 @@ pub fn logged(line: &str) -> Option<Logged> {
     if let Ok(event) = serde_json::from_value::<EventView>(fields.clone()) {
         return Some(Logged::Decision(LoggedDecision { at, event }));
     }
-    let Ok(verdict) = serde_json::from_value::<VerdictFields>(fields.clone()) else {
+    if let Ok(verdict) = serde_json::from_value::<VerdictFields>(fields.clone()) {
+        let VerdictFields {
+            upstream,
+            verdict_from,
+            verdict_to,
+            cause,
+        } = verdict;
+        return Some(Logged::Verdict(LoggedVerdict {
+            at,
+            upstream,
+            from: verdict_from,
+            to: verdict_to,
+            cause,
+        }));
+    }
+    let Ok(switch) = serde_json::from_value::<SwitchFields>(fields.clone()) else {
         return None;
     };
-    let VerdictFields {
-        verdict_from,
-        verdict_to,
-        cause,
-    } = verdict;
-    Some(Logged::Verdict(LoggedVerdict {
+    let SwitchFields {
+        upstream_from,
+        upstream_to,
+        switch_cause,
+    } = switch;
+    Some(Logged::Switch(LoggedSwitch {
         at,
-        from: verdict_from,
-        to: verdict_to,
-        cause,
+        from: named(upstream_from),
+        to: named(upstream_to),
+        cause: switch_cause,
     }))
+}
+
+/// Reads a switch side back, where the empty string the line carries for none means absent.
+fn named(upstream: UpstreamAddr) -> Option<UpstreamAddr> {
+    let UpstreamAddr(written) = &upstream;
+    if written.is_empty() {
+        return None;
+    }
+    Some(upstream)
 }
 
 fn stamped(line: &str) -> Option<SystemTime> {
@@ -308,6 +360,15 @@ pub(crate) fn cause_name(cause: VerdictCause) -> &'static str {
     }
 }
 
+pub(crate) fn switch_cause_name(cause: SwitchCause) -> &'static str {
+    match cause {
+        SwitchCause::Down => "down",
+        SwitchCause::Held => "held",
+        SwitchCause::Recovered => "recovered",
+        SwitchCause::Reload => "reload",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -325,6 +386,8 @@ mod tests {
         upstream: HealthState,
         connect_ms: Option<u64>,
         hop: Option<EffectiveHop>,
+        #[serde(default)]
+        via: Option<UpstreamAddr>,
         duration_ms: u64,
         error: Option<String>,
     }
@@ -345,6 +408,7 @@ mod tests {
             upstream: HealthState::Up,
             connect_ms: Some(2),
             hop: Some(EffectiveHop::Upstream),
+            via: Some(UpstreamAddr("socks5://192.0.2.11:1080".to_owned())),
             duration_ms: 17,
             error: Some("reset by peer".to_owned()),
         }
@@ -360,6 +424,7 @@ mod tests {
             upstream: HealthState::Down,
             connect_ms: None,
             hop: None,
+            via: None,
             duration_ms: 4,
             error: None,
         }
@@ -409,6 +474,7 @@ mod tests {
             upstream,
             connect_ms,
             hop,
+            via,
             duration_ms,
             error,
         } = matched();
@@ -423,11 +489,13 @@ mod tests {
                 upstream,
                 connect_ms,
                 hop,
+                via,
                 duration_ms,
                 error,
             }
         );
         let absent = fields_of(&lines[1]);
+        assert_eq!(absent.via, None);
         assert_eq!(absent.rule_index, None);
         assert_eq!(absent.connect_ms, None);
         assert_eq!(absent.hop, None);
@@ -536,12 +604,40 @@ mod tests {
             logged(verdict),
             Some(Logged::Verdict(LoggedVerdict {
                 at: Timestamp(humantime::parse_rfc3339("2026-09-03T19:28:46Z").unwrap()),
+                upstream: None,
                 from: HealthState::Up,
                 to: HealthState::Down,
                 cause: VerdictCause::Dial,
             }))
         );
         assert_eq!(logged(noise), None);
+    }
+
+    #[test]
+    fn logged_reads_the_upstream_of_a_verdict_and_both_sides_of_a_switch() {
+        let verdict = r#"{"timestamp":"2026-10-07T09:12:31Z","level":"INFO","fields":{"upstream":"socks5://192.0.2.11:1080","verdict_from":"up","verdict_to":"down","cause":"probe"},"target":"nhop::upstream::health"}"#;
+        let switch = r#"{"timestamp":"2026-10-07T09:12:32Z","level":"INFO","fields":{"upstream_from":"socks5://192.0.2.11:1080","upstream_to":"","switch_cause":"down"},"target":"nhop::upstream::select"}"#;
+        let at = |at: &str| Timestamp(humantime::parse_rfc3339(at).unwrap());
+
+        assert_eq!(
+            logged(verdict),
+            Some(Logged::Verdict(LoggedVerdict {
+                at: at("2026-10-07T09:12:31Z"),
+                upstream: Some(UpstreamAddr("socks5://192.0.2.11:1080".to_owned())),
+                from: HealthState::Up,
+                to: HealthState::Down,
+                cause: VerdictCause::Probe,
+            }))
+        );
+        assert_eq!(
+            logged(switch),
+            Some(Logged::Switch(LoggedSwitch {
+                at: at("2026-10-07T09:12:32Z"),
+                from: Some(UpstreamAddr("socks5://192.0.2.11:1080".to_owned())),
+                to: None,
+                cause: SwitchCause::Down,
+            }))
+        );
     }
 
     #[test]
@@ -623,6 +719,18 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&cause).unwrap(),
                 format!("\"{}\"", cause_name(cause))
+            );
+        }
+        let switches = [
+            SwitchCause::Down,
+            SwitchCause::Held,
+            SwitchCause::Recovered,
+            SwitchCause::Reload,
+        ];
+        for cause in switches {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{}\"", switch_cause_name(cause))
             );
         }
     }

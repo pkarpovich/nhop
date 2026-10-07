@@ -9,13 +9,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nhop::daemon::{self, Daemon};
+use nhop::daemon::{self, Daemon, Pace};
+use nhop::logging;
 use nhop::proxy::{Dialled, Listen, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleId};
-use nhop_ipc::{Command, EffectiveHop, Host, Paths, Port, Response, UpstreamAddr};
+use nhop::upstream::HealthHandle;
+use nhop_ipc::{Command, EffectiveHop, HealthState, Host, Paths, Port, Response, UpstreamAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tracing::Dispatch;
+use tracing::dispatcher::DefaultGuard;
+use tracing::subscriber::NoSubscriber;
 
 const NO_AUTH: [u8; 2] = [0x05, 0x00];
 const GRANTED: [u8; 10] = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
@@ -53,6 +58,28 @@ impl io::Write for Shared {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// A daemon log installed as this thread's subscriber for as long as it is held.
+///
+/// tracing caches process-wide whether a callsite is wanted, and while exactly one dispatcher is
+/// registered it asks only the default of the thread that reaches the callsite first. A daemon in
+/// a parallel test reaching a callsite before this one would then silence it here for good. The
+/// silent dispatcher kept beside the log makes every registration ask all live dispatchers.
+#[derive(Debug)]
+pub struct ScopedLog {
+    installed: DefaultGuard,
+    silent: Dispatch,
+}
+
+impl ScopedLog {
+    /// Writes the log of the daemon at `paths` from this thread until the value is dropped.
+    pub fn install(paths: &Paths) -> Self {
+        let silent = Dispatch::new(NoSubscriber::default());
+        let subscriber = logging::subscriber(paths).unwrap();
+        let installed = tracing::subscriber::set_default(subscriber);
+        Self { installed, silent }
     }
 }
 
@@ -231,12 +258,63 @@ pub enum Answers {
     Slow(Duration),
 }
 
+fn serve_socks5(
+    listener: TcpListener,
+    answers: Answers,
+    requests: Arc<Mutex<Vec<SocksRequest>>>,
+) -> Serving {
+    Serving(tokio::spawn(async move {
+        let mut arrived = 0usize;
+        let mut held = Vec::new();
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            arrived += 1;
+            let requests = requests.clone();
+            match answers {
+                Answers::Always => {
+                    tokio::spawn(async move {
+                        let _served = socks5(stream, requests).await;
+                    });
+                }
+                Answers::Once => {
+                    tokio::spawn(async move {
+                        let _served = socks5(stream, requests).await;
+                    });
+                    return;
+                }
+                Answers::AfterOneDrop => {
+                    if arrived == 1 {
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let _served = socks5(stream, requests).await;
+                    });
+                }
+                Answers::Never => held.push(stream),
+                Answers::Slow(delay) => {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _served = socks5(stream, requests).await;
+                    });
+                }
+            }
+        }
+    }))
+}
+
 /// SOCKS5 upstream that records every request and echoes the payload that follows.
+///
+/// [`StubSocks5::stop`] and [`StubSocks5::restart`] are the shape of an upstream host that is
+/// turned off and on again: the listener goes away and comes back on the same address, while the
+/// connections it already relays keep echoing, as a dropped listener leaves them.
 #[derive(Debug)]
 pub struct StubSocks5 {
     addr: SocketAddr,
+    answers: Answers,
     requests: Arc<Mutex<Vec<SocksRequest>>>,
-    serving: Serving,
+    serving: Option<Serving>,
 }
 
 impl StubSocks5 {
@@ -248,53 +326,45 @@ impl StubSocks5 {
         let listener = TcpListener::bind(ephemeral()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let serving = Serving(tokio::spawn({
-            let requests = requests.clone();
-            async move {
-                let mut arrived = 0usize;
-                let mut held = Vec::new();
-                loop {
-                    let Ok((stream, _peer)) = listener.accept().await else {
-                        return;
-                    };
-                    arrived += 1;
-                    let requests = requests.clone();
-                    match answers {
-                        Answers::Always => {
-                            tokio::spawn(async move {
-                                let _served = socks5(stream, requests).await;
-                            });
-                        }
-                        Answers::Once => {
-                            tokio::spawn(async move {
-                                let _served = socks5(stream, requests).await;
-                            });
-                            return;
-                        }
-                        Answers::AfterOneDrop => {
-                            if arrived == 1 {
-                                continue;
-                            }
-                            tokio::spawn(async move {
-                                let _served = socks5(stream, requests).await;
-                            });
-                        }
-                        Answers::Never => held.push(stream),
-                        Answers::Slow(delay) => {
-                            tokio::spawn(async move {
-                                tokio::time::sleep(delay).await;
-                                let _served = socks5(stream, requests).await;
-                            });
-                        }
-                    }
-                }
-            }
-        }));
+        let serving = serve_socks5(listener, answers, requests.clone());
         Self {
             addr,
+            answers,
+            requests,
+            serving: Some(serving),
+        }
+    }
+
+    /// Closes the listener, so every dial to the upstream is refused until [`Self::restart`].
+    ///
+    /// Returns once the listening socket is released: the accept task is awaited after the abort,
+    /// since an aborted task drops its listener only when the runtime next polls it.
+    pub async fn stop(&mut self) {
+        let Self {
+            addr: _,
+            answers: _,
+            requests: _,
+            serving,
+        } = self;
+        let Some(Serving(accepting)) = serving else {
+            return;
+        };
+        accepting.abort();
+        let _stopped = accepting.await;
+        *serving = None;
+    }
+
+    /// Listens again on the address the stub had, answering as it did before [`Self::stop`].
+    pub async fn restart(&mut self) {
+        self.stop().await;
+        let Self {
+            addr,
+            answers,
             requests,
             serving,
-        }
+        } = self;
+        let listener = TcpListener::bind(*addr).await.unwrap();
+        *serving = Some(serve_socks5(listener, *answers, requests.clone()));
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -413,9 +483,14 @@ impl NextHop for StubHop {
         Box::pin(async move {
             Dialled::Attempted {
                 hop: EffectiveHop::Direct,
+                via: None,
                 next: TcpStream::connect(self.target).await,
             }
         })
+    }
+
+    fn verdict(&self) -> HealthState {
+        HealthState::Down
     }
 }
 
@@ -462,11 +537,16 @@ impl NextHop for DownHop {
                     tokio::time::sleep(took).await;
                     Dialled::Attempted {
                         hop: EffectiveHop::Upstream,
+                        via: Some(UpstreamAddr(format!("socks5://{upstream}"))),
                         next: Err(refused),
                     }
                 }
             }
         })
+    }
+
+    fn verdict(&self) -> HealthState {
+        HealthState::Down
     }
 }
 
@@ -479,14 +559,28 @@ pub struct TestDaemon {
 }
 
 impl TestDaemon {
-    pub async fn start(paths: &Paths, upstream: SocketAddr) -> Self {
-        let daemon = daemon::start_on(paths, ephemeral_listen()).unwrap();
+    /// Starts a daemon dialling `upstreams` in the order given, the first one preferred.
+    pub async fn start(paths: &Paths, upstreams: &[SocketAddr]) -> Self {
+        Self::paced(paths, upstreams, Pace::PRODUCTION).await
+    }
+
+    /// Starts a daemon like [`Self::start`] whose patrol and return hold run at `pace`.
+    pub async fn paced(paths: &Paths, upstreams: &[SocketAddr], pace: Pace) -> Self {
+        let Some((first, rest)) = upstreams.split_first() else {
+            panic!("a test daemon is pointed at one upstream at least");
+        };
+        let mut fallbacks = Vec::with_capacity(rest.len());
+        for fallback in rest {
+            fallbacks.push(UpstreamAddr(format!("socks5://{fallback}")));
+        }
+        let daemon = daemon::start_paced(paths, ephemeral_listen(), pace).unwrap();
         let answer = daemon
             .state()
-            .call(Command::SetUpstream {
-                addr: UpstreamAddr(format!("socks5://{upstream}")),
-                load: None,
-            })
+            .call(Command::upstreams(
+                UpstreamAddr(format!("socks5://{first}")),
+                fallbacks,
+                None,
+            ))
             .await;
         assert_eq!(answer, Response::Ok, "the upstream must be accepted");
         let Listen { http, socks } = daemon.listen();
@@ -511,6 +605,16 @@ impl TestDaemon {
 
     pub fn state(&self) -> &nhop::daemon::state::StateHandle {
         self.daemon.state()
+    }
+
+    /// Returns the verdict the daemon holds on one published upstream.
+    pub fn verdict(&self, upstream: SocketAddr) -> HealthHandle {
+        for entry in self.daemon.state().live().upstream().snapshot().as_slice() {
+            if entry.upstream().socket() == upstream {
+                return entry.health().clone();
+            }
+        }
+        panic!("{upstream} is not a published upstream");
     }
 
     pub async fn call(&self, command: Command) -> Response {

@@ -1,6 +1,6 @@
-use nhop_ipc::{LoadId, RuleClass, RuleKind, RuleValue};
+use nhop_ipc::{LoadId, RuleClass, RuleKind, RuleValue, UpstreamAddr};
 
-use crate::proxy::{DuplicateForward, Forward, Forwards, Listen, Upstream};
+use crate::proxy::{DuplicateForward, Forward, Forwards, Listen, UnusableUpstreams, Upstreams};
 use crate::rules::{InvalidRule, Ruleset};
 
 /// Command an init run was rejected on, named as it appears on the wire.
@@ -8,8 +8,10 @@ use crate::rules::{InvalidRule, Ruleset};
 pub enum FailedCommand {
     /// The value could not be read as its kind.
     AddRule,
-    /// The address could not be read.
+    /// The single upstream could not be read.
     SetUpstream,
+    /// An address of a list with fallbacks could not be read, or was listed twice.
+    SetUpstreams,
     /// The front ends could not be moved to the address.
     SetListen,
     /// The address was declared twice, or could not be bound.
@@ -22,6 +24,7 @@ impl FailedCommand {
         match self {
             Self::AddRule => "add_rule",
             Self::SetUpstream => "set_upstream",
+            Self::SetUpstreams => "set_upstreams",
             Self::SetListen => "set_listen",
             Self::AddForward => "add_forward",
         }
@@ -33,8 +36,8 @@ impl FailedCommand {
 pub struct Committed {
     /// Rules the run declared, in declaration order.
     pub rules: Ruleset,
-    /// Upstream the run set, absent when it set none.
-    pub upstream: Option<Upstream>,
+    /// Upstreams the run set, absent when it set none.
+    pub upstream: Option<Upstreams>,
     /// Front-end addresses the run set, absent when it set none.
     pub listen: Option<Listen>,
     /// Forwards the run declared, in declaration order.
@@ -49,7 +52,7 @@ pub struct Committed {
 #[derive(Debug, Default)]
 pub struct Staging {
     rules: Ruleset,
-    upstream: Option<Upstream>,
+    upstream: Option<Upstreams>,
     listen: Option<Listen>,
     forwards: Forwards,
     failed: Option<FailedCommand>,
@@ -80,9 +83,32 @@ impl Staging {
         self.rules = Ruleset::default();
     }
 
-    /// Points the run at an upstream.
-    pub fn set_upstream(&mut self, upstream: Upstream) {
-        self.upstream = Some(upstream);
+    /// Points the run at an ordered list of upstreams, replacing any list staged before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnusableUpstreams`] when an address cannot be read or is listed twice, and marks
+    /// the run as failed so that it is discarded even if the script goes on to exit zero. The run
+    /// fails on `set_upstream` for one address and on `set_upstreams` for a list, the command
+    /// [`nhop_ipc::Command::upstreams`] sends for each.
+    pub fn set_upstream(
+        &mut self,
+        first: UpstreamAddr,
+        fallbacks: Vec<UpstreamAddr>,
+    ) -> Result<(), UnusableUpstreams> {
+        let sent = match fallbacks.is_empty() {
+            true => FailedCommand::SetUpstream,
+            false => FailedCommand::SetUpstreams,
+        };
+        let upstreams = match Upstreams::parse(first, fallbacks) {
+            Ok(upstreams) => upstreams,
+            Err(failure) => {
+                self.fail(sent);
+                return Err(failure);
+            }
+        };
+        self.upstream = Some(upstreams);
+        Ok(())
     }
 
     /// Moves the front ends the run commits.
@@ -150,9 +176,9 @@ impl LoadIds {
 
 #[cfg(test)]
 mod tests {
-    use nhop_ipc::{Host, Port, UpstreamAddr};
+    use nhop_ipc::{Host, Port};
 
-    use crate::proxy::Target;
+    use crate::proxy::{DuplicateUpstream, Target};
     use crate::rules::{Decision, RuleId};
 
     use super::*;
@@ -178,8 +204,16 @@ mod tests {
         }
     }
 
-    fn upstream(written: &str) -> Upstream {
-        Upstream::parse(UpstreamAddr(written.to_owned())).unwrap()
+    fn addr(written: &str) -> UpstreamAddr {
+        UpstreamAddr(written.to_owned())
+    }
+
+    fn upstreams(first: &str, fallbacks: &[&str]) -> Upstreams {
+        let mut rest = Vec::new();
+        for written in fallbacks {
+            rest.push(addr(written));
+        }
+        Upstreams::parse(addr(first), rest).unwrap()
     }
 
     #[test]
@@ -251,9 +285,13 @@ mod tests {
     #[test]
     fn the_upstream_and_the_listen_addresses_travel_with_the_run() {
         let mut staging = Staging::default();
-        staging.set_upstream(upstream("socks5://192.0.2.10:1080"));
+        staging
+            .set_upstream(addr("socks5://192.0.2.10:1080"), Vec::new())
+            .unwrap();
         staging.set_listen(listen());
-        staging.set_upstream(upstream("socks5://192.0.2.11:1080"));
+        staging
+            .set_upstream(addr("socks5://192.0.2.11:1080"), Vec::new())
+            .unwrap();
 
         let Committed {
             rules: _,
@@ -262,8 +300,94 @@ mod tests {
             forwards: _,
         } = staging.commit();
 
-        assert_eq!(staged_upstream, Some(upstream("socks5://192.0.2.11:1080")));
+        assert_eq!(
+            staged_upstream,
+            Some(upstreams("socks5://192.0.2.11:1080", &[]))
+        );
         assert_eq!(staged, Some(listen()));
+    }
+
+    #[test]
+    fn a_second_upstream_line_replaces_the_whole_list() {
+        let mut staging = Staging::default();
+        staging
+            .set_upstream(
+                addr("socks5://192.0.2.10:1080"),
+                vec![
+                    addr("socks5://192.0.2.11:1080"),
+                    addr("socks5://192.0.2.12:1080"),
+                ],
+            )
+            .unwrap();
+        staging
+            .set_upstream(
+                addr("socks5://192.0.2.20:1080"),
+                vec![addr("socks5://192.0.2.10:1080")],
+            )
+            .unwrap();
+
+        let Committed {
+            rules: _,
+            upstream,
+            listen: _,
+            forwards: _,
+        } = staging.commit();
+
+        assert_eq!(
+            upstream,
+            Some(upstreams(
+                "socks5://192.0.2.20:1080",
+                &["socks5://192.0.2.10:1080"]
+            ))
+        );
+    }
+
+    #[test]
+    fn a_repeated_upstream_address_fails_the_command() {
+        let mut staging = Staging::default();
+        staging
+            .set_upstream(addr("socks5://192.0.2.10:1080"), Vec::new())
+            .unwrap();
+
+        let refused = staging
+            .set_upstream(
+                addr("socks5://192.0.2.11:1080"),
+                vec![addr("socks5://192.0.2.12:1080"), addr("192.0.2.11:1080")],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            refused,
+            UnusableUpstreams::Duplicate(DuplicateUpstream("192.0.2.11:1080".parse().unwrap()))
+        );
+        assert!(refused.to_string().contains("192.0.2.11:1080"), "{refused}");
+        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstreams));
+        let Committed {
+            rules: _,
+            upstream,
+            listen: _,
+            forwards: _,
+        } = staging.commit();
+        assert_eq!(upstream, Some(upstreams("socks5://192.0.2.10:1080", &[])));
+    }
+
+    #[test]
+    fn an_unreadable_fallback_fails_the_command() {
+        let mut staging = Staging::default();
+
+        let refused = staging
+            .set_upstream(
+                addr("socks5://192.0.2.10:1080"),
+                vec![addr("socks5://fallback.example.com:1080")],
+            )
+            .unwrap_err();
+
+        assert!(
+            refused.to_string().contains("fallback.example.com"),
+            "{refused}"
+        );
+        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstreams));
+        assert_eq!(FailedCommand::SetUpstreams.name(), "set_upstreams");
     }
 
     #[test]

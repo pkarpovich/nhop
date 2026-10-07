@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use nhop::proxy::{ConnCtx, EventTx, NextHop, socks5};
 use nhop::rules::{Decision, Host, Port, RuleClass, RuleId, RuleKind, RuleValue, Ruleset};
-use nhop::upstream::HealthHandle;
 use nhop_ipc::{DecisionKind, EventView, Paths};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,22 +70,18 @@ fn never(value: &str) -> Ruleset {
     rules
 }
 
-fn ctx_of(rules: Ruleset, upstream: SocketAddr) -> ConnCtx {
+fn ctx_of(rules: Ruleset) -> ConnCtx {
     ConnCtx {
         rules: Arc::new(rules),
-        health: HealthHandle::default(),
-        upstream,
         events: EventTx::default(),
     }
 }
 
-fn watched(rules: Ruleset, upstream: SocketAddr) -> (ConnCtx, mpsc::Receiver<EventView>) {
+fn watched(rules: Ruleset) -> (ConnCtx, mpsc::Receiver<EventView>) {
     let events = EventTx::default();
     let decisions = events.subscribe();
     let ctx = ConnCtx {
         rules: Arc::new(rules),
-        health: HealthHandle::default(),
-        upstream,
         events,
     };
     (ctx, decisions)
@@ -164,7 +159,7 @@ async fn echoed(mut client: TcpStream, payload: &[u8]) -> Vec<u8> {
 async fn an_ipv4_request_tunnels_to_the_destination() {
     let (_home, paths) = temp_paths();
     let origin = StubOrigin::start().await;
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
 
     let client = connected(daemon.socks_addr(), &ipv4_request(origin.addr())).await;
 
@@ -177,7 +172,7 @@ async fn an_ipv4_request_tunnels_to_the_destination() {
 async fn a_domain_request_reaches_the_next_hop_as_a_name() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let front = serve_once(ctx_of(require("example.com"), ephemeral()), hop.clone()).await;
+    let front = serve_once(ctx_of(require("example.com")), hop.clone()).await;
 
     let client = connected(front, &domain_request("example.com", 443)).await;
 
@@ -199,7 +194,7 @@ async fn a_domain_request_reaches_the_next_hop_as_a_name() {
 async fn an_ipv6_request_reaches_the_next_hop_as_an_address() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let front = serve_once(ctx_of(Ruleset::default(), ephemeral()), hop.clone()).await;
+    let front = serve_once(ctx_of(Ruleset::default()), hop.clone()).await;
 
     let client = connected(front, &ipv6_request(Ipv6Addr::LOCALHOST, 80)).await;
 
@@ -214,7 +209,7 @@ async fn an_ipv6_request_reaches_the_next_hop_as_an_address() {
 async fn an_ipv4_request_reaches_the_next_hop_as_an_address() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let front = serve_once(ctx_of(Ruleset::default(), ephemeral()), hop.clone()).await;
+    let front = serve_once(ctx_of(Ruleset::default()), hop.clone()).await;
 
     let client = connected(front, &ipv4_request("127.0.0.1:8443".parse().unwrap())).await;
 
@@ -229,7 +224,7 @@ async fn an_ipv4_request_reaches_the_next_hop_as_an_address() {
 async fn a_request_for_the_front_ends_own_address_is_refused_before_any_dial() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let front = serve_once(ctx_of(Ruleset::default(), ephemeral()), hop.clone()).await;
+    let front = serve_once(ctx_of(Ruleset::default()), hop.clone()).await;
 
     let reply = reply_to(front, &ipv4_request(front)).await;
 
@@ -242,7 +237,7 @@ async fn a_request_for_the_front_ends_own_address_is_refused_before_any_dial() {
 async fn the_front_ends_own_address_by_name_is_refused_identically() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let front = serve_once(ctx_of(Ruleset::default(), ephemeral()), hop.clone()).await;
+    let front = serve_once(ctx_of(Ruleset::default()), hop.clone()).await;
 
     let reply = reply_to(front, &domain_request("localhost", front.port())).await;
 
@@ -255,7 +250,7 @@ async fn the_front_ends_own_address_by_name_is_refused_identically() {
 async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, mut decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, mut decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop).await;
 
     let reply = reply_to(front, &ipv4_request(front)).await;
@@ -276,7 +271,7 @@ async fn a_refused_loop_is_published_as_one_decision_carrying_the_refusal() {
 async fn a_never_rule_matching_the_front_ends_own_name_does_not_bypass_the_refusal() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, mut decisions) = watched(never("localhost"), ephemeral());
+    let (ctx, mut decisions) = watched(never("localhost"));
     let front = serve_once(ctx, hop.clone()).await;
 
     let reply = reply_to(front, &domain_request("localhost", front.port())).await;
@@ -299,7 +294,7 @@ async fn a_never_rule_matching_the_front_ends_own_name_does_not_bypass_the_refus
 #[tokio::test]
 async fn a_bind_request_is_refused_as_a_command_not_supported() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let mut request = ipv4_request("127.0.0.1:443".parse().unwrap());
     request[1] = 0x02;
 
@@ -312,7 +307,7 @@ async fn a_bind_request_is_refused_as_a_command_not_supported() {
 #[tokio::test]
 async fn a_udp_associate_request_is_refused_as_a_command_not_supported() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let mut request = ipv4_request("127.0.0.1:443".parse().unwrap());
     request[1] = 0x03;
 
@@ -325,7 +320,7 @@ async fn a_udp_associate_request_is_refused_as_a_command_not_supported() {
 #[tokio::test]
 async fn an_unknown_address_type_is_refused() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
 
     let reply = reply_to(daemon.socks_addr(), &[0x05, 0x01, 0x00, 0x02, 0, 0]).await;
 
@@ -336,7 +331,7 @@ async fn an_unknown_address_type_is_refused() {
 #[tokio::test]
 async fn a_client_offering_no_supported_method_is_turned_away() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
 
     let mut client = TcpStream::connect(daemon.socks_addr()).await.unwrap();
     client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
@@ -350,7 +345,7 @@ async fn a_client_offering_no_supported_method_is_turned_away() {
 #[tokio::test]
 async fn a_destination_that_refuses_the_dial_is_answered_with_a_general_failure() {
     let (_home, paths) = temp_paths();
-    let daemon = TestDaemon::start(&paths, ephemeral()).await;
+    let daemon = TestDaemon::start(&paths, &[ephemeral()]).await;
     let closed = closed_port().await;
 
     let reply = reply_to(daemon.socks_addr(), &ipv4_request(closed)).await;
@@ -363,7 +358,7 @@ async fn a_destination_that_refuses_the_dial_is_answered_with_a_general_failure(
 async fn a_require_rule_is_refused_as_host_unreachable_while_the_upstream_is_down() {
     let upstream: SocketAddr = "192.0.2.10:1080".parse().unwrap();
     let front = serve_once(
-        ctx_of(require("example.com"), upstream),
+        ctx_of(require("example.com")),
         Arc::new(DownHop::new(upstream, Refusal::BeforeDialling)),
     )
     .await;
@@ -377,7 +372,7 @@ async fn a_require_rule_is_refused_as_host_unreachable_while_the_upstream_is_dow
 async fn the_dial_time_covers_the_dial_alone_while_the_duration_covers_the_whole_connection() {
     let origin = StubOrigin::start().await;
     let hop = Arc::new(StubHop::new(origin.addr()));
-    let (ctx, mut decisions) = watched(Ruleset::default(), ephemeral());
+    let (ctx, mut decisions) = watched(Ruleset::default());
     let front = serve_once(ctx, hop).await;
 
     let client = connected(front, &ipv4_request(origin.addr())).await;
@@ -395,7 +390,7 @@ async fn the_dial_time_covers_the_dial_alone_while_the_duration_covers_the_whole
 #[tokio::test]
 async fn a_require_refusal_reports_no_dial_time() {
     let upstream: SocketAddr = "192.0.2.10:1080".parse().unwrap();
-    let (ctx, mut decisions) = watched(require("example.com"), upstream);
+    let (ctx, mut decisions) = watched(require("example.com"));
     let front = serve_once(
         ctx,
         Arc::new(DownHop::new(upstream, Refusal::BeforeDialling)),
@@ -412,7 +407,7 @@ async fn a_require_refusal_reports_no_dial_time() {
 #[tokio::test]
 async fn a_dial_that_failed_upstream_side_still_reports_what_it_cost() {
     let upstream: SocketAddr = "192.0.2.10:1080".parse().unwrap();
-    let (ctx, mut decisions) = watched(require("example.com"), upstream);
+    let (ctx, mut decisions) = watched(require("example.com"));
     let front = serve_once(
         ctx,
         Arc::new(DownHop::new(

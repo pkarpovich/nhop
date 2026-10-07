@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::doctor;
 use crate::cli::explain;
-use crate::cli::status::{DaemonStatus, status_view};
+use crate::cli::status::{DaemonStatus, status_view, upstream_views};
 use crate::cli::system_proxy::{
     NetworkService, NoSystemProxy, ProxyFailure, SystemProxy, SystemProxyReader,
 };
@@ -22,11 +22,10 @@ use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
 use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
 use crate::proxy::{
-    ConnCtx, DuplicateForward, EventTx, Forward, Forwards, InvalidUpstream, Listen, NO_UPSTREAM,
-    Upstream,
+    ConnCtx, DuplicateForward, EventTx, Forward, Forwards, Listen, UnusableUpstreams, Upstreams,
 };
 use crate::rules::{InvalidRule, Ruleset};
-use crate::upstream::HealthHandle;
+use crate::upstream::{Health, RETURN_HOLD, UpstreamEntries};
 
 /// Address the HTTP front end binds until the init script moves it.
 pub const DEFAULT_HTTP_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890);
@@ -87,27 +86,25 @@ impl LiveRules {
     }
 }
 
-/// Upstream serving traffic, published the same way the ruleset is.
-#[derive(Debug, Clone)]
-pub struct LiveUpstream(Arc<ArcSwap<SocketAddr>>);
-
-impl Default for LiveUpstream {
-    fn default() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(NO_UPSTREAM)))
-    }
-}
+/// Upstreams serving traffic, each with its verdict, published the same way the ruleset is.
+///
+/// Only the state task publishes, so a publication reads the list it replaces without racing
+/// another one.
+#[derive(Debug, Clone, Default)]
+pub struct LiveUpstream(Arc<ArcSwap<UpstreamEntries>>);
 
 impl LiveUpstream {
-    /// Returns the address new connections are handed to at this instant.
-    pub fn snapshot(&self) -> SocketAddr {
+    /// Returns the entries new connections are handed to at this instant.
+    pub fn snapshot(&self) -> Arc<UpstreamEntries> {
         let Self(live) = self;
-        **live.load()
+        live.load_full()
     }
 
-    /// Swaps in an address for connections accepted from now on.
-    pub fn publish(&self, addr: SocketAddr) {
+    /// Swaps in a list for connections accepted from now on, keeping the verdict of every address
+    /// the list in force already names.
+    pub fn publish(&self, upstreams: &Upstreams) {
         let Self(live) = self;
-        live.store(Arc::new(addr));
+        live.rcu(|published| published.adopted(upstreams));
     }
 }
 
@@ -116,7 +113,6 @@ impl LiveUpstream {
 pub struct Live {
     rules: LiveRules,
     upstream: LiveUpstream,
-    health: HealthHandle,
     events: EventTx,
 }
 
@@ -125,14 +121,11 @@ impl Live {
     pub fn accepted(&self) -> ConnCtx {
         let Self {
             rules,
-            upstream,
-            health,
+            upstream: _,
             events,
         } = self;
         ConnCtx {
             rules: rules.snapshot(),
-            health: health.clone(),
-            upstream: upstream.snapshot(),
             events: events.clone(),
         }
     }
@@ -145,11 +138,6 @@ impl Live {
     /// Returns the upstream publication.
     pub fn upstream(&self) -> &LiveUpstream {
         &self.upstream
-    }
-
-    /// Returns the upstream verdict.
-    pub fn health(&self) -> &HealthHandle {
-        &self.health
     }
 
     /// Returns the fan-out the front ends publish their decisions to.
@@ -171,6 +159,8 @@ pub struct StateConfig {
     pub load_timeout: Duration,
     /// Where `status` reads the system proxy settings from.
     pub proxy: Arc<dyn SystemProxyReader>,
+    /// Return hold `status` and `test` select an upstream with, the one the dialer uses.
+    pub hold: Duration,
 }
 
 impl Default for StateConfig {
@@ -184,6 +174,7 @@ impl Default for StateConfig {
             },
             load_timeout: LOAD_TIMEOUT,
             proxy: Arc::new(NoSystemProxy),
+            hold: RETURN_HOLD,
         }
     }
 }
@@ -228,24 +219,10 @@ fn state_gone() -> Response {
 
 /// Starts the state task and returns the handle every command travels through.
 pub fn spawn(paths: &Paths, config: StateConfig) -> StateHandle {
-    let StateConfig {
-        live,
-        frontends,
-        listen,
-        load_timeout,
-        proxy,
-    } = config;
     let (requests, inbox) = mpsc::channel(REQUEST_CAPACITY);
     let (finished, completions) = mpsc::channel(1);
-    let state = DaemonState::new(
-        paths.clone(),
-        live.clone(),
-        frontends,
-        listen,
-        load_timeout,
-        proxy,
-        finished,
-    );
+    let state = DaemonState::new(paths.clone(), config, finished);
+    let live = state.live.clone();
     tokio::spawn(serve(state, inbox, completions));
     StateHandle { requests, live }
 }
@@ -338,27 +315,28 @@ struct DaemonState {
     http_listen: SocketAddr,
     socks_listen: SocketAddr,
     forwards: Forwards,
-    upstream: UpstreamAddr,
+    unconfigured: Health,
     init_path: Option<PathBuf>,
     last_load: Option<LastLoadView>,
     load_ids: LoadIds,
     load: Option<InFlight>,
     load_timeout: Duration,
     proxy: Arc<dyn SystemProxyReader>,
+    hold: Duration,
     service: NetworkService,
     finished: mpsc::Sender<ScriptOutcome>,
 }
 
 impl DaemonState {
-    fn new(
-        paths: Paths,
-        live: Live,
-        frontends: Frontends,
-        listen: Listen,
-        load_timeout: Duration,
-        proxy: Arc<dyn SystemProxyReader>,
-        finished: mpsc::Sender<ScriptOutcome>,
-    ) -> Self {
+    fn new(paths: Paths, config: StateConfig, finished: mpsc::Sender<ScriptOutcome>) -> Self {
+        let StateConfig {
+            live,
+            frontends,
+            listen,
+            load_timeout,
+            proxy,
+            hold,
+        } = config;
         let Listen { http, socks } = listen;
         Self {
             started: Instant::now(),
@@ -368,13 +346,14 @@ impl DaemonState {
             http_listen: http,
             socks_listen: socks,
             forwards: Forwards::default(),
-            upstream: UpstreamAddr(String::new()),
+            unconfigured: Health::default(),
             init_path: None,
             last_load: None,
             load_ids: LoadIds::default(),
             load: None,
             load_timeout,
             proxy,
+            hold,
             service: NetworkService::default(),
             finished,
         }
@@ -398,7 +377,15 @@ impl DaemonState {
                 answer(reply, response);
             }
             Command::SetUpstream { addr, load } => {
-                let response = self.set_upstream(addr, load);
+                let response = self.set_upstream(addr, Vec::new(), load);
+                answer(reply, response);
+            }
+            Command::SetUpstreams {
+                addr,
+                fallbacks,
+                load,
+            } => {
+                let response = self.set_upstream(addr, fallbacks, load);
                 answer(reply, response);
             }
             Command::SetListen { http, socks, load } => {
@@ -492,28 +479,26 @@ impl DaemonState {
         }
     }
 
-    fn set_upstream(&mut self, addr: UpstreamAddr, load: Option<LoadId>) -> Response {
+    fn set_upstream(
+        &mut self,
+        addr: UpstreamAddr,
+        fallbacks: Vec<UpstreamAddr>,
+        load: Option<LoadId>,
+    ) -> Response {
         match self.target(load) {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => {
-                let upstream = match Upstream::parse(addr) {
-                    Ok(upstream) => upstream,
-                    Err(failure) => {
-                        self.fail_staged();
-                        return unreadable(&failure);
-                    }
+            Target::Staged => self.staged(|staged| {
+                let Err(failure) = staged.set_upstream(addr, fallbacks) else {
+                    return Response::Ok;
                 };
-                self.staged(|staged| {
-                    staged.set_upstream(upstream);
-                    Response::Ok
-                })
-            }
+                unreadable(&failure)
+            }),
             Target::Live => {
-                let upstream = match Upstream::parse(addr) {
-                    Ok(upstream) => upstream,
+                let upstreams = match Upstreams::parse(addr, fallbacks) {
+                    Ok(upstreams) => upstreams,
                     Err(failure) => return unreadable(&failure),
                 };
-                self.adopt_upstream(Some(upstream));
+                self.adopt_upstream(Some(upstreams));
                 Response::Ok
             }
         }
@@ -555,18 +540,6 @@ impl DaemonState {
                 unopenable(&failure)
             }
         }
-    }
-
-    fn fail_staged(&mut self) {
-        let Some(InFlight {
-            id: _,
-            staged,
-            reply: _,
-        }) = &mut self.load
-        else {
-            return;
-        };
-        staged.fail(FailedCommand::SetUpstream);
     }
 
     fn rebind(&mut self, listen: Listen) -> io::Result<()> {
@@ -747,17 +720,26 @@ impl DaemonState {
         Ok(())
     }
 
-    fn publish(&mut self, rules: Ruleset, upstream: Option<Upstream>) {
+    fn publish(&mut self, rules: Ruleset, upstream: Option<Upstreams>) {
         self.live.rules().publish(rules);
         self.adopt_upstream(upstream);
     }
 
-    fn adopt_upstream(&mut self, upstream: Option<Upstream>) {
-        let Some(upstream) = upstream else {
+    fn adopt_upstream(&mut self, upstreams: Option<Upstreams>) {
+        let Some(upstreams) = upstreams else {
             return;
         };
-        self.upstream = upstream.written().clone();
-        self.live.upstream().publish(upstream.socket());
+        self.live.upstream().publish(&upstreams);
+    }
+
+    /// Returns the first entry's address and verdict, the pair `status` reports on its own.
+    ///
+    /// While no upstream is configured that is an empty address, `Down` since the state task began.
+    fn first(&self, entries: &UpstreamEntries) -> (UpstreamAddr, Health) {
+        let Some(entry) = entries.first() else {
+            return (UpstreamAddr(String::new()), self.unconfigured);
+        };
+        (entry.upstream().written().clone(), entry.health().verdict())
     }
 
     fn bind_state(&self) -> BindState {
@@ -785,12 +767,10 @@ impl DaemonState {
         let listen = self.listen();
         let service = self.service.clone();
         let reading = self.reading_proxy();
-        let written = self.upstream.clone();
-        let upstream = self.live.upstream().snapshot();
-        let health = self.live.health().verdict();
+        let entries = self.live.upstream().snapshot();
         tokio::spawn(async move {
             findings.push(doctor::system_proxy(reading.await, listen, &service));
-            findings.push(doctor::upstream_reachable(&written, upstream, health).await);
+            findings.push(doctor::upstream_reachable(&entries).await);
             answer(reply, Response::Doctor(doctor::report(&findings)));
         });
     }
@@ -822,13 +802,17 @@ impl DaemonState {
 
     fn daemon_status(&self) -> DaemonStatus {
         let rules = self.live.rules().snapshot();
+        let entries = self.live.upstream().snapshot();
+        let (upstream, health) = self.first(&entries);
+        let selected = entries.selected(SystemTime::now(), self.hold);
         DaemonStatus {
             uptime_secs: self.started.elapsed().as_secs(),
             listen: self.listen(),
             bound: self.bind_state(),
             forwards: self.forwards.clone(),
-            upstream: self.upstream.clone(),
-            health: self.live.health().verdict(),
+            upstream,
+            health,
+            upstreams: upstream_views(&entries, selected),
             init_path: self.init_path.clone(),
             last_load: self.last_load.clone(),
             rules: RuleCountsView {
@@ -844,7 +828,12 @@ impl DaemonState {
     }
 
     fn decision(&self, host: &Host, port: Port) -> DecisionView {
-        explain::decision_view(&self.live.rules().snapshot(), &self.upstream, host, port)
+        let entries = self.live.upstream().snapshot();
+        let selected = entries.selected(SystemTime::now(), self.hold);
+        let upstream = entries
+            .required(selected)
+            .map(|entry| entry.upstream().written());
+        explain::decision_view(&self.live.rules().snapshot(), upstream, host, port)
     }
 }
 
@@ -874,7 +863,7 @@ fn invalid(failure: &InvalidRule) -> Response {
     }
 }
 
-fn unreadable(failure: &InvalidUpstream) -> Response {
+fn unreadable(failure: &UnusableUpstreams) -> Response {
     Response::Err {
         kind: ErrKind::InvalidArgs,
         message: failure.to_string(),
@@ -930,6 +919,7 @@ mod tests {
 
     use nhop_ipc::{
         DecisionKind, ForwardView, HealthState, RuleKind, RuleValue, StatusView, SystemProxyView,
+        UpstreamView,
     };
 
     use crate::cli::system_proxy::ProxyEndpoint;
@@ -1716,11 +1706,13 @@ mod tests {
             upstream,
             health,
             health_changed_at: _,
+            upstreams,
             init_path,
             last_load,
             rules,
             system_proxy,
         } = status;
+        assert_eq!(upstreams, Vec::new());
         assert_eq!(http_listen, DEFAULT_HTTP_LISTEN);
         assert_eq!(socks_listen, DEFAULT_SOCKS_LISTEN);
         assert!(!http_bound);
@@ -1869,6 +1861,117 @@ mod tests {
                 socks: None,
             }
         );
+    }
+
+    const PRIMARY: &str = "socks5://192.0.2.10:1080";
+    const FALLBACK: &str = "socks5://192.0.2.11:1080";
+    const LAST: &str = "socks5://192.0.2.12:1080";
+
+    async fn listed(state: &StateHandle) {
+        let answer = state
+            .call(Command::SetUpstreams {
+                addr: UpstreamAddr(PRIMARY.to_owned()),
+                fallbacks: vec![
+                    UpstreamAddr(FALLBACK.to_owned()),
+                    UpstreamAddr(LAST.to_owned()),
+                ],
+                load: None,
+            })
+            .await;
+        assert_eq!(answer, Response::Ok);
+    }
+
+    fn seed_up(state: &StateHandle, index: usize) {
+        let entries = state.live().upstream().snapshot();
+        entries.as_slice()[index].health().seed(HealthState::Up);
+    }
+
+    fn marks(status: &StatusView) -> Vec<(String, HealthState, bool)> {
+        let mut marks = Vec::new();
+        for upstream in &status.upstreams {
+            let UpstreamView {
+                addr: UpstreamAddr(addr),
+                health,
+                health_changed_at: _,
+                selected,
+            } = upstream;
+            marks.push((addr.clone(), *health, *selected));
+        }
+        marks
+    }
+
+    #[tokio::test]
+    async fn status_lists_every_upstream_in_order() {
+        let (_home, state) = spawn_here();
+        listed(&state).await;
+
+        let status = status_of(&state).await;
+
+        assert_eq!(
+            marks(&status),
+            vec![
+                (PRIMARY.to_owned(), HealthState::Down, false),
+                (FALLBACK.to_owned(), HealthState::Down, false),
+                (LAST.to_owned(), HealthState::Down, false),
+            ]
+        );
+        assert_eq!(status.upstream, UpstreamAddr(PRIMARY.to_owned()));
+        assert_eq!(status.health, HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn status_marks_the_selected_upstream() {
+        let (_home, state) = spawn_here();
+        listed(&state).await;
+        seed_up(&state, 1);
+
+        let status = status_of(&state).await;
+
+        assert_eq!(
+            marks(&status),
+            vec![
+                (PRIMARY.to_owned(), HealthState::Down, false),
+                (FALLBACK.to_owned(), HealthState::Up, true),
+                (LAST.to_owned(), HealthState::Down, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reports_the_selected_upstream() {
+        let (_home, state) = spawn_here();
+        listed(&state).await;
+        state.rules().publish(ruleset(&[(
+            RuleClass::Require,
+            RuleKind::Suffix,
+            "example.com",
+        )]));
+
+        assert_eq!(
+            next_hop(&state).await,
+            PRIMARY,
+            "with nothing up, require dials the first"
+        );
+
+        seed_up(&state, 1);
+        assert_eq!(next_hop(&state).await, FALLBACK);
+    }
+
+    async fn next_hop(state: &StateHandle) -> String {
+        let asked = Command::Test {
+            host: Host("api.example.com".to_owned()),
+            port: Port(443),
+        };
+        let Response::Decision(DecisionView {
+            decision: _,
+            rule_index: _,
+            class: _,
+            next_hop,
+        }) = state.call(asked).await
+        else {
+            panic!("test must answer with a decision");
+        };
+        next_hop
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ pub async fn serve(
 ) -> io::Result<()> {
     let Target { host, port } = target;
     let decision = ctx.rules.decide(host, *port);
-    let mut routed = Routed::begun(&ctx, host, *port, decision);
+    let mut routed = Routed::begun(&ctx, hop.verdict(), host, *port, decision);
     let served = match own_address(&client, host, *port) {
         Loop::Own(listening) => refuse_loop(listening, &mut routed),
         Loop::Elsewhere => relay(&mut client, host, *port, decision, hop, &mut routed).await,

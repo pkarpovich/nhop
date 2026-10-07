@@ -135,6 +135,19 @@ pub struct ForwardView {
     pub port: Port,
 }
 
+/// One upstream of the configured list, with its own verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamView {
+    /// Address of the upstream as the init script wrote it.
+    pub addr: UpstreamAddr,
+    /// Current verdict on this upstream alone.
+    pub health: HealthState,
+    /// When this upstream's verdict last changed.
+    pub health_changed_at: Timestamp,
+    /// Whether new connections go through this upstream at the time of the snapshot.
+    pub selected: bool,
+}
+
 /// Proxy settings macOS reports for the configured network service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemProxyView {
@@ -162,12 +175,16 @@ pub struct StatusView {
     /// Forward front ends, in declaration order; absent on a daemon older than the field.
     #[serde(default)]
     pub forwards: Vec<ForwardView>,
-    /// Address of the upstream proxy.
+    /// Address of the first upstream of the list, the one preferred over every other.
     pub upstream: UpstreamAddr,
-    /// Current upstream verdict.
+    /// Current verdict on the first upstream.
     pub health: HealthState,
-    /// When the verdict last changed.
+    /// When the first upstream's verdict last changed.
     pub health_changed_at: Timestamp,
+    /// Every configured upstream in order of preference, empty until a load names one; absent on a
+    /// daemon older than the field.
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamView>,
     /// Init script the daemon remembers, absent until one is run.
     pub init_path: Option<PathBuf>,
     /// Result of the most recent run, absent until one finishes.
@@ -202,7 +219,7 @@ pub struct EventView {
     pub rule_index: Option<u32>,
     /// Class of the matching rule, absent when no rule matched.
     pub class: Option<RuleClass>,
-    /// Upstream verdict at the time of the decision.
+    /// Verdict of the upstream selected at the time of the decision, down while none is selected.
     pub upstream: HealthState,
     /// How long the dial phase took, absent when no dial was attempted.
     ///
@@ -219,6 +236,14 @@ pub struct EventView {
     /// Absent as well on a line written before the field existed.
     #[serde(default)]
     pub hop: Option<EffectiveHop>,
+    /// Upstream that carried the connection, as the operator wrote it, present only when `hop` is
+    /// [`EffectiveHop::Upstream`].
+    ///
+    /// The dial site names the entry it dialled, so the line says which of several upstreams
+    /// served the connection without re-deriving it from a selection made later.
+    /// Absent as well on a line written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<UpstreamAddr>,
     /// How long the connection lasted.
     pub duration_ms: u64,
     /// Why the connection ended badly, absent when it did not.
@@ -277,6 +302,7 @@ mod tests {
             upstream: HealthState::Up,
             connect_ms: Some(37),
             hop: Some(EffectiveHop::Upstream),
+            via: None,
             duration_ms: 1_204,
             error: None,
         }
@@ -289,6 +315,22 @@ mod tests {
         let status: StatusView = serde_json::from_str(wire).unwrap();
 
         assert_eq!(status.forwards, Vec::new());
+        assert_eq!(status.upstreams, Vec::new());
+    }
+
+    #[test]
+    fn a_carrying_upstream_round_trips_and_an_absent_one_is_not_written() {
+        let mut event = routed();
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("via"), "{wire}");
+
+        event.via = Some(UpstreamAddr("socks5://192.0.2.11:1080".to_owned()));
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(
+            wire.contains(r#""via":"socks5://192.0.2.11:1080""#),
+            "{wire}"
+        );
+        assert_eq!(serde_json::from_str::<EventView>(&wire).unwrap(), event);
     }
 
     #[test]

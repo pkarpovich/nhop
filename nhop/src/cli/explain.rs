@@ -20,9 +20,14 @@ pub fn rule_views(rules: &Ruleset) -> Vec<RuleView> {
 }
 
 /// Reports where a destination would be routed, without opening any connection.
+///
+/// `upstream` is the upstream a dial made now would go through - the selected one, or the first
+/// while none is selected, which is what a `require` rule dials - and absent while no init script
+/// has named one. The `prefer` fallback to the direct route is not applied: this reports the route
+/// the rules choose, and `status` shows the verdicts that would bend it.
 pub fn decision_view(
     rules: &Ruleset,
-    upstream: &UpstreamAddr,
+    upstream: Option<&UpstreamAddr>,
     host: &Host,
     port: Port,
 ) -> DecisionView {
@@ -70,11 +75,10 @@ fn dialled(host: &Host, port: Port) -> String {
     format!("{host}:{port}")
 }
 
-fn named(upstream: &UpstreamAddr) -> String {
-    let UpstreamAddr(upstream) = upstream;
-    if upstream.is_empty() {
+fn named(upstream: Option<&UpstreamAddr>) -> String {
+    let Some(UpstreamAddr(upstream)) = upstream else {
         return NO_UPSTREAM.to_owned();
-    }
+    };
     upstream.clone()
 }
 
@@ -107,7 +111,12 @@ mod tests {
     }
 
     fn decide(host: &str, port: u16) -> DecisionView {
-        decision_view(&routed(), &upstream(), &Host(host.to_owned()), Port(port))
+        decision_view(
+            &routed(),
+            Some(&upstream()),
+            &Host(host.to_owned()),
+            Port(port),
+        )
     }
 
     #[test]
@@ -166,7 +175,7 @@ mod tests {
     fn an_upstream_decision_without_an_upstream_names_none() {
         let decided = decision_view(
             &routed(),
-            &UpstreamAddr(String::new()),
+            None,
             &Host("api.example.com".to_owned()),
             Port(443),
         );
@@ -177,7 +186,7 @@ mod tests {
     fn an_address_literal_is_dialled_as_it_would_be_written() {
         let decided = decision_view(
             &Ruleset::default(),
-            &upstream(),
+            Some(&upstream()),
             &Host("2001:db8::1".to_owned()),
             Port(8443),
         );
