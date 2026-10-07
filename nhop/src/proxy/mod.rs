@@ -174,6 +174,63 @@ impl Upstream {
     }
 }
 
+/// Rejection of an upstream list that names one address twice.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("upstream {0} is listed more than once")]
+pub struct DuplicateUpstream(pub SocketAddr);
+
+/// Rejection of an upstream list a `set_upstream` command named.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnusableUpstreams {
+    /// One of the addresses cannot be dialled.
+    #[error(transparent)]
+    Invalid(#[from] InvalidUpstream),
+    /// Two entries dial the same address.
+    #[error(transparent)]
+    Duplicate(#[from] DuplicateUpstream),
+}
+
+/// Upstream proxies in the order the operator prefers them, each address at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstreams(Vec<Upstream>);
+
+impl Upstreams {
+    /// Reads the first upstream and its fallbacks, keeping the order they were written in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnusableUpstreams::Invalid`] when an address cannot be read and
+    /// [`UnusableUpstreams::Duplicate`] when two of them dial the same socket address.
+    pub fn parse(
+        first: UpstreamAddr,
+        fallbacks: Vec<UpstreamAddr>,
+    ) -> Result<Self, UnusableUpstreams> {
+        let mut entries: Vec<Upstream> = Vec::with_capacity(1 + fallbacks.len());
+        for written in std::iter::once(first).chain(fallbacks) {
+            let upstream = Upstream::parse(written)?;
+            for listed in &entries {
+                if listed.socket() == upstream.socket() {
+                    return Err(DuplicateUpstream(upstream.socket()).into());
+                }
+            }
+            entries.push(upstream);
+        }
+        Ok(Self(entries))
+    }
+
+    /// Returns the entry preferred over every other, absent for an empty list.
+    pub fn first(&self) -> Option<&Upstream> {
+        let Self(entries) = self;
+        entries.first()
+    }
+
+    /// Returns the entries in order of preference.
+    pub fn as_slice(&self) -> &[Upstream] {
+        let Self(entries) = self;
+        entries
+    }
+}
+
 /// Number of events one subscriber may fall behind by before its events are dropped.
 pub const SUBSCRIBER_CAPACITY: usize = 256;
 
@@ -596,6 +653,48 @@ mod tests {
         assert!(failure.to_string().contains("vm.example.com"), "{failure}");
         assert!(upstream("").is_err());
         assert!(upstream("socks5://192.0.2.10").is_err());
+    }
+
+    #[test]
+    fn an_upstream_list_keeps_the_order_it_was_written_in() {
+        let upstreams = Upstreams::parse(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![
+                UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                UpstreamAddr("192.0.2.12:1080".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        let mut sockets = Vec::new();
+        for entry in upstreams.as_slice() {
+            sockets.push(entry.socket());
+        }
+        assert_eq!(
+            sockets,
+            [
+                "192.0.2.10:1080".parse::<SocketAddr>().unwrap(),
+                "192.0.2.11:1080".parse().unwrap(),
+                "192.0.2.12:1080".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            upstreams.first(),
+            Some(&upstream("socks5://192.0.2.10:1080").unwrap())
+        );
+    }
+
+    #[test]
+    fn an_upstream_list_naming_one_address_twice_is_rejected() {
+        let refused = Upstreams::parse(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![UpstreamAddr("192.0.2.10:1080".to_owned())],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            UnusableUpstreams::Duplicate(DuplicateUpstream("192.0.2.10:1080".parse().unwrap()))
+        );
     }
 
     fn forward(listen: &str, host: &str, port: u16) -> Forward {

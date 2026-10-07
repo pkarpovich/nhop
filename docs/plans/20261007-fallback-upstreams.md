@@ -81,6 +81,8 @@ Line numbers below are as of commit `1b75da9` (v0.1.6). Anchor by the named symb
 - `mise run check` green: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - `grep -rn '^\s*//[^/!]' nhop/src nhop-ipc/src | wc -l` must not grow from its value at the start of Task 1 (record it in this file before starting)
 - `grep -rn 'matches!\|_ =>' nhop/src nhop-ipc/src | wc -l` must not grow from its value at the start of Task 1 (record it the same way)
+- recorded at the start of Task 1: `//` comments **5**, `matches!`/`_ =>` **4**
+- `mise` is not installed in the agent environment; the gate is run as its three commands directly
 
 ## Testing Strategy
 
@@ -236,15 +238,16 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/daemon/state.rs`
 - Modify: `nhop/src/cli/mod.rs`
 
-- [ ] add `fallbacks: Vec<UpstreamAddr>` with `#[serde(default)]` to `Command::SetUpstream`, documented as the entries after `addr`, in order
-- [ ] make the `upstream` subcommand take one or more positional addresses; the CLI sends the first as `addr` and the rest as `fallbacks`
-- [ ] add `Upstreams` (ordered, non-empty when parsed from a command) with a constructor that parses every address with `Upstream::parse` and rejects a repeated `SocketAddr` with `DuplicateUpstream`; staging stores `Option<Upstreams>` and `set_upstream` replaces it whole
-- [ ] map `DuplicateUpstream` to a failed staged command the way `DuplicateForward` is mapped
-- [ ] keep publishing only the first entry's address through the existing `LiveUpstream` in this task, so routing is unchanged until Task 2
-- [ ] write the wire test `a_single_upstream_command_serializes_as_before`: a `SetUpstream` with empty `fallbacks` produces the exact JSON today's command produces, and that JSON without `fallbacks` deserializes to empty `fallbacks`
-- [ ] write the CLI parse tests `upstream_takes_several_addresses_in_order` and `upstream_without_an_address_is_a_usage_error`
-- [ ] write the staging tests `a_repeated_upstream_address_fails_the_command` and `a_second_upstream_line_replaces_the_whole_list`
-- [ ] run `mise run check` - must pass before task 2
+- [x] add `fallbacks: Vec<UpstreamAddr>` with `#[serde(default)]` to `Command::SetUpstream`, documented as the entries after `addr`, in order
+- [x] make the `upstream` subcommand take one or more positional addresses; the CLI sends the first as `addr` and the rest as `fallbacks`
+- [x] add `Upstreams` (ordered, non-empty when parsed from a command) with a constructor that parses every address with `Upstream::parse` and rejects a repeated `SocketAddr` with `DuplicateUpstream`; staging stores `Option<Upstreams>` and `set_upstream` replaces it whole
+- [x] map `DuplicateUpstream` to a failed staged command the way `DuplicateForward` is mapped
+- [x] keep publishing only the first entry's address through the existing `LiveUpstream` in this task, so routing is unchanged until Task 2
+- [x] write the wire test `a_single_upstream_command_serializes_as_before`: a `SetUpstream` with empty `fallbacks` produces the exact JSON today's command produces, and that JSON without `fallbacks` deserializes to empty `fallbacks`
+- [x] write the CLI parse tests `upstream_takes_several_addresses_in_order` and `upstream_without_an_address_is_a_usage_error`
+- [x] write the staging tests `a_repeated_upstream_address_fails_the_command` and `a_second_upstream_line_replaces_the_whole_list`
+- [x] run `mise run check` - must pass before task 2
+- + note: `fallbacks` also carries `skip_serializing_if = "Vec::is_empty"`, which is what keeps a one-address command byte-identical on the wire. `Upstreams` lands in `nhop/src/proxy/mod.rs` beside `Upstream` as `Upstreams(Vec<Upstream>)` (staged form, no verdicts) with `UnusableUpstreams { Invalid, Duplicate }` as its rejection; Task 2 decides where the published entries with their `HealthHandle` live. `Staging::set_upstream(first, fallbacks)` parses and fails the run itself, as `push_rule` does, so `DaemonState::fail_staged` was removed
 
 ### Task 2: Publish the list with a verdict per entry
 

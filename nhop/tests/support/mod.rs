@@ -485,6 +485,7 @@ impl TestDaemon {
             .state()
             .call(Command::SetUpstream {
                 addr: UpstreamAddr(format!("socks5://{upstream}")),
+                fallbacks: Vec::new(),
                 load: None,
             })
             .await;

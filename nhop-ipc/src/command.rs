@@ -106,10 +106,15 @@ pub enum Command {
         /// Init run this command belongs to, absent outside a load.
         load: Option<LoadId>,
     },
-    /// `set_upstream` - points the router at a SOCKS5 upstream.
+    /// `set_upstream` - points the router at an ordered list of SOCKS5 upstreams.
     SetUpstream {
-        /// Address of the upstream proxy.
+        /// Address of the first upstream proxy, the one preferred over every fallback.
         addr: UpstreamAddr,
+        /// Upstreams after `addr`, in order of preference, empty when only one is named.
+        ///
+        /// Absent from commands sent by clients older than the field, which name one upstream.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fallbacks: Vec<UpstreamAddr>,
         /// Init run this command belongs to, absent outside a load.
         load: Option<LoadId>,
     },
@@ -242,7 +247,16 @@ mod tests {
             },
             Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: Vec::new(),
                 load: None,
+            },
+            Command::SetUpstream {
+                addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: vec![
+                    UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    UpstreamAddr("socks5://192.0.2.12:1080".to_owned()),
+                ],
+                load: Some(LoadId(4)),
             },
             Command::SetListen {
                 http: "127.0.0.1:7890".parse().unwrap(),
@@ -376,6 +390,36 @@ mod tests {
         assert_eq!(
             wire,
             r#"{"cmd":"add_forward","listen":"127.0.0.1:19000","host":"api.example.com","port":9000,"load":null}"#
+        );
+    }
+
+    #[test]
+    fn a_single_upstream_command_serializes_as_before() {
+        let before = r#"{"cmd":"set_upstream","addr":"socks5://192.0.2.10:1080","load":7}"#;
+        let command = Command::SetUpstream {
+            addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            fallbacks: Vec::new(),
+            load: Some(LoadId(7)),
+        };
+
+        assert_eq!(serde_json::to_string(&command).unwrap(), before);
+        assert_eq!(serde_json::from_str::<Command>(before).unwrap(), command);
+    }
+
+    #[test]
+    fn a_fallback_list_travels_after_the_first_upstream_in_order() {
+        let wire = serde_json::to_string(&Command::SetUpstream {
+            addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            fallbacks: vec![
+                UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                UpstreamAddr("socks5://192.0.2.12:1080".to_owned()),
+            ],
+            load: None,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            r#"{"cmd":"set_upstream","addr":"socks5://192.0.2.10:1080","fallbacks":["socks5://192.0.2.11:1080","socks5://192.0.2.12:1080"],"load":null}"#
         );
     }
 

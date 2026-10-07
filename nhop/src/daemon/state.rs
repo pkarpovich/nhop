@@ -22,8 +22,8 @@ use crate::daemon::Frontends;
 use crate::daemon::init_script::{self, ScriptOutcome};
 use crate::daemon::staging::{Committed, FailedCommand, LoadIds, Staging};
 use crate::proxy::{
-    ConnCtx, DuplicateForward, EventTx, Forward, Forwards, InvalidUpstream, Listen, NO_UPSTREAM,
-    Upstream,
+    ConnCtx, DuplicateForward, EventTx, Forward, Forwards, Listen, NO_UPSTREAM, UnusableUpstreams,
+    Upstreams,
 };
 use crate::rules::{InvalidRule, Ruleset};
 use crate::upstream::HealthHandle;
@@ -397,8 +397,12 @@ impl DaemonState {
                 let response = self.clear_rules(load);
                 answer(reply, response);
             }
-            Command::SetUpstream { addr, load } => {
-                let response = self.set_upstream(addr, load);
+            Command::SetUpstream {
+                addr,
+                fallbacks,
+                load,
+            } => {
+                let response = self.set_upstream(addr, fallbacks, load);
                 answer(reply, response);
             }
             Command::SetListen { http, socks, load } => {
@@ -492,28 +496,26 @@ impl DaemonState {
         }
     }
 
-    fn set_upstream(&mut self, addr: UpstreamAddr, load: Option<LoadId>) -> Response {
+    fn set_upstream(
+        &mut self,
+        addr: UpstreamAddr,
+        fallbacks: Vec<UpstreamAddr>,
+        load: Option<LoadId>,
+    ) -> Response {
         match self.target(load) {
             Target::Refused(refusal) => *refusal,
-            Target::Staged => {
-                let upstream = match Upstream::parse(addr) {
-                    Ok(upstream) => upstream,
-                    Err(failure) => {
-                        self.fail_staged();
-                        return unreadable(&failure);
-                    }
+            Target::Staged => self.staged(|staged| {
+                let Err(failure) = staged.set_upstream(addr, fallbacks) else {
+                    return Response::Ok;
                 };
-                self.staged(|staged| {
-                    staged.set_upstream(upstream);
-                    Response::Ok
-                })
-            }
+                unreadable(&failure)
+            }),
             Target::Live => {
-                let upstream = match Upstream::parse(addr) {
-                    Ok(upstream) => upstream,
+                let upstreams = match Upstreams::parse(addr, fallbacks) {
+                    Ok(upstreams) => upstreams,
                     Err(failure) => return unreadable(&failure),
                 };
-                self.adopt_upstream(Some(upstream));
+                self.adopt_upstream(Some(upstreams));
                 Response::Ok
             }
         }
@@ -555,18 +557,6 @@ impl DaemonState {
                 unopenable(&failure)
             }
         }
-    }
-
-    fn fail_staged(&mut self) {
-        let Some(InFlight {
-            id: _,
-            staged,
-            reply: _,
-        }) = &mut self.load
-        else {
-            return;
-        };
-        staged.fail(FailedCommand::SetUpstream);
     }
 
     fn rebind(&mut self, listen: Listen) -> io::Result<()> {
@@ -747,13 +737,16 @@ impl DaemonState {
         Ok(())
     }
 
-    fn publish(&mut self, rules: Ruleset, upstream: Option<Upstream>) {
+    fn publish(&mut self, rules: Ruleset, upstream: Option<Upstreams>) {
         self.live.rules().publish(rules);
         self.adopt_upstream(upstream);
     }
 
-    fn adopt_upstream(&mut self, upstream: Option<Upstream>) {
-        let Some(upstream) = upstream else {
+    fn adopt_upstream(&mut self, upstreams: Option<Upstreams>) {
+        let Some(upstreams) = upstreams else {
+            return;
+        };
+        let Some(upstream) = upstreams.first() else {
             return;
         };
         self.upstream = upstream.written().clone();
@@ -874,7 +867,7 @@ fn invalid(failure: &InvalidRule) -> Response {
     }
 }
 
-fn unreadable(failure: &InvalidUpstream) -> Response {
+fn unreadable(failure: &UnusableUpstreams) -> Response {
     Response::Err {
         kind: ErrKind::InvalidArgs,
         message: failure.to_string(),
@@ -1156,10 +1149,12 @@ mod tests {
             Command::ClearRules { load: None },
             Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: Vec::new(),
                 load: None,
             },
             Command::SetUpstream {
                 addr: UpstreamAddr("192.0.2.10".to_owned()),
+                fallbacks: Vec::new(),
                 load: None,
             },
             Command::Reload { path: None },
@@ -1257,6 +1252,7 @@ mod tests {
         let refused = state
             .call(Command::SetUpstream {
                 addr: UpstreamAddr("192.0.2.10".to_owned()),
+                fallbacks: Vec::new(),
                 load: Some(id),
             })
             .await;
@@ -1431,6 +1427,7 @@ mod tests {
             state
                 .call(Command::SetUpstream {
                     addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                    fallbacks: Vec::new(),
                     load: None,
                 })
                 .await,
@@ -1647,6 +1644,7 @@ mod tests {
         state
             .call(Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: Vec::new(),
                 load: Some(id),
             })
             .await;
@@ -1877,6 +1875,7 @@ mod tests {
         state
             .call(Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: Vec::new(),
                 load: None,
             })
             .await;

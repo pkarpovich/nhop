@@ -271,12 +271,15 @@ struct Never {
 }
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
-/// point the router at a SOCKS5 upstream
+/// point the router at SOCKS5 upstreams, the first preferred and the rest as fallbacks in order
 #[argh(subcommand, name = "upstream")]
 struct Upstream {
     /// upstream address, as socks5://host:port
     #[argh(positional, from_str_fn(parse_upstream))]
     addr: UpstreamAddr,
+    /// fallback addresses, in order of preference
+    #[argh(positional, from_str_fn(parse_upstream))]
+    fallbacks: Vec<UpstreamAddr>,
 }
 
 #[derive(FromArgs, Debug, PartialEq, Eq)]
@@ -440,8 +443,12 @@ async fn dispatch(
             let command = add_rule(RuleClass::Never, kind, value, load);
             ask(paths, command, Output::Human, out, err).await
         }
-        Subcommand::Upstream(Upstream { addr }) => {
-            let command = Command::SetUpstream { addr, load };
+        Subcommand::Upstream(Upstream { addr, fallbacks }) => {
+            let command = Command::SetUpstream {
+                addr,
+                fallbacks,
+                load,
+            };
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Listen(Listen { http, socks }) => {
@@ -1205,6 +1212,7 @@ mod tests {
             parse(&["upstream", "socks5://192.0.2.10:1080"]),
             Subcommand::Upstream(Upstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: Vec::new(),
             })
         );
         assert_eq!(
@@ -1375,6 +1383,36 @@ mod tests {
         assert!(tokio::net::TcpStream::connect(listen).await.is_ok());
 
         daemon.shutdown().await;
+    }
+
+    #[test]
+    fn upstream_takes_several_addresses_in_order() {
+        assert_eq!(
+            parse(&[
+                "upstream",
+                "socks5://192.0.2.10:1080",
+                "socks5://192.0.2.11:1080",
+                "192.0.2.12:1080",
+            ]),
+            Subcommand::Upstream(Upstream {
+                addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+                fallbacks: vec![
+                    UpstreamAddr("socks5://192.0.2.11:1080".to_owned()),
+                    UpstreamAddr("192.0.2.12:1080".to_owned()),
+                ],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_without_an_address_is_a_usage_error() {
+        let (_home, paths) = temp_paths();
+
+        let (exit, out, err) = invoke(&paths, &["upstream"]).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("addr"), "{err}");
     }
 
     #[tokio::test]
