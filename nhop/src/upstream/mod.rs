@@ -10,9 +10,9 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use nhop_ipc::{EffectiveHop, HealthState, Host, Port, RuleClass};
+use nhop_ipc::{EffectiveHop, HealthState, Host, Port, RuleClass, UpstreamAddr};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -111,17 +111,18 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// How many unanswered keepalive probes end a relay socket.
 pub const KEEPALIVE_RETRIES: u32 = 4;
 
-/// Next hop that sends `require` and `prefer` traffic through the SOCKS5 upstream.
+/// Next hop that sends `require` and `prefer` traffic through the selected SOCKS5 upstream.
 ///
-/// Each entry's verdict routes `prefer` only: while it is [`HealthState::Down`] a `prefer`
-/// destination goes direct at once rather than paying a connect timeout for a route it does not
-/// need. `require` has no direct route to fall back to, so it dials every configured address
-/// whatever the verdict says and gives up only at [`REQUIRE_CONNECT_TIMEOUT`]; a refusal there
+/// Every connection asks [`select`] once which entry it goes through. While none is selected a
+/// `prefer` destination goes direct at once rather than paying a connect timeout for a route it
+/// does not need. `require` has no direct route to fall back to, so it dials the first entry
+/// whatever the verdicts say and gives up only at [`REQUIRE_CONNECT_TIMEOUT`]; a refusal there
 /// would turn an upstream that is merely slow into one that is dead.
 #[derive(Debug)]
 pub struct UpstreamHop {
     upstream: LiveUpstream,
     hold: Duration,
+    selection: Selection,
     patrolling: JoinHandle<()>,
 }
 
@@ -130,6 +131,7 @@ impl Drop for UpstreamHop {
         let Self {
             upstream: _,
             hold: _,
+            selection: _,
             patrolling,
         } = self;
         patrolling.abort();
@@ -151,6 +153,7 @@ impl UpstreamHop {
         Self {
             upstream,
             hold,
+            selection: Selection::default(),
             patrolling,
         }
     }
@@ -160,24 +163,32 @@ impl UpstreamHop {
         &self.upstream
     }
 
-    /// Returns how long a higher-ranked entry has to stay up before it takes traffic back.
-    pub fn hold(&self) -> Duration {
-        self.hold
-    }
-
+    /// Dials an upstream-class decision through the entry selected for this one connection.
+    ///
+    /// The selection is made once, from one snapshot of the published list, and recorded with
+    /// [`Selection::observe`] so a switch is logged by the first dial that sees it.
     async fn routed(&self, host: &Host, port: Port, class: RuleClass, rule: RuleId) -> Dialled {
         let entries = self.upstream.snapshot();
-        let dialled = entries.first();
+        let selected = entries.selected(SystemTime::now(), self.hold);
+        self.selection.observe(&entries, selected);
+        let selected = match selected {
+            Some(index) => entries.as_slice().get(index),
+            None => None,
+        };
         match class {
             RuleClass::Never => Dialled::Attempted {
                 hop: EffectiveHop::Direct,
+                via: None,
                 next: direct(host, port).await,
             },
-            RuleClass::Require => required(host, port, rule, dialled).await,
-            RuleClass::Prefer => {
-                let (hop, next) = preferred(host, port, dialled).await;
-                Dialled::Attempted { hop, next }
+            RuleClass::Require => {
+                let dialled = match selected {
+                    Some(entry) => Some(entry),
+                    None => entries.first(),
+                };
+                required(host, port, rule, dialled).await
             }
+            RuleClass::Prefer => preferred(host, port, selected).await,
         }
     }
 }
@@ -185,10 +196,12 @@ impl UpstreamHop {
 /// Dials a `require` destination, refusing before the network only with no upstream configured.
 ///
 /// An empty list is a configuration absence rather than a health judgment, so it is the one case
-/// turned away without a socket, reported against [`NO_UPSTREAM`]. Every configured address is
-/// dialled whatever the verdict says, because a `require` destination has no direct route to be
-/// spared for: refusing early only fails sooner, and during an upstream that was slow rather than
-/// gone it failed everything the upstream could still have served.
+/// turned away without a socket, reported against [`NO_UPSTREAM`]. Otherwise the entry handed in -
+/// the selected one, or the first when none is selected - is dialled whatever its verdict says,
+/// because a `require` destination has no direct route to be spared for: refusing early only fails
+/// sooner, and during an upstream that was slow rather than gone it failed everything the upstream
+/// could still have served. A dial that connects flips that entry up at once, which makes it the
+/// selected entry for the connections after it.
 ///
 /// The refusal and a dial that failed upstream-side carry the same [`UpstreamDown`] surface on
 /// purpose - a `require` rule has one meaning for the client either way - so the two are told
@@ -220,8 +233,13 @@ async fn required(
     };
     Dialled::Attempted {
         hop: EffectiveHop::Upstream,
+        via: Some(carried_by(dialled)),
         next,
     }
+}
+
+fn carried_by(dialled: &UpstreamEntry) -> UpstreamAddr {
+    dialled.upstream().written().clone()
 }
 
 /// Records what one real dial saw about the entry it was made against.
@@ -241,38 +259,41 @@ fn observed(dialled: &UpstreamEntry, state: HealthState, cause: VerdictCause) {
 
 /// Dials a `prefer` destination, reporting which of its two routes carried the connection.
 ///
-/// With no upstream configured, or the entry's verdict [`HealthState::Down`], it goes direct at
-/// once. Every path that ends at [`direct`] reports [`EffectiveHop::FallbackDirect`], because from
-/// the client's side those connections are indistinguishable from an upstream one and the log is
-/// the only place the difference can be seen.
-async fn preferred(
-    host: &Host,
-    port: Port,
-    dialled: Option<&UpstreamEntry>,
-) -> (EffectiveHop, io::Result<TcpStream>) {
-    let Some(dialled) = dialled else {
-        return (EffectiveHop::FallbackDirect, direct(host, port).await);
+/// With no entry selected - none configured, or none up - it goes direct at once. Every path that
+/// ends at [`direct`] reports [`EffectiveHop::FallbackDirect`] and no carrying upstream, because
+/// from the client's side those connections are indistinguishable from an upstream one and the log
+/// is the only place the difference can be seen.
+async fn preferred(host: &Host, port: Port, selected: Option<&UpstreamEntry>) -> Dialled {
+    let Some(dialled) = selected else {
+        return fallen_back(host, port).await;
     };
     let upstream = dialled.upstream().socket();
-    match dialled.health().state() {
-        HealthState::Down => (EffectiveHop::FallbackDirect, direct(host, port).await),
-        HealthState::Up => match through(host, port, upstream, UpstreamBudget::Prefer).await {
-            Ok(next) => {
-                observed(dialled, HealthState::Up, VerdictCause::Dial);
-                (EffectiveHop::Upstream, Ok(next))
+    match through(host, port, upstream, UpstreamBudget::Prefer).await {
+        Ok(next) => {
+            observed(dialled, HealthState::Up, VerdictCause::Dial);
+            Dialled::Attempted {
+                hop: EffectiveHop::Upstream,
+                via: Some(carried_by(dialled)),
+                next: Ok(next),
             }
-            Err(DialFailure::Destination(_failure)) => {
-                observed(dialled, HealthState::Up, VerdictCause::Dial);
-                (EffectiveHop::FallbackDirect, direct(host, port).await)
-            }
-            Err(DialFailure::Unsent(_failure)) => {
-                (EffectiveHop::FallbackDirect, direct(host, port).await)
-            }
-            Err(DialFailure::Upstream(_failure)) => {
-                observed(dialled, HealthState::Down, VerdictCause::Dial);
-                (EffectiveHop::FallbackDirect, direct(host, port).await)
-            }
-        },
+        }
+        Err(DialFailure::Destination(_failure)) => {
+            observed(dialled, HealthState::Up, VerdictCause::Dial);
+            fallen_back(host, port).await
+        }
+        Err(DialFailure::Unsent(_failure)) => fallen_back(host, port).await,
+        Err(DialFailure::Upstream(_failure)) => {
+            observed(dialled, HealthState::Down, VerdictCause::Dial);
+            fallen_back(host, port).await
+        }
+    }
+}
+
+async fn fallen_back(host: &Host, port: Port) -> Dialled {
+    Dialled::Attempted {
+        hop: EffectiveHop::FallbackDirect,
+        via: None,
+        next: direct(host, port).await,
     }
 }
 
@@ -298,15 +319,25 @@ impl NextHop for UpstreamHop {
             match decision {
                 Decision::Direct => Dialled::Attempted {
                     hop: EffectiveHop::Direct,
+                    via: None,
                     next: direct(host, port).await,
                 },
                 Decision::Never { rule: _ } => Dialled::Attempted {
                     hop: EffectiveHop::Direct,
+                    via: None,
                     next: direct(host, port).await,
                 },
                 Decision::Upstream { class, rule } => self.routed(host, port, class, rule).await,
             }
         })
+    }
+
+    fn verdict(&self) -> HealthState {
+        let entries = self.upstream.snapshot();
+        match entries.selected(SystemTime::now(), self.hold) {
+            Some(_index) => HealthState::Up,
+            None => HealthState::Down,
+        }
     }
 }
 
@@ -551,8 +582,23 @@ mod tests {
     const GENERAL_FAILURE: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     const OFF_RFC: [u8; 10] = [0x05, 0x09, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
 
+    fn written(upstream: SocketAddr) -> UpstreamAddr {
+        UpstreamAddr(format!("socks5://{upstream}"))
+    }
+
     fn listed(upstream: SocketAddr) -> Upstreams {
-        Upstreams::parse(UpstreamAddr(format!("socks5://{upstream}")), Vec::new()).unwrap()
+        listed_in_order(&[upstream])
+    }
+
+    fn listed_in_order(upstreams: &[SocketAddr]) -> Upstreams {
+        let Some((first, rest)) = upstreams.split_first() else {
+            panic!("a staged list names at least one upstream");
+        };
+        let mut fallbacks = Vec::with_capacity(rest.len());
+        for fallback in rest {
+            fallbacks.push(written(*fallback));
+        }
+        Upstreams::parse(written(*first), fallbacks).unwrap()
     }
 
     fn first(published: &LiveUpstream) -> UpstreamEntry {
@@ -564,6 +610,41 @@ mod tests {
 
     fn verdict(hop: &UpstreamHop) -> HealthHandle {
         first(hop.upstream()).health().clone()
+    }
+
+    fn health_of(hop: &UpstreamHop, upstream: SocketAddr) -> HealthHandle {
+        for entry in hop.upstream().snapshot().as_slice() {
+            if entry.upstream().socket() == upstream {
+                return entry.health().clone();
+            }
+        }
+        panic!("{upstream} is not published");
+    }
+
+    fn hop_over(seeded: &[(SocketAddr, HealthState)]) -> UpstreamHop {
+        let mut upstreams = Vec::with_capacity(seeded.len());
+        for (upstream, _state) in seeded {
+            upstreams.push(*upstream);
+        }
+        let published = LiveUpstream::default();
+        published.publish(&listed_in_order(&upstreams));
+        let entries = published.snapshot();
+        for ((_upstream, state), entry) in seeded.iter().zip(entries.as_slice()) {
+            entry.health().seed(*state);
+        }
+        UpstreamHop::start(published, PATIENT, PATIENT, PATIENT)
+    }
+
+    async fn attempted(
+        hop: &UpstreamHop,
+        host: &Host,
+        port: Port,
+        decision: Decision,
+    ) -> (EffectiveHop, Option<UpstreamAddr>, io::Result<TcpStream>) {
+        let Dialled::Attempted { hop, via, next } = hop.dial(host, port, decision).await else {
+            panic!("a configured upstream list never refuses before the network");
+        };
+        (hop, via, next)
     }
 
     fn hop(upstream: SocketAddr, state: HealthState, interval: Duration) -> UpstreamHop {
@@ -588,7 +669,11 @@ mod tests {
     ) -> io::Result<TcpStream> {
         match hop.dial(host, port, decision).await {
             Dialled::Refused(failure) => Err(failure),
-            Dialled::Attempted { hop: _, next } => next,
+            Dialled::Attempted {
+                hop: _,
+                via: _,
+                next,
+            } => next,
         }
     }
 
@@ -769,7 +854,12 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Require, 4))
             .await;
 
-        let Dialled::Attempted { hop: _, next } = dialled else {
+        let Dialled::Attempted {
+            hop: _,
+            via: _,
+            next,
+        } = dialled
+        else {
             panic!("a configured upstream is dialled whatever the verdict says");
         };
         let failure = next.unwrap_err();
@@ -805,7 +895,12 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Require, 4))
             .await;
 
-        let Dialled::Attempted { hop: _, next } = dialled else {
+        let Dialled::Attempted {
+            hop: _,
+            via: _,
+            next,
+        } = dialled
+        else {
             panic!("a dial that reached the network must be reported as attempted");
         };
         let failure = next.unwrap_err();
@@ -824,7 +919,7 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Prefer, 7))
             .await;
 
-        let Dialled::Attempted { hop, next } = dialled else {
+        let Dialled::Attempted { hop, via: _, next } = dialled else {
             panic!("a prefer decision dials whichever route it takes");
         };
         let _next = next.unwrap();
@@ -844,7 +939,7 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Require, 7))
             .await;
 
-        let Dialled::Attempted { hop, next } = dialled else {
+        let Dialled::Attempted { hop, via: _, next } = dialled else {
             panic!("a configured upstream is dialled whatever the verdict says");
         };
         let _next = next.unwrap();
@@ -860,7 +955,7 @@ mod tests {
             .dial(&host, port, upstream_decision(RuleClass::Prefer, 7))
             .await;
 
-        let Dialled::Attempted { hop, next } = dialled else {
+        let Dialled::Attempted { hop, via: _, next } = dialled else {
             panic!("a prefer decision dials whichever route it takes");
         };
         let _next = next.unwrap();
@@ -1009,6 +1104,109 @@ mod tests {
 
         assert_eq!(dialled.peer_addr().unwrap(), listener.local_addr().unwrap());
         assert_eq!(verdict(&hop).state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn a_require_dial_uses_the_selected_fallback() {
+        let (_listener, host, port) = destination().await;
+        let primary = closed_port().await;
+        let fallback = upstream_answering(GRANTED).await;
+        let hop = hop_over(&[(primary, HealthState::Down), (fallback, HealthState::Up)]);
+
+        let (taken, via, next) =
+            attempted(&hop, &host, port, upstream_decision(RuleClass::Require, 2)).await;
+
+        assert_eq!(next.unwrap().peer_addr().unwrap(), fallback);
+        assert_eq!(taken, EffectiveHop::Upstream);
+        assert_eq!(via, Some(written(fallback)));
+    }
+
+    #[tokio::test]
+    async fn a_require_dial_with_nothing_up_dials_the_first_entry() {
+        let (_listener, host, port) = destination().await;
+        let primary = upstream_answering(GRANTED).await;
+        let fallback = upstream_answering(GRANTED).await;
+        let hop = hop_over(&[(primary, HealthState::Down), (fallback, HealthState::Down)]);
+
+        let (taken, via, next) =
+            attempted(&hop, &host, port, upstream_decision(RuleClass::Require, 2)).await;
+
+        assert_eq!(next.unwrap().peer_addr().unwrap(), primary);
+        assert_eq!(taken, EffectiveHop::Upstream);
+        assert_eq!(via, Some(written(primary)));
+        assert_eq!(health_of(&hop, primary).state(), HealthState::Up);
+        assert_eq!(health_of(&hop, fallback).state(), HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_prefer_dial_with_nothing_up_goes_direct_at_once() {
+        let (listener, host, port) = destination().await;
+        let primary = upstream_answering(GRANTED).await;
+        let fallback = upstream_answering(GRANTED).await;
+        let hop = hop_over(&[(primary, HealthState::Down), (fallback, HealthState::Down)]);
+
+        let (taken, via, next) =
+            attempted(&hop, &host, port, upstream_decision(RuleClass::Prefer, 0)).await;
+
+        assert_eq!(
+            next.unwrap().peer_addr().unwrap(),
+            listener.local_addr().unwrap()
+        );
+        assert_eq!(taken, EffectiveHop::FallbackDirect);
+        assert_eq!(via, None);
+        assert_eq!(health_of(&hop, primary).state(), HealthState::Down);
+        assert_eq!(health_of(&hop, fallback).state(), HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_prefer_dial_uses_the_selected_fallback() {
+        let (_listener, host, port) = destination().await;
+        let primary = closed_port().await;
+        let fallback = upstream_answering(GRANTED).await;
+        let hop = hop_over(&[(primary, HealthState::Down), (fallback, HealthState::Up)]);
+
+        let (taken, via, next) =
+            attempted(&hop, &host, port, upstream_decision(RuleClass::Prefer, 0)).await;
+
+        assert_eq!(next.unwrap().peer_addr().unwrap(), fallback);
+        assert_eq!(taken, EffectiveHop::Upstream);
+        assert_eq!(via, Some(written(fallback)));
+    }
+
+    #[tokio::test]
+    async fn a_dial_failure_flips_only_the_entry_it_dialled() {
+        let (_listener, host, port) = destination().await;
+        let primary = closed_port().await;
+        let fallback = upstream_answering(GRANTED).await;
+        let hop = hop_over(&[(primary, HealthState::Up), (fallback, HealthState::Up)]);
+
+        let (taken, via, next) =
+            attempted(&hop, &host, port, upstream_decision(RuleClass::Require, 2)).await;
+
+        let failure = next.unwrap_err();
+        assert!(
+            UpstreamDown::carried_by(&failure).is_some(),
+            "the selected upstream refused the connection: {failure}"
+        );
+        assert_eq!(taken, EffectiveHop::Upstream);
+        assert_eq!(via, Some(written(primary)));
+        assert_eq!(health_of(&hop, primary).state(), HealthState::Down);
+        assert_eq!(health_of(&hop, fallback).state(), HealthState::Up);
+    }
+
+    #[tokio::test]
+    async fn the_verdict_is_up_while_any_entry_is_selected() {
+        let hop = hop_over(&[
+            (closed_port().await, HealthState::Down),
+            (closed_port().await, HealthState::Up),
+        ]);
+        let unselected = hop_over(&[
+            (closed_port().await, HealthState::Down),
+            (closed_port().await, HealthState::Down),
+        ]);
+
+        assert_eq!(hop.verdict(), HealthState::Up);
+        assert_eq!(unselected.verdict(), HealthState::Down);
     }
 
     #[test]

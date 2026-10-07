@@ -99,6 +99,7 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
             upstream,
             connect_ms,
             hop,
+            via,
             duration_ms,
             error,
         } = event;
@@ -114,6 +115,7 @@ async fn every_routed_connection_leaves_one_line_in_the_log() {
         };
         assert!(connect_ms <= duration_ms, "{connect_ms} > {duration_ms}");
         assert_eq!(hop, Some(EffectiveHop::Direct));
+        assert_eq!(via, None);
         assert_eq!(error, None);
     }
     assert_eq!(origin.connections(), 2);

@@ -880,6 +880,7 @@ mod tests {
             upstream: HealthState::Down,
             connect_ms: Some(1),
             hop: Some(nhop_ipc::EffectiveHop::Direct),
+            via: None,
             duration_ms: 3,
             error: None,
         }

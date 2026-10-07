@@ -995,6 +995,7 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         upstream,
         connect_ms,
         hop,
+        via,
         duration_ms,
         error,
     } = event;
@@ -1008,9 +1009,13 @@ fn render_event(event: &EventView, out: &mut dyn Write) {
         Some(connect_ms) => format!(" (dial {connect_ms}ms)"),
         None => String::new(),
     };
+    let carried = match via {
+        Some(UpstreamAddr(via)) => format!(" @ {via}"),
+        None => String::new(),
+    };
     let _ = writeln!(
         out,
-        "{host}:{port}  {} via {}{}  upstream {}  {duration_ms}ms{dialled}  {error}",
+        "{host}:{port}  {} via {}{carried}{}  upstream {}  {duration_ms}ms{dialled}  {error}",
         decision_name(*decision),
         rule_name(*rule_index, *class),
         fallen_back(*hop),
@@ -1920,6 +1925,24 @@ mod tests {
             out.lines().next(),
             Some(
                 "2026-09-03T19:53:11Z  teams.microsoft.com:443  upstream via rule 19 (prefer) -> direct  upstream down  431ms (dial 12ms)  upstream down"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_carried_by_an_upstream_names_it() {
+        let (_home, paths) = temp_paths();
+        let carried = r#"{"timestamp":"2026-10-07T09:12:30Z","level":"INFO","fields":{"host":"git.corp.example","port":443,"decision":"upstream","rule_index":2,"class":"require","upstream":"up","connect_ms":37,"hop":"upstream","via":"socks5://192.0.2.11:1080","duration_ms":1204},"target":"nhop::logging"}"#;
+        write_log(&paths, "2026-10-07", &[carried.to_owned()]);
+
+        let (exit, out, err) = invoke(&paths, &["logs"]).await;
+
+        assert_eq!(exit, Exit::Success);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some(
+                "2026-10-07T09:12:30Z  git.corp.example:443  upstream via rule 2 (require) @ socks5://192.0.2.11:1080  upstream up  1204ms (dial 37ms)  -"
             )
         );
     }

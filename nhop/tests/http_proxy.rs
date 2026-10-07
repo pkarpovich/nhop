@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use nhop::proxy::{ConnCtx, EventTx, NextHop, http};
 use nhop::rules::{RuleClass, RuleKind, RuleValue, Ruleset};
-use nhop::upstream::HealthHandle;
 use nhop_ipc::{Command, DecisionKind, ErrKind, EventView, Paths, Response};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,7 +74,6 @@ fn watched(rules: Ruleset) -> (ConnCtx, mpsc::Receiver<EventView>) {
     let decisions = events.subscribe();
     let ctx = ConnCtx {
         rules: Arc::new(rules),
-        health: HealthHandle::default(),
         events,
     };
     (ctx, decisions)

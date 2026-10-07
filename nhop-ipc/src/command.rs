@@ -350,6 +350,7 @@ mod tests {
                 upstream: HealthState::Up,
                 connect_ms: Some(4),
                 hop: Some(crate::EffectiveHop::Direct),
+                via: None,
                 duration_ms: 12,
                 error: Some("reset by peer".to_owned()),
             }),

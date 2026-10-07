@@ -26,7 +26,7 @@ use crate::proxy::{
     Upstreams,
 };
 use crate::rules::{InvalidRule, Ruleset};
-use crate::upstream::{Health, HealthHandle, UpstreamEntries};
+use crate::upstream::{Health, UpstreamEntries};
 
 /// Address the HTTP front end binds until the init script moves it.
 pub const DEFAULT_HTTP_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890);
@@ -119,24 +119,14 @@ pub struct Live {
 
 impl Live {
     /// Returns the context one accepted connection is routed by.
-    ///
-    /// The verdict is the first entry's, or a fresh [`HealthState::Down`] one while no upstream is
-    /// configured.
-    ///
-    /// [`HealthState::Down`]: nhop_ipc::HealthState::Down
     pub fn accepted(&self) -> ConnCtx {
         let Self {
             rules,
-            upstream,
+            upstream: _,
             events,
         } = self;
-        let health = match upstream.snapshot().first() {
-            Some(entry) => entry.health().clone(),
-            None => HealthHandle::default(),
-        };
         ConnCtx {
             rules: rules.snapshot(),
-            health,
             events: events.clone(),
         }
     }

@@ -13,7 +13,7 @@ use nhop::daemon::{self, Daemon};
 use nhop::proxy::{Dialled, Listen, NextHop, UpstreamDown};
 use nhop::rules::{Decision, RuleId};
 use nhop::upstream::HealthHandle;
-use nhop_ipc::{Command, EffectiveHop, Host, Paths, Port, Response, UpstreamAddr};
+use nhop_ipc::{Command, EffectiveHop, HealthState, Host, Paths, Port, Response, UpstreamAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -414,9 +414,14 @@ impl NextHop for StubHop {
         Box::pin(async move {
             Dialled::Attempted {
                 hop: EffectiveHop::Direct,
+                via: None,
                 next: TcpStream::connect(self.target).await,
             }
         })
+    }
+
+    fn verdict(&self) -> HealthState {
+        HealthState::Down
     }
 }
 
@@ -463,11 +468,16 @@ impl NextHop for DownHop {
                     tokio::time::sleep(took).await;
                     Dialled::Attempted {
                         hop: EffectiveHop::Upstream,
+                        via: Some(UpstreamAddr(format!("socks5://{upstream}"))),
                         next: Err(refused),
                     }
                 }
             }
         })
+    }
+
+    fn verdict(&self) -> HealthState {
+        HealthState::Down
     }
 }
 

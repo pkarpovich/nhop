@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use nhop::proxy::{ConnCtx, EventTx, NextHop, socks5};
 use nhop::rules::{Decision, Host, Port, RuleClass, RuleId, RuleKind, RuleValue, Ruleset};
-use nhop::upstream::HealthHandle;
 use nhop_ipc::{DecisionKind, EventView, Paths};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,7 +73,6 @@ fn never(value: &str) -> Ruleset {
 fn ctx_of(rules: Ruleset) -> ConnCtx {
     ConnCtx {
         rules: Arc::new(rules),
-        health: HealthHandle::default(),
         events: EventTx::default(),
     }
 }
@@ -84,7 +82,6 @@ fn watched(rules: Ruleset) -> (ConnCtx, mpsc::Receiver<EventView>) {
     let decisions = events.subscribe();
     let ctx = ConnCtx {
         rules: Arc::new(rules),
-        health: HealthHandle::default(),
         events,
     };
     (ctx, decisions)

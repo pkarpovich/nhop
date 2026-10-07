@@ -308,15 +308,17 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `nhop/src/cli/mod.rs`
 - Modify: `nhop/tests/support/mod.rs`
 
-- [ ] make `routed()` compute `select` once per connection and dial per the class table in "Solution Overview"; call `Selection::observe` with the result
-- [ ] report the carrying entry on `Dialled::Attempted` and `Connect::Attempted` as `via: Option<UpstreamAddr>`, set only when the hop is `Upstream`; fill `EventView.via` in `Routed::ended`
-- [ ] take `EventView.upstream` from the selected entry's verdict (`Down` when none is selected)
-- [ ] emit `via` in `logging::decision` and render ` @ <via>` in `render_event` when present
-- [ ] update `StubHop` and `DownHop` in the support module for the new field
-- [ ] write the unit tests `a_require_dial_uses_the_selected_fallback`, `a_require_dial_with_nothing_up_dials_the_first_entry`, `a_prefer_dial_with_nothing_up_goes_direct_at_once` and `a_prefer_dial_uses_the_selected_fallback`, each asserting the dialled stub, `hop` and `via`
-- [ ] write the unit test `a_dial_failure_flips_only_the_entry_it_dialled`: two entries both seeded `Up`, the selected one closed; after a `require` dial the selected one is `Down` and the other is still `Up`
-- [ ] write the rendering test `a_line_carried_by_an_upstream_names_it` and confirm the existing decision goldens are byte-unchanged
-- [ ] run `mise run check` - must pass before task 5
+- [x] make `routed()` compute `select` once per connection and dial per the class table in "Solution Overview"; call `Selection::observe` with the result
+- [x] report the carrying entry on `Dialled::Attempted` and `Connect::Attempted` as `via: Option<UpstreamAddr>`, set only when the hop is `Upstream`; fill `EventView.via` in `Routed::ended`
+- [x] take `EventView.upstream` from the selected entry's verdict (`Down` when none is selected)
+- [x] emit `via` in `logging::decision` and render ` @ <via>` in `render_event` when present
+- [x] update `StubHop` and `DownHop` in the support module for the new field
+- [x] write the unit tests `a_require_dial_uses_the_selected_fallback`, `a_require_dial_with_nothing_up_dials_the_first_entry`, `a_prefer_dial_with_nothing_up_goes_direct_at_once` and `a_prefer_dial_uses_the_selected_fallback`, each asserting the dialled stub, `hop` and `via`
+- [x] write the unit test `a_dial_failure_flips_only_the_entry_it_dialled`: two entries both seeded `Up`, the selected one closed; after a `require` dial the selected one is `Down` and the other is still `Up`
+- [x] write the rendering test `a_line_carried_by_an_upstream_names_it` and confirm the existing decision goldens are byte-unchanged
+- [x] run `mise run check` - must pass before task 5
+- + note: `EventView.upstream` comes from a new `NextHop::verdict()` read when `Routed::begun` records the decision (`Up` while any entry is selected, since a selected entry is `Up`), so `ConnCtx.health` is gone: `Live::accepted` has no hold to select with, and the hop is the one owner of it. `StubHop` and `DownHop` answer `Down`, which is what their default `HealthHandle` gave before. The verdict read does not call `Selection::observe`; only dials do (and patrol rounds from Task 5)
+- + note: `UpstreamEntries::selected(now, hold)` collects the verdicts and calls `select`, for the patrol (Task 5) and the state task (Task 7) to reuse. `preferred()` no longer checks the entry's verdict itself: it is handed the selected entry or none. `Connect` lost `Copy` with `via`. `EventView.via` also carries `skip_serializing_if`, so an event without it is byte-identical on the wire. `hold()` on `UpstreamHop` was removed now that `routed()` reads the field. The dialler tests assert "the dialled stub" by the relay socket's `peer_addr`, since the patrol's first probe also reaches the stubs. The extra test `the_verdict_is_up_while_any_entry_is_selected` pins `verdict()`
 
 ### Task 5: Patrol every entry
 

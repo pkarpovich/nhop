@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use nhop_ipc::{
     DecisionKind, EffectiveHop, EventView, HealthState, Host, Paths, Port, RuleClass, Timestamp,
+    UpstreamAddr,
 };
 use serde::Deserialize;
 use tracing::Subscriber;
@@ -76,6 +77,7 @@ pub fn decision(event: &EventView) {
         upstream,
         connect_ms,
         hop,
+        via,
         duration_ms,
         error,
     } = event;
@@ -90,6 +92,7 @@ pub fn decision(event: &EventView) {
         upstream = health_name(*upstream),
         connect_ms = *connect_ms,
         hop = hop.map(hop_name),
+        via = via.as_ref().map(|UpstreamAddr(via)| via.as_str()),
         duration_ms = *duration_ms,
         error = error.as_deref(),
     );
@@ -334,6 +337,8 @@ mod tests {
         upstream: HealthState,
         connect_ms: Option<u64>,
         hop: Option<EffectiveHop>,
+        #[serde(default)]
+        via: Option<UpstreamAddr>,
         duration_ms: u64,
         error: Option<String>,
     }
@@ -354,6 +359,7 @@ mod tests {
             upstream: HealthState::Up,
             connect_ms: Some(2),
             hop: Some(EffectiveHop::Upstream),
+            via: Some(UpstreamAddr("socks5://192.0.2.11:1080".to_owned())),
             duration_ms: 17,
             error: Some("reset by peer".to_owned()),
         }
@@ -369,6 +375,7 @@ mod tests {
             upstream: HealthState::Down,
             connect_ms: None,
             hop: None,
+            via: None,
             duration_ms: 4,
             error: None,
         }
@@ -418,6 +425,7 @@ mod tests {
             upstream,
             connect_ms,
             hop,
+            via,
             duration_ms,
             error,
         } = matched();
@@ -432,11 +440,13 @@ mod tests {
                 upstream,
                 connect_ms,
                 hop,
+                via,
                 duration_ms,
                 error,
             }
         );
         let absent = fields_of(&lines[1]);
+        assert_eq!(absent.via, None);
         assert_eq!(absent.rule_index, None);
         assert_eq!(absent.connect_ms, None);
         assert_eq!(absent.hop, None);

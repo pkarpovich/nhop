@@ -62,7 +62,11 @@ async fn dial(
 ) -> io::Result<TcpStream> {
     match hop.dial(host, port, decision).await {
         Dialled::Refused(failure) => Err(failure),
-        Dialled::Attempted { hop: _, next } => next,
+        Dialled::Attempted {
+            hop: _,
+            via: _,
+            next,
+        } => next,
     }
 }
 
@@ -462,7 +466,12 @@ async fn a_require_dial_into_a_black_hole_costs_the_require_budget() {
         .dial(&Host("example.com".to_owned()), Port(443), require(5))
         .await;
 
-    let Dialled::Attempted { hop: _, next } = dialled else {
+    let Dialled::Attempted {
+        hop: _,
+        via: _,
+        next,
+    } = dialled
+    else {
         panic!("a configured upstream must be dialled whatever the verdict says");
     };
     let failure = next.unwrap_err();

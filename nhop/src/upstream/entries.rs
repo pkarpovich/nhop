@@ -1,7 +1,9 @@
 //! The published upstream list: every address the operator named, each judged by its own verdict.
 
+use std::time::{Duration, SystemTime};
+
 use crate::proxy::{Upstream, Upstreams};
-use crate::upstream::HealthHandle;
+use crate::upstream::{HealthHandle, select};
 
 /// One upstream as the dialer and the patrol see it: where it is and the verdict judging it.
 ///
@@ -72,6 +74,19 @@ impl UpstreamEntries {
     pub fn as_slice(&self) -> &[UpstreamEntry] {
         let Self(entries) = self;
         entries
+    }
+
+    /// Returns the index of the entry new connections go through at `now`, absent while none is up.
+    ///
+    /// It reads every entry's verdict once and hands them to [`select`], so the answer is the
+    /// selection those verdicts make with the given return hold.
+    pub fn selected(&self, now: SystemTime, hold: Duration) -> Option<usize> {
+        let Self(entries) = self;
+        let mut verdicts = Vec::with_capacity(entries.len());
+        for entry in entries {
+            verdicts.push(entry.health().verdict());
+        }
+        select(&verdicts, now, hold)
     }
 }
 

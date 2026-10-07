@@ -82,6 +82,7 @@ async fn tail_prints_one_document_per_routed_connection() {
             upstream: _,
             connect_ms: _,
             hop: _,
+            via: _,
             duration_ms: _,
             error,
         } = published;

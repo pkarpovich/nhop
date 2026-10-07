@@ -139,7 +139,7 @@ pub async fn serve(mut client: TcpStream, ctx: ConnCtx, hop: &dyn NextHop) -> io
         rest: rest_of_body(method, body, behind),
     };
     let decision = ctx.rules.decide(&host, port);
-    let mut routed = Routed::begun(&ctx, &host, port, decision);
+    let mut routed = Routed::begun(&ctx, hop.verdict(), &host, port, decision);
     let served = match own_address(&client, &host, port) {
         Loop::Own(listening) => refuse_loop(&mut client, listening, &mut routed).await,
         Loop::Elsewhere => {
