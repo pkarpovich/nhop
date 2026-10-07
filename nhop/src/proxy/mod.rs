@@ -179,7 +179,7 @@ impl Upstream {
 #[error("upstream {0} is listed more than once")]
 pub struct DuplicateUpstream(pub SocketAddr);
 
-/// Rejection of an upstream list a `set_upstream` command named.
+/// Rejection of an upstream list a `set_upstream` or `set_upstreams` command named.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnusableUpstreams {
     /// One of the addresses cannot be dialled.

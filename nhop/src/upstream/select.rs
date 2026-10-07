@@ -107,6 +107,9 @@ impl Selection {
     /// and `switch_cause`. A selection that dials the same socket address as the previous one is no
     /// switch, even when a reload moved that address to another position or spelled it another way. Several callers seeing
     /// the same move log it once, since only the first of them swaps out the selection before it.
+    /// A selection made from a list a reload has since replaced, which a dial that read its snapshot
+    /// just before the reload still holds, records nothing: it would log a switch back to the old
+    /// list and another forward again at the next observation.
     pub fn observe(&self, list: &Arc<UpstreamEntries>, new: Option<usize>) {
         let Some(switch) = self.switched(list, new) else {
             return;
@@ -121,14 +124,26 @@ impl Selection {
 
     fn switched(&self, list: &Arc<UpstreamEntries>, new: Option<usize>) -> Option<Switch> {
         let Self(observed) = self;
-        let previous = observed.swap(Arc::new(Observed {
-            list: Arc::clone(list),
-            selected: new,
-        }));
+        let previous = observed.rcu(|current| {
+            let Observed {
+                list: current_list,
+                selected: _,
+            } = &**current;
+            match list.published_before(current_list) {
+                true => Arc::clone(current),
+                false => Arc::new(Observed {
+                    list: Arc::clone(list),
+                    selected: new,
+                }),
+            }
+        });
         let Observed {
             list: previous_list,
             selected: previous,
         } = &*previous;
+        if list.published_before(previous_list) {
+            return None;
+        }
         let from = upstream_at(previous_list, *previous);
         let to = upstream_at(list, new);
         let same = match (from, to) {
@@ -607,6 +622,21 @@ mod tests {
         let switch = selection.switched(&respelled, Some(0));
 
         assert_eq!(switch, None);
+    }
+
+    #[test]
+    fn a_selection_from_a_replaced_list_records_nothing() {
+        let live = LiveUpstream::default();
+        let replaced = published(&live, &[P, F]);
+        let list = published(&live, &[F, G]);
+        let selection = Selection::default();
+        let _primed = selection.switched(&list, Some(1));
+
+        let stale = selection.switched(&replaced, Some(0));
+        let current = selection.switched(&list, Some(1));
+
+        assert_eq!(stale, None);
+        assert_eq!(current, None);
     }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]

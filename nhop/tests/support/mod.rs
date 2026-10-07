@@ -576,11 +576,11 @@ impl TestDaemon {
         let daemon = daemon::start_paced(paths, ephemeral_listen(), pace).unwrap();
         let answer = daemon
             .state()
-            .call(Command::SetUpstream {
-                addr: UpstreamAddr(format!("socks5://{first}")),
+            .call(Command::upstreams(
+                UpstreamAddr(format!("socks5://{first}")),
                 fallbacks,
-                load: None,
-            })
+                None,
+            ))
             .await;
         assert_eq!(answer, Response::Ok, "the upstream must be accepted");
         let Listen { http, socks } = daemon.listen();

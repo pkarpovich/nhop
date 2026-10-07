@@ -324,10 +324,14 @@ makes it the selected entry for the connections after it. Forwards route
 through the same rules and follow selection with nothing of their own.
 
 **The cold-start window.** Right after the daemon starts, and after a reload
-that adds addresses, the new entries are `down` until two agreeing probes - the
-confirm delay plus the probe time, around a second. During that window `prefer`
-goes direct and `require` dials the first entry, so with the primary off a
-connection made then can cost the full 10 second `REQUIRE_CONNECT_TIMEOUT`.
+that adds addresses, the new entries are `down` until two agreeing probes. At
+start the first round goes out at once, so the window is the confirm delay plus
+the probe time, around a second. A reload does not wake the prober: the new
+entries wait for the round it next starts, up to the 5 second probe interval,
+so the window after a reload can reach about six seconds. During that window
+`prefer` goes direct and `require` dials the first entry, so with the primary
+off a connection made then can cost the full 10 second
+`REQUIRE_CONNECT_TIMEOUT`.
 
 **Up means the proxy answers, not that the network behind it works.** A probe
 asks an entry to connect to its own address and counts any reply as `up`, and a

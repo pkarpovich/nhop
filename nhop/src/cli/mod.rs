@@ -446,12 +446,7 @@ async fn dispatch(
             ask(paths, command, Output::Human, out, err).await
         }
         Subcommand::Upstream(Upstream { addr, fallbacks }) => {
-            let command = Command::SetUpstream {
-                addr,
-                fallbacks,
-                load,
-            };
-            ask(paths, command, Output::Human, out, err).await
+            set_upstreams(paths, Command::upstreams(addr, fallbacks, load), out, err).await
         }
         Subcommand::Listen(Listen { http, socks }) => {
             let command = Command::SetListen { http, socks, load };
@@ -854,15 +849,57 @@ async fn ask(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Exit {
-    let answered = client::ask(&paths.socket_file(), &command).await;
-    let response = match answered {
+    let response = match answer(paths, &command, err).await {
         Ok(response) => response,
-        Err(failure) => {
-            let _ = writeln!(err, "nhop: {failure}");
-            return Exit::of_unreachable(&failure);
-        }
+        Err(exit) => return exit,
     };
     render(&response, output, out, err)
+}
+
+/// Sends the command `nhop upstream` built, failing its load when the daemon refuses a list.
+///
+/// A daemon older than fallbacks refuses [`Command::SetUpstreams`] before it reads the load id,
+/// leaving a run that commits on a zero exit, so a refused list within a load is followed by
+/// [`Command::unreadable_upstream`]. A current daemon has already failed the run by then, and
+/// keeps the first command it was rejected on.
+async fn set_upstreams(
+    paths: &Paths,
+    command: Command,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    let Command::SetUpstreams {
+        addr: _,
+        fallbacks: _,
+        load: Some(load),
+    } = command
+    else {
+        return ask(paths, command, Output::Human, out, err).await;
+    };
+    let response = match answer(paths, &command, err).await {
+        Ok(response) => response,
+        Err(exit) => return exit,
+    };
+    let Response::Err {
+        kind: ErrKind::InvalidArgs,
+        message: _,
+    } = &response
+    else {
+        return render(&response, Output::Human, out, err);
+    };
+    let _refused = client::ask(&paths.socket_file(), &Command::unreadable_upstream(load)).await;
+    render(&response, Output::Human, out, err)
+}
+
+async fn answer(paths: &Paths, command: &Command, err: &mut dyn Write) -> Result<Response, Exit> {
+    let answered = client::ask(&paths.socket_file(), command).await;
+    match answered {
+        Ok(response) => Ok(response),
+        Err(failure) => {
+            let _ = writeln!(err, "nhop: {failure}");
+            Err(Exit::of_unreachable(&failure))
+        }
+    }
 }
 
 fn render(response: &Response, output: Output, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
@@ -1552,6 +1589,78 @@ mod tests {
         assert!(out.is_empty(), "{out}");
         assert_eq!(err.lines().count(), 1, "{err}");
         assert!(err.contains("nhop start"), "{err}");
+    }
+
+    async fn daemon_before_fallbacks(paths: &Paths) -> tokio::task::JoinHandle<Vec<Command>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        paths.state_dir().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            let mut asked = Vec::new();
+            loop {
+                let idle = Duration::from_millis(200);
+                let Ok(accepted) = tokio::time::timeout(idle, listener.accept()).await else {
+                    return asked;
+                };
+                let (stream, _address) = accepted.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let read = serde_json::from_str::<Command>(&line);
+                let refusal = Response::Err {
+                    kind: ErrKind::InvalidArgs,
+                    message: "unknown variant `set_upstreams`".to_owned(),
+                };
+                let mut wire = serde_json::to_vec(&refusal).unwrap();
+                wire.push(b'\n');
+                writer.write_all(&wire).await.unwrap();
+                asked.push(read.unwrap());
+            }
+        })
+    }
+
+    fn primary_and_fallback(load: Option<LoadId>) -> Command {
+        Command::upstreams(
+            UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
+            vec![UpstreamAddr("socks5://192.0.2.11:1080".to_owned())],
+            load,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_list_refused_within_a_load_fails_the_run_on_a_command_every_daemon_reads() {
+        let (_home, paths) = temp_paths();
+        let daemon = daemon_before_fallbacks(&paths).await;
+        let command = primary_and_fallback(Some(LoadId(7)));
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let exit = set_upstreams(&paths, command.clone(), &mut out, &mut err).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("set_upstreams"), "{err}");
+        let poison = Command::unreadable_upstream(LoadId(7));
+        assert_eq!(daemon.await.unwrap(), [command, poison.clone()]);
+        let Command::SetUpstream { addr, load: _ } = poison else {
+            panic!("the poison must be the command every daemon parses: {poison:?}");
+        };
+        assert!(crate::proxy::Upstream::parse(addr).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_list_refused_outside_a_load_is_sent_alone() {
+        let (_home, paths) = temp_paths();
+        let daemon = daemon_before_fallbacks(&paths).await;
+        let command = primary_and_fallback(None);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let exit = set_upstreams(&paths, command.clone(), &mut out, &mut err).await;
+
+        assert_eq!(exit, Exit::InvalidArgs);
+        assert_eq!(daemon.await.unwrap(), [command]);
     }
 
     #[test]

@@ -29,7 +29,15 @@ impl UpstreamEntry {
 
 /// Upstreams new connections are handed to, in the operator's order, empty until a load names one.
 #[derive(Debug, Clone, Default)]
-pub struct UpstreamEntries(Vec<UpstreamEntry>);
+pub struct UpstreamEntries {
+    entries: Vec<UpstreamEntry>,
+    publication: Publication,
+}
+
+/// How many lists were published before this one, so a list read before a reload can be told
+/// from the list that replaced it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Publication(u64);
 
 impl UpstreamEntries {
     /// Returns the entries for `next`, keeping the verdict of every address this list already judges.
@@ -42,7 +50,10 @@ impl UpstreamEntries {
     ///
     /// [`HealthState::Down`]: nhop_ipc::HealthState::Down
     pub fn adopted(&self, next: &Upstreams) -> Self {
-        let Self(kept) = self;
+        let Self {
+            entries: kept,
+            publication: Publication(published),
+        } = self;
         let mut entries = Vec::with_capacity(next.as_slice().len());
         for upstream in next.as_slice() {
             let mut health = None;
@@ -61,24 +72,49 @@ impl UpstreamEntries {
                 health: health.unwrap_or_else(|| HealthHandle::judging(upstream.written().clone())),
             });
         }
-        Self(entries)
+        Self {
+            entries,
+            publication: Publication(published.saturating_add(1)),
+        }
+    }
+
+    /// Tells whether this list was published before `other`, and so has been replaced by it.
+    pub fn published_before(&self, other: &Self) -> bool {
+        let Self {
+            entries: _,
+            publication,
+        } = self;
+        let Self {
+            entries: _,
+            publication: later,
+        } = other;
+        publication < later
     }
 
     /// Returns the entry preferred over every other, absent while no upstream is configured.
     pub fn first(&self) -> Option<&UpstreamEntry> {
-        let Self(entries) = self;
+        let Self {
+            entries,
+            publication: _,
+        } = self;
         entries.first()
     }
 
     /// Returns the entries in order of preference.
     pub fn as_slice(&self) -> &[UpstreamEntry] {
-        let Self(entries) = self;
+        let Self {
+            entries,
+            publication: _,
+        } = self;
         entries
     }
 
     /// Returns the entry at `selected`, absent when nothing is selected.
     pub fn at(&self, selected: Option<usize>) -> Option<&UpstreamEntry> {
-        let Self(entries) = self;
+        let Self {
+            entries,
+            publication: _,
+        } = self;
         entries.get(selected?)
     }
 
@@ -99,7 +135,10 @@ impl UpstreamEntries {
     /// It reads every entry's verdict once and hands them to [`select`], so the answer is the
     /// selection those verdicts make with the given return hold.
     pub fn selected(&self, now: SystemTime, hold: Duration) -> Option<usize> {
-        let Self(entries) = self;
+        let Self {
+            entries,
+            publication: _,
+        } = self;
         let mut verdicts = Vec::with_capacity(entries.len());
         for entry in entries {
             verdicts.push(entry.health().verdict());

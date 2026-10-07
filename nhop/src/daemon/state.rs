@@ -376,7 +376,11 @@ impl DaemonState {
                 let response = self.clear_rules(load);
                 answer(reply, response);
             }
-            Command::SetUpstream {
+            Command::SetUpstream { addr, load } => {
+                let response = self.set_upstream(addr, Vec::new(), load);
+                answer(reply, response);
+            }
+            Command::SetUpstreams {
                 addr,
                 fallbacks,
                 load,
@@ -1142,12 +1146,10 @@ mod tests {
             Command::ClearRules { load: None },
             Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
-                fallbacks: Vec::new(),
                 load: None,
             },
             Command::SetUpstream {
                 addr: UpstreamAddr("192.0.2.10".to_owned()),
-                fallbacks: Vec::new(),
                 load: None,
             },
             Command::Reload { path: None },
@@ -1245,7 +1247,6 @@ mod tests {
         let refused = state
             .call(Command::SetUpstream {
                 addr: UpstreamAddr("192.0.2.10".to_owned()),
-                fallbacks: Vec::new(),
                 load: Some(id),
             })
             .await;
@@ -1420,7 +1421,6 @@ mod tests {
             state
                 .call(Command::SetUpstream {
                     addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
-                    fallbacks: Vec::new(),
                     load: None,
                 })
                 .await,
@@ -1637,7 +1637,6 @@ mod tests {
         state
             .call(Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
-                fallbacks: Vec::new(),
                 load: Some(id),
             })
             .await;
@@ -1870,7 +1869,7 @@ mod tests {
 
     async fn listed(state: &StateHandle) {
         let answer = state
-            .call(Command::SetUpstream {
+            .call(Command::SetUpstreams {
                 addr: UpstreamAddr(PRIMARY.to_owned()),
                 fallbacks: vec![
                     UpstreamAddr(FALLBACK.to_owned()),
@@ -1981,7 +1980,6 @@ mod tests {
         state
             .call(Command::SetUpstream {
                 addr: UpstreamAddr("socks5://192.0.2.10:1080".to_owned()),
-                fallbacks: Vec::new(),
                 load: None,
             })
             .await;

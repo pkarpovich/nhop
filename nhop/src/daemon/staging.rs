@@ -8,8 +8,10 @@ use crate::rules::{InvalidRule, Ruleset};
 pub enum FailedCommand {
     /// The value could not be read as its kind.
     AddRule,
-    /// An address could not be read, or was listed twice.
+    /// The single upstream could not be read.
     SetUpstream,
+    /// An address of a list with fallbacks could not be read, or was listed twice.
+    SetUpstreams,
     /// The front ends could not be moved to the address.
     SetListen,
     /// The address was declared twice, or could not be bound.
@@ -22,6 +24,7 @@ impl FailedCommand {
         match self {
             Self::AddRule => "add_rule",
             Self::SetUpstream => "set_upstream",
+            Self::SetUpstreams => "set_upstreams",
             Self::SetListen => "set_listen",
             Self::AddForward => "add_forward",
         }
@@ -85,16 +88,22 @@ impl Staging {
     /// # Errors
     ///
     /// Returns [`UnusableUpstreams`] when an address cannot be read or is listed twice, and marks
-    /// the run as failed so that it is discarded even if the script goes on to exit zero.
+    /// the run as failed so that it is discarded even if the script goes on to exit zero. The run
+    /// fails on `set_upstream` for one address and on `set_upstreams` for a list, the command
+    /// [`nhop_ipc::Command::upstreams`] sends for each.
     pub fn set_upstream(
         &mut self,
         first: UpstreamAddr,
         fallbacks: Vec<UpstreamAddr>,
     ) -> Result<(), UnusableUpstreams> {
+        let sent = match fallbacks.is_empty() {
+            true => FailedCommand::SetUpstream,
+            false => FailedCommand::SetUpstreams,
+        };
         let upstreams = match Upstreams::parse(first, fallbacks) {
             Ok(upstreams) => upstreams,
             Err(failure) => {
-                self.fail(FailedCommand::SetUpstream);
+                self.fail(sent);
                 return Err(failure);
             }
         };
@@ -352,7 +361,7 @@ mod tests {
             UnusableUpstreams::Duplicate(DuplicateUpstream("192.0.2.11:1080".parse().unwrap()))
         );
         assert!(refused.to_string().contains("192.0.2.11:1080"), "{refused}");
-        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstream));
+        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstreams));
         let Committed {
             rules: _,
             upstream,
@@ -377,7 +386,8 @@ mod tests {
             refused.to_string().contains("fallback.example.com"),
             "{refused}"
         );
-        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstream));
+        assert_eq!(staging.failure(), Some(FailedCommand::SetUpstreams));
+        assert_eq!(FailedCommand::SetUpstreams.name(), "set_upstreams");
     }
 
     #[test]

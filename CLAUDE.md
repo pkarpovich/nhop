@@ -54,7 +54,11 @@ The whole tree obeys these; a change that breaks one reads as foreign.
 - **Loads are atomic.** A run gets a `LoadId`, passed to the script as
   `NHOP_LOAD_ID` and carried back by every mutating command; those accumulate in
   `Staging` and go live only on a zero exit. A command with no id or a stale one
-  while a run is in flight is refused with `ErrKind::LoadInProgress`.
+  while a run is in flight is refused with `ErrKind::LoadInProgress`. A line
+  the daemon cannot parse never reaches the actor, so it fails no run: a
+  command an older daemon may not know (`set_upstreams`) is followed, when
+  refused within a load, by `Command::unreadable_upstream`, which every daemon
+  parses and refuses inside the run.
 - **`Command::Subscribe` never reaches the actor** - `ipc_server.rs` intercepts
   it and streams from the fan-out.
 - **`cli::Exit` owns the exit-code table**, `of_err`/`of_unreachable`/`of_start`
@@ -97,7 +101,10 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   remembers the last answer only to log a switch, once, with its
   `SwitchCause` - every dial and every patrol round calls `observe`, since a
   hold expiring is a switch no verdict write announces - and routing always
-  recomputes. The patrol stamps every verdict of one round with the round's
+  recomputes. Each published `UpstreamEntries` carries its publication count,
+  and an observation made from a list a reload has since replaced records
+  nothing, so a dial that read its snapshot just before the reload cannot log a
+  switch back to the old list. The patrol stamps every verdict of one round with the round's
   start (`HealthHandle::set_at`), so entries confirmed together tie and the
   primary wins at cold start. Switches, like turnovers, are log records only
   (`Logged::Switch`, parsed after the decision and verdict shapes) and never
