@@ -401,12 +401,12 @@ A one-entry list prints exactly today's line, with no ` (selected)` suffix: ther
 - Modify: `packaging/nhop.init.example`
 - Modify: `docs/plans/20261007-fallback-upstreams.md`
 
-- [ ] in `README.md`, document the list form of `nhop upstream`, selection, `RETURN_HOLD` and why it exists, that open connections are never moved, the class table from "Solution Overview", and the new status, log and doctor output
-- [ ] in `README.md`, state the cold-start window: right after the daemon starts, and after a reload that adds addresses, the new entries are `Down` until two agreeing probes (about `confirm_delay` plus the probe time, around a second); during that window `require` dials the first entry, so with the primary off a connection made then can cost the full `REQUIRE_CONNECT_TIMEOUT`
-- [ ] in `README.md`, state the health non-goal: an entry is `Up` when its proxy answers, not when the network behind it works
-- [ ] in `packaging/nhop.init.example`, show a commented two-entry `nhop upstream` line with documentation addresses
-- [ ] in `CLAUDE.md`, add the invariants: each upstream has its own verdict, kept across reloads by address; selection is a pure function of the list, the verdicts and the time, and the selected entry is reported by the dial site (`via`), never re-derived; a switch never touches an accepted connection
-- [ ] move this plan to `docs/plans/completed/`
+- [x] in `README.md`, document the list form of `nhop upstream`, selection, `RETURN_HOLD` and why it exists, that open connections are never moved, the class table from "Solution Overview", and the new status, log and doctor output
+- [x] in `README.md`, state the cold-start window: right after the daemon starts, and after a reload that adds addresses, the new entries are `Down` until two agreeing probes (about `confirm_delay` plus the probe time, around a second); during that window `require` dials the first entry, so with the primary off a connection made then can cost the full `REQUIRE_CONNECT_TIMEOUT`
+- [x] in `README.md`, state the health non-goal: an entry is `Up` when its proxy answers, not when the network behind it works
+- [x] in `packaging/nhop.init.example`, show a commented two-entry `nhop upstream` line with documentation addresses
+- [x] in `CLAUDE.md`, add the invariants: each upstream has its own verdict, kept across reloads by address; selection is a pure function of the list, the verdicts and the time, and the selected entry is reported by the dial site (`via`), never re-derived; a switch never touches an accepted connection
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

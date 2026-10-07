@@ -70,13 +70,38 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   verdict at all, since reading it as a reply would let one request declare a
   dead upstream alive.
 - **`require` is gated only by the absence of an upstream.** `required()`
-  refuses before the network when the published address is `NO_UPSTREAM` and
-  dials every configured one, whatever the verdict says, at
+  refuses before the network, against `NO_UPSTREAM`, only when the published
+  list is empty, and otherwise dials the selected entry - the first while none
+  is selected (`UpstreamEntries::required`) - whatever its verdict says, at
   `REQUIRE_CONNECT_TIMEOUT` rather than `PREFER_CONNECT_TIMEOUT`. The verdict
   gate that used to sit there was removed because a refusal only saves a dial
   timeout when the upstream is dead, and an upstream that was merely slow had
   every `require` destination refused for hours it could have served. `prefer`
   keeps its gate: fast fallback to the direct route is its purpose.
+- **Each upstream has its own verdict, kept across reloads by address.**
+  `UpstreamEntries` is the published list in operator order, each
+  `UpstreamEntry` pairing an `Upstream` with its own `HealthHandle`.
+  `UpstreamEntries::adopted` reuses the handle of every address the previous
+  list held and gives a new address a fresh one (`Down`), so a reload neither
+  drops the verdicts it keeps nor lets a stale dial reach an address removed
+  and added back. A one-entry list behaves byte-for-byte as the single upstream
+  did.
+- **Selection is a pure function of the list, the verdicts and the time.**
+  `select(&[Health], now, hold)` (`upstream/select.rs`) picks the first entry
+  `Up` for at least the hold, else the `Up` entry up longest with ties to list
+  order, else none; there is no selection state to keep consistent. `Selection`
+  remembers the last answer only to log a switch, once, with its
+  `SwitchCause` - every dial and every patrol round calls `observe`, since a
+  hold expiring is a switch no verdict write announces - and routing always
+  recomputes. The patrol stamps every verdict of one round with the round's
+  start (`HealthHandle::set_at`), so entries confirmed together tie and the
+  primary wins at cold start. Switches, like turnovers, are log records only
+  (`Logged::Switch`, parsed after the decision and verdict shapes) and never
+  reach `EventView` or `Command::Subscribe`.
+- **A switch never touches an accepted connection.** A connection selects once,
+  when it dials at accept time, and keeps that entry until it ends; nothing
+  closes, re-dials or migrates it, and a failed dial is not retried on the next
+  entry, since that would stack budgets.
 - **The prober patrols both verdict states with two-probe hysteresis.** `patrol`
   probes from startup on, Up and Down alike. A probe contradicting the live
   verdict only opens a pending sequence recording the state it aims at and the
@@ -86,14 +111,16 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   or a reload pointing the daemon elsewhere discards the sequence. A real dial
   failure still flips Down on one failure - it is evidence a user already paid
   for, a self-generated timeout is not.
-- **A verdict turnover is a log record, not an event.** `HealthHandle::set`
+- **A verdict turnover is a log record, not an event.** `HealthHandle::set_at`
   writes it - the one place the settled verdict and the observation are both in
-  hand - as `verdict_from`, `verdict_to` and `cause` (`probe` or `dial`); `seed`
-  establishes a starting verdict and logs nothing. It never reaches `EventView`,
-  `Command::Subscribe` or `nhop tail`. `logging::logged` returns
-  `Logged::{Decision, Verdict}` and tries `EventView` first, because a verdict
-  line fails a decision's required fields while the reverse is not true - a
-  third record kind goes after that attempt, never before it.
+  hand - as `upstream` (the written address the handle judges, absent for a
+  `Default` handle), `verdict_from`, `verdict_to` and `cause` (`probe` or
+  `dial`); `seed` establishes a starting verdict and logs nothing. It never
+  reaches `EventView`, `Command::Subscribe` or `nhop tail`. `logging::logged`
+  returns `Logged::{Decision, Verdict, Switch}` and tries `EventView` first,
+  because a verdict line fails a decision's required fields while the reverse
+  is not true - a further record kind goes after those attempts, never before
+  them.
 - **Every outbound relay socket carries keepalive.** `direct()` and `through()`
   both apply `keep_alive` before handing the stream back, and a failed setsockopt
   warns rather than failing a dial that otherwise succeeded. Probe sockets are
@@ -125,9 +152,12 @@ The whole tree obeys these; a change that breaks one reads as foreign.
   same as a refusal. `Attempted` also carries the `EffectiveHop` the dial site
   produced - `Direct`, `Upstream` or `FallbackDirect` - so the path the bytes
   actually took travels with the dial instead of being re-derived from the
-  decision, which cannot see a `prefer` rule that fell back. The front end folds
-  both with `Dialled::timed(elapsed)` into `Connect`, which `Routed::dialled`
-  records as `connect_ms` and `hop`. Deriving the distinction from the error, or
+  decision, which cannot see a `prefer` rule that fell back. It carries `via`
+  the same way: the written address of the entry the dial went through,
+  present only on `Upstream`, never re-derived from selection afterwards,
+  which a patrol round may have moved in between. The front end folds both with
+  `Dialled::timed(elapsed)` into `Connect`, which `Routed::dialled` records as
+  `connect_ms`, `hop` and `via`. Deriving the distinction from the error, or
   from re-reading the health verdict after the call, is banned: the first
   mislabels a two-second failing dial as "nothing dialled", the second races the
   patrol.

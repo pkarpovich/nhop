@@ -19,6 +19,9 @@ presence; everything is driven from the CLI.
   the health verdict says, error when it cannot be reached), `prefer` (try the
   upstream while the verdict is up, fall back to a direct connection) and
   `never` (always direct, matched before every other rule)
+- the upstream is an ordered list: new connections go through the first entry
+  that is up, and traffic returns to a higher-ranked entry only after it has
+  stayed up for a minute
 - listens for HTTP CONNECT and SOCKS5 on the ports the previous setup used, so
   clients pinned to them need no reconfiguration
 - a `forward` opens a plain local port for one destination, so a client that
@@ -39,13 +42,13 @@ reads macOS rather than the daemon and prints three fixed lines.
 | `nhop require <kind> <value>` | adds a rule that must traverse the upstream, dialled even while it is down |
 | `nhop prefer <kind> <value>` | adds a rule that tries the upstream, direct when the verdict is down |
 | `nhop never <kind> <value>` | adds a rule that is always dialled directly |
-| `nhop upstream socks5://<ip>:<port>` | points the router at its one SOCKS5 upstream |
+| `nhop upstream socks5://<ip>:<port> [socks5://<ip>:<port>...]` | points the router at its SOCKS5 upstreams, the first preferred and the rest as fallbacks in order |
 | `nhop listen <http addr> <socks addr>` | moves the two front ends |
 | `nhop forward <addr or port> <host>:<port>` | opens a local port whose every connection is routed to that destination |
 | `nhop reload [path]` | re-runs the init script, or a different file and remembers it |
 | `nhop on` | re-runs the remembered init script |
 | `nhop off` | clears the live ruleset while both front ends keep listening |
-| `nhop status` | reports uptime, listeners, forwards, upstream health, last load, rule counts, system proxy |
+| `nhop status` | reports uptime, listeners, forwards, the health of every upstream, last load, rule counts, system proxy |
 | `nhop rules` | lists the live ruleset in declaration order |
 | `nhop test <host>:<port>` | reports where a destination would be routed, without dialling it |
 | `nhop logs` | prints the daemon log; `-f` follows, `--since 15m` limits the window |
@@ -207,11 +210,12 @@ The client half is loopback and gets nothing - loopback cannot die silently.
 
 `up` or `down`. `prefer` reads it - that is the whole of what it routes, the
 choice between the upstream and the direct route waiting behind it. `require`
-only writes it: it dials every configured address regardless, so its dials are
-evidence about the upstream rather than something the verdict may veto. A prober
-patrols the upstream every 5 seconds in **both** states, starting with a probe
-as soon as the daemon has an upstream address rather than after a first
-interval, so a proxy that went away is found by the prober and not by whichever
+only writes it: it dials whenever an upstream is configured at all, so its
+dials are evidence about the upstream rather than something the verdict may
+veto. Every upstream in the list has a verdict of its own. A prober patrols
+every upstream every 5 seconds in **both** states, starting with a probe as
+soon as the daemon has an upstream address rather than after a first interval,
+so a proxy that went away is found by the prober and not by whichever
 connection dials next.
 
 A probe that disagrees with the live verdict does not move it. It opens a
@@ -237,11 +241,12 @@ Every turnover is written to the log as a line of its own, whichever path caused
 it:
 
 ```
-2026-09-03T19:28:46Z  verdict up -> down  (dial)
+2026-09-03T19:28:46Z  verdict socks5://192.168.7.20:1080 up -> down  (dial)
 ```
 
-The cause is `dial` or `probe`. In `--json` the same record is three fields,
-`verdict_from`, `verdict_to` and `cause`. It is a log record only - `nhop tail`
+The cause is `dial` or `probe`. In `--json` the same record is four fields,
+`upstream`, `verdict_from`, `verdict_to` and `cause`; a line from a version
+before the upstream list has no `upstream` and renders without the address. It is a log record only - `nhop tail`
 streams routing decisions and never carries it.
 
 Because `require` no longer refuses on the verdict, a genuinely dead upstream
@@ -256,6 +261,119 @@ the real upstream host:
 
 That is the price of serving a slow upstream instead of declaring it dead:
 without dialling, "off" and "stalled" are indistinguishable.
+
+## Fallback upstreams
+
+`nhop upstream` takes the whole list in order of preference:
+
+```fish
+nhop upstream socks5://192.0.2.10:1080 socks5://192.0.2.11:1080
+```
+
+The common shape is a primary that is sometimes off and a fallback that is
+always on, both offering an equivalent SOCKS5 proxy into the same network. A
+second `nhop upstream` line replaces the whole list, as it replaced the single
+upstream before. An address named twice in one command fails the run, and the
+previous list keeps serving. A one-entry list behaves exactly as the single
+upstream always has, so an existing init file needs no change.
+
+**Each entry has its own verdict.** The prober patrols every entry each round,
+concurrently, with the hysteresis described above; a real dial moves the
+verdict of the entry it dialled and of no other. A reload keeps the verdict of
+every address the new list still names, so reordering or extending the list
+does not send `prefer` traffic direct while the prober re-confirms. A new
+address starts `down`, as every entry does when the daemon starts.
+
+**Selection.** New connections go through the selected entry, which is:
+
+1. the first entry in the list that is `up` and has stayed up for
+   `RETURN_HOLD`, 60 seconds;
+2. otherwise the `up` entry that has been up longest, ties going to list order;
+3. otherwise nothing.
+
+Losing traffic is immediate - an entry that goes `down` is never selected - but
+winning it back waits for the hold. A primary that has just come back does not
+take traffic from a fallback that is serving until it has stayed up a full
+minute. The hold is there because a flapping primary is the normal failure: the
+upstream this was written for turned its verdict over about every 30 seconds
+while its host struggled, and twice that keeps such a primary from ever winning
+traffic back, while one that is genuinely back takes over within a minute plus
+one probe cycle. Step 2 keeps the cases with nothing held immediate: at start
+every entry the prober confirms in the same round ties, so the primary serves
+at once, and a fallback that came up first is not preempted by a primary that
+came up a moment after it.
+
+**Open connections are never moved.** A connection dials once, when it is
+accepted, through the entry selected then, and keeps it until it ends. A switch
+changes where the next connection goes and nothing else; there is no retry of
+one connection on the next entry either, since that would stack dial budgets
+into a hang no single budget explains.
+
+What each class does with the list:
+
+| Class | An entry is selected | Nothing is selected |
+|---|---|---|
+| `require` | dials it with the require budget | dials the first entry with the require budget; an empty list is refused before the network |
+| `prefer` | dials it with the prefer budget, direct on failure | direct at once (`fallback_direct`) |
+| `never` / no rule | direct | direct |
+
+`require` dials the first entry when nothing is up because that is the one the
+operator ranked first, and a successful dial flips its verdict up at once, which
+makes it the selected entry for the connections after it. Forwards route
+through the same rules and follow selection with nothing of their own.
+
+**The cold-start window.** Right after the daemon starts, and after a reload
+that adds addresses, the new entries are `down` until two agreeing probes - the
+confirm delay plus the probe time, around a second. During that window `prefer`
+goes direct and `require` dials the first entry, so with the primary off a
+connection made then can cost the full 10 second `REQUIRE_CONNECT_TIMEOUT`.
+
+**Up means the proxy answers, not that the network behind it works.** A probe
+asks an entry to connect to its own address and counts any reply as `up`, and a
+real dial that fails at the destination proves the proxy is serving, so it
+counts as `up` too. An
+entry whose SOCKS server is alive but whose own path into the remote network is
+down therefore stays `up`, its dials fail at the destination, and no failover
+happens even though the fallback would serve them.
+
+`nhop status` prints one line per entry in list order, the first under
+`upstream` and the rest under `fallback`, marking the selected one; a one-entry
+list prints the single line it always has, with no mark. `--json` carries the
+list as `upstreams`, each with `addr`, `health`, `health_changed_at` and
+`selected`, beside the unchanged `upstream`, `health` and `health_changed_at`
+of the first entry:
+
+```
+upstream      socks5://192.0.2.10:1080 down since 2026-02-02T02:40:00Z
+fallback      socks5://192.0.2.11:1080 up since 2026-02-02T02:41:00Z (selected)
+```
+
+The log names the entry behind every turnover, and writes a line of its own
+each time the selected entry changes, `none` standing for nothing selected:
+
+```
+2026-10-07T09:12:31Z  verdict socks5://192.0.2.10:1080 up -> down  (dial)
+2026-10-07T09:12:31Z  switch socks5://192.0.2.10:1080 -> socks5://192.0.2.11:1080  (down)
+```
+
+The cause of a switch is `down` (the selected entry was lost), `held` (a
+higher-ranked entry stayed up for the hold), `recovered` (an entry came up
+while none was selected) or `reload` (the list itself changed). In `--json` a
+switch is `upstream_from`, `upstream_to` (empty for none) and `switch_cause`,
+and a turnover gains `upstream`. Switches are log records only, like
+turnovers - `nhop tail` never carries them - but every decision through an
+upstream names the entry that carried it after the rule, as `via` in `--json`:
+
+```
+warehouse.corp.example:443  upstream via rule 2 (require) @ socks5://192.0.2.11:1080  upstream up  1204ms (dial 9ms)  -
+```
+
+`nhop doctor` keeps one `upstream_reachable` check. It connects to every entry
+at once, fails only when none answers, and names each entry in its detail with
+`reachable` or `unreachable` and its verdict. Failing whenever any entry is
+unreachable would turn it red for the normal state of this feature, a primary
+that is sometimes off. `nhop test` reports the entry a dial would use now: the
+selected one, or the first while nothing is selected.
 
 ## Init file
 
@@ -512,7 +630,7 @@ guessing:
   malformed arguments, 1 everything else. A script can branch without reading a
   message.
 - **The log is JSON lines**, one object per record - routing decisions, upstream
-  verdict turnovers and the startup open-file limit - so `jq` answers questions
+  verdict turnovers, upstream switches and the startup open-file limit - so `jq` answers questions
   the tool has no command for. Filter on the fields you want rather than reading
   every line as a decision.
 - **No interactive prompts anywhere.** Every command either acts or fails with a
@@ -570,9 +688,10 @@ nhop logs --since 1h --json |
 ```
 
 Every decision event carries `host`, `port`, `decision`, `rule_index`, `class`,
-`upstream` (the health verdict at the time), `connect_ms`, `hop` (`direct`,
-`upstream` or `fallback_direct`, the way the bytes actually went), `duration_ms`
-and `error`. The two timings answer different questions: `connect_ms` is the dial
+`upstream` (the verdict of the selected upstream at the time, `down` when none
+was selected), `connect_ms`, `hop` (`direct`, `upstream` or `fallback_direct`,
+the way the bytes actually went), `via` (the upstream that carried it, present
+only when `hop` is `upstream`), `duration_ms` and `error`. The two timings answer different questions: `connect_ms` is the dial
 alone, `duration_ms` the whole connection, so "slow to reach" and "held open for
 an hour" stop looking alike. `connect_ms` is absent only when nothing was
 dialled - a `require` destination with no upstream configured, or a request for

@@ -9,9 +9,14 @@
 # Every command here is staged: the ruleset only goes live when this script exits zero. A failed
 # command or a non-zero exit leaves the previous ruleset serving traffic.
 
-# The one upstream, as socks5://<ip>:<port>. A hostname is rejected - the address is dialled, not
+# The upstream, as socks5://<ip>:<port>. A hostname is rejected - the address is dialled, not
 # resolved through the routing rules it defines.
 nhop upstream socks5://192.0.2.10:1080  # replace
+
+# Or an ordered list: new connections go through the first entry that is up, and traffic returns
+# to a higher-ranked entry only once it has stayed up for a minute. Open connections are never
+# moved. A second `nhop upstream` line replaces the whole list.
+# nhop upstream socks5://192.0.2.10:1080 socks5://192.0.2.11:1080
 
 # Move the front ends off 127.0.0.1:7890 (HTTP) and 127.0.0.1:7891 (SOCKS5) if something else
 # already owns those ports. Clients pinned to the SOCKS port need it left alone.
